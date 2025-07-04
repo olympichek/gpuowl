@@ -49,3 +49,10 @@ string formatBound(u32 b) {
     return to_string(b);
   }
 }
+
+// Convert Words to GMP mpz_class (adapted from GpuOwl)
+mpz_class mpz(const Words& words) {
+  mpz_class result{};
+  mpz_import(result.get_mpz_t(), words.size(), -1 /*LSWord first*/, sizeof(u32), 0 /*native endian*/, 0 /*nails*/, words.data());
+  return result;
+}

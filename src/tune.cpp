@@ -148,7 +148,7 @@ pair<double, double> Tune::maxBpw(FFTConfig fft) {
 
 double Tune::zForBpw(double bpw, FFTConfig fft) {
   u32 exponent = primes.nearestPrime(fft.size() * bpw + 0.5);
-  auto [ok, res, roeSq, roeMul] = Gpu::make(q, exponent, shared, fft, {}, false)->measureROE(true);
+  auto [ok, res, roeSq, roeMul] = Gpu::make(q, exponent, {}, shared, fft, {}, false)->measureROE(true);
   double z = roeSq.z();
   if (!ok) { log("Error at bpw %.2f (z %.2f) : %s\n", bpw, z, fft.spec().c_str()); }
   return z;
@@ -187,7 +187,7 @@ void Tune::carryTune() {
     const double mid = fft.shape.carry32BPW();
     for (double bpw : {mid - 0.05, mid + 0.05}) {
       u32 exponent = primes.nearestPrime(fft.size() * bpw);
-      auto [ok, carry] = Gpu::make(q, exponent, shared, fft, {}, false)->measureCarry();
+      auto [ok, carry] = Gpu::make(q, exponent, {}, shared, fft, {}, false)->measureCarry();
       m = carry.max;
       if (!ok) { log("Error %s at %f\n", fft.spec().c_str(), bpw); }
       zv.push_back(carry.z());
@@ -246,7 +246,7 @@ void Tune::ctune() {
         for (u32 k = i + 1; k < configsVect.size(); ++k) {
           add(c, configsVect[k][bestPos[k]]);
         }
-        auto cost = Gpu::make(q, exponent, shared, fft, c, false)->timePRP();
+        auto cost = Gpu::make(q, exponent, {}, shared, fft, c, false)->timePRP();
 
         bool isBest = (cost < best.cost);
         if (isBest) {
@@ -290,7 +290,7 @@ void Tune::tune() {
           continue;
         }
 
-        double cost = Gpu::make(q, exponent, shared, fft, {}, false)->timePRP();
+        double cost = Gpu::make(q, exponent, {}, shared, fft, {}, false)->timePRP();
         if (minCost <= 0) { minCost = cost; }
 
         bool isUseful = TuneEntry{cost, fft}.update(results);

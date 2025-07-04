@@ -23,6 +23,7 @@
 #include <iomanip>
 #include <array>
 #include <cinttypes>
+#include <gmpxx.h>
 
 #define _USE_MATH_DEFINES
 #include <cmath>
@@ -356,8 +357,8 @@ string toHex(const vector<u32>& v) {
 
 // --------
 
-unique_ptr<Gpu> Gpu::make(Queue* q, u32 E, GpuCommon shared, FFTConfig fftConfig, const vector<KeyVal>& extraConf, bool logFftSize) {
-  return make_unique<Gpu>(q, shared, fftConfig, E, extraConf, logFftSize);
+unique_ptr<Gpu> Gpu::make(Queue* q, u32 E, const vector<string>& knownFactors, GpuCommon shared, FFTConfig fftConfig, const vector<KeyVal>& extraConf, bool logFftSize) {
+  return make_unique<Gpu>(q, shared, fftConfig, E, knownFactors, extraConf, logFftSize);
 }
 
 Gpu::~Gpu() {
@@ -368,11 +369,12 @@ Gpu::~Gpu() {
 #define ROE_SIZE 100000
 #define CARRY_SIZE 100000
 
-Gpu::Gpu(Queue* q, GpuCommon shared, FFTConfig fft, u32 E, const vector<KeyVal>& extraConf, bool logFftSize) :
+Gpu::Gpu(Queue* q, GpuCommon shared, FFTConfig fft, u32 E, const vector<string>& knownFactors, const vector<KeyVal>& extraConf, bool logFftSize) :
   queue(q),
   background{shared.background},
   args{*shared.args},
   E(E),
+  knownFactors(knownFactors),
   N(fft.shape.size()),
   WIDTH(fft.shape.width),
   SMALL_H(fft.shape.height),
@@ -1024,6 +1026,40 @@ bool Gpu::equals9(const Words& a) {
   return true;
 }
 
+// Check Type 5 residue:
+// KF = product(known_factors)
+// N = (2^p - 1) / KF
+// residue == base^(KF-1) (mod N)
+bool Gpu::isCofactorPRP(const Words& finalResidue, 
+                        const std::vector<std::string>& factors,
+                        int base, int exponent) {  
+  try {
+    mpz_class finalRes = mpz(finalResidue);
+    mpz_class baseGmp{base};
+    
+    mpz_class knownFactorsProduct{1};
+    for (const auto& factorStr : factors) {
+      mpz_class factor{factorStr};
+      knownFactorsProduct *= factor;
+    }
+    
+    mpz_class mersenne = (mpz_class{1} << exponent) - 1;
+    mpz_class cofactor = mersenne / knownFactorsProduct;
+    
+    mpz_class kfMinus1 = knownFactorsProduct - 1;
+    mpz_class expected;
+    mpz_powm(expected.get_mpz_t(), baseGmp.get_mpz_t(), kfMinus1.get_mpz_t(), cofactor.get_mpz_t());
+    
+    mpz_class actual = finalRes % cofactor;
+    bool isPrime = (actual == expected);
+    
+    return isPrime;
+  } catch (const std::exception& e) {
+    log("Cofactor PRP error: %s\n", e.what());
+    return false;
+  }
+}
+
 int ulps(double a, double b) {
   if (a == 0 && b == 0) { return 0; }
 
@@ -1176,7 +1212,7 @@ PRPState Gpu::loadPRP(Saver<PRPState>& saver) {
 }
 
 u32 Gpu::getProofPower(u32 k) {
-  u32 power = ProofSet::effectivePower(E, args.getProofPow(E), k);
+  u32 power = ProofSet::effectivePower(E, knownFactors, args.getProofPow(E), k);
 
   if (power != args.getProofPow(E)) {
     log("Proof using power %u (vs %u)\n", power, args.getProofPow(E));
@@ -1412,7 +1448,7 @@ PRPResult Gpu::isPrimePRP(const Task& task) {
 
   u32 power = getProofPower(k);
   
-  ProofSet proofSet{E, power};
+  ProofSet proofSet{E, task.knownFactors, power};
 
   bool isPrime = false;
 
@@ -1478,9 +1514,17 @@ PRPResult Gpu::isPrimePRP(const Task& task) {
 
     if (k == kEnd) {
       Words words = readData();
-      isPrime = equals9(words);
-      doDiv9(E, words);
-      finalRes64 = residue(words);
+
+      if (task.isCofactor()) {
+        doDiv9(E, words);
+        isPrime = isCofactorPRP(words, knownFactors, 3, E);
+        finalRes64 = residue(words);
+      } else {
+        isPrime = equals9(words);
+        doDiv9(E, words);
+        finalRes64 = residue(words);
+      }
+      
       res2048.clear();
       assert(words.size() >= 64);
       res2048.insert(res2048.end(), words.begin(), std::next(words.begin(), 64));

@@ -7,6 +7,7 @@
 #include "GpuCommon.h"
 
 #include <string>
+#include <vector>
 
 class Args;
 class Result;
@@ -23,6 +24,10 @@ public:
   string AID;  // Assignment ID
   string line; // the verbatim worktodo line, used in deleteTask().
   u32 squarings;  // For CERTs
+
+  std::vector<string> knownFactors; // For PRP on cofactors
+  int residueType = 1;  // Default Type 1, Type 5 for cofactors
+  bool isCofactor() const { return !knownFactors.empty(); }
 
   string verifyPath; // For Verify
   void execute(GpuCommon shared, Queue* q, u32 instance);

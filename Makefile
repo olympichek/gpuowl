@@ -19,7 +19,7 @@ else
 CXX = g++
 endif
 
-COMMON_FLAGS = -Wall -std=c++20
+COMMON_FLAGS = -Wall -std=c++20 -lgmp
 # -static-libstdc++ -static-libgcc
 # -fext-numeric-literals
 

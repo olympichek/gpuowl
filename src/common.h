@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <gmpxx.h>
 
 using u8  = uint8_t;
 using i32 = int32_t;
@@ -38,6 +39,9 @@ inline Words makeWords(u32 E, u32 value) {
   ret[0] = value;
   return ret;
 }
+
+// Convert Words to GMP mpz_class
+mpz_class mpz(const Words& words);
 
 inline u32 roundUp(u32 x, u32 multiple) { return ((x - 1) / multiple + 1) * multiple; }
 

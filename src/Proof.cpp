@@ -11,6 +11,8 @@
 #include <cassert>
 #include <filesystem>
 #include <cinttypes>
+#include <charconv>
+#include <gmpxx.h>
 
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error Byte order must be Little Endian
@@ -40,14 +42,74 @@ ProofInfo getInfo(const fs::path& proofFile) {
   string hash = proof::fileHash(proofFile);
   File fi = File::openReadThrow(proofFile);
   u32 E = 0, power = 0;
+  vector<string> knownFactors{};
+  char number [2048] = {0};
   char c = 0;
-  if (fi.scanf(Proof::HEADER_v2, &power, &E, &c) != 3 || c != '\n') {
+  if (fi.scanf(Proof::HEADER_v2, &power, number, &c) != 3 || c != '\n') {
     log("Proof file '%s' has invalid header\n", proofFile.string().c_str());
     throw "Invalid proof header";
   }
-  return {power, E, hash};
+  try {
+    E = proof::mersenneFromString(number, knownFactors);
+  } catch (string &e) {
+    log("Proof file '%s' has invalid header\n", proofFile.string().c_str());
+    log(e.c_str());
+    throw "Invalid proof header";
+  }
+  return {power, E, knownFactors, hash};
 }
 
+// Mersenne number example: M124647911
+// Mersenne cofactor example: M18178631/36357263/145429049/8411216206439
+string mersenneToString(u32 E, const vector<string>& knownFactors) {
+  string result = "M" + to_string(E);
+  for (const auto& factor : knownFactors) {
+    result += "/" + factor;
+  }
+  return result;
+}
+
+u32 mersenneFromString(const string& number, vector<string>& knownFactors) {
+  if (number.empty() || number[0] != 'M') {
+    throw string("Invalid Mersenne number format: must start with M");
+  }
+  
+  // Split by '/' to separate exponent from factors
+  vector<string> parts = split(number.substr(1), '/'); // Remove 'M' prefix and split
+  
+  if (parts.empty()) {
+    throw string("Invalid Mersenne number format: no exponent found");
+  }
+  
+  // First part is the exponent
+  u32 exponent = 0;
+  const char* expStr = parts[0].c_str();
+  const char* end = expStr + parts[0].size();
+  auto [ptr, ec] = from_chars(expStr, end, exponent, 10);
+  
+  if (ptr != end || ec != std::errc{}) {
+    throw string("Invalid exponent: " + parts[0]);
+  }
+  
+  // Remaining parts are known factors
+  knownFactors.clear();
+  for (size_t i = 1; i < parts.size(); ++i) {
+    if (!parts[i].empty()) {
+      // Validate factor is numeric
+      try {
+        mpz_class test{parts[i]};
+        if (test <= 0) {
+          throw string("Invalid factor: '" + parts[i] + "' (not positive)");
+        }
+        knownFactors.push_back(parts[i]);
+      } catch (const std::invalid_argument&) {
+        throw string("Invalid factor: '" + parts[i] + "' (not numeric)");
+      }
+    }
+  }
+  
+  return exponent;
+}
 }
 
 // ---- Proof ----
@@ -61,7 +123,8 @@ fs::path Proof::file(const fs::path& proofDir) const {
 void Proof::save(const fs::path& proofFile) const {
   File fo = File::openWrite(proofFile);
   u32 power = middles.size();
-  fo.printf(HEADER_v2, power, E, '\n');
+  string number = proof::mersenneToString(E, knownFactors);
+  fo.printf(HEADER_v2, power, number.c_str(), '\n');
   fo.write(B.data(), (E-1)/8+1);
   for (const Words& w : middles) { fo.write(w.data(), (E-1)/8+1); }
 }
@@ -69,16 +132,25 @@ void Proof::save(const fs::path& proofFile) const {
 Proof Proof::load(const fs::path& path) {
   File fi = File::openReadThrow(path);
   u32 E = 0, power = 0;
+  vector<string> knownFactors{};
+  char number [2048] = {0};
   char c = 0;
-  if (fi.scanf(HEADER_v2, &power, &E, &c) != 3 || c != '\n') {
+  if (fi.scanf(HEADER_v2, &power, number, &c) != 3 || c != '\n') {
     log("Proof file '%s' has invalid header\n", path.string().c_str());
+    throw "Invalid proof header";
+  }
+  try {
+    E = proof::mersenneFromString(number, knownFactors);
+  } catch (string &e) {
+    log("Proof file '%s' has invalid header\n", path.string().c_str());
+    log(e.c_str());
     throw "Invalid proof header";
   }
   u32 nBytes = (E - 1) / 8 + 1;
   Words B = fi.readBytesLE(nBytes);
   vector<Words> middles;
   for (u32 i = 0; i < power; ++i) { middles.push_back(fi.readBytesLE(nBytes)); }
-  return {E, B, middles};
+  return {E, knownFactors, B, middles};
 }
 
 bool Proof::verify(Gpu *gpu, const vector<u64>& hashes) const {
@@ -127,8 +199,8 @@ bool Proof::verify(Gpu *gpu, const vector<u64>& hashes) const {
 
 // ---- ProofSet ----
 
-ProofSet::ProofSet(u32 E, u32 power)
-  : E{E}, power{power} {
+ProofSet::ProofSet(u32 E, const vector<string>& knownFactors, u32 power)
+  : E{E}, knownFactors{knownFactors}, power{power} {
   
   assert(E & 1); // E is supposed to be prime
   if (power <= 0 || power > 12) {
@@ -179,9 +251,9 @@ bool ProofSet::isInPoints(u32 E, u32 power, u32 k) {
   return false;
 }
 
-bool ProofSet::canDo(u32 E, u32 power, u32 currentK) {
+bool ProofSet::canDo(u32 E, const vector<string>& knownFactors, u32 power, u32 currentK) {
   assert(power > 0 && power <= 12);
-  return ProofSet{E, power}.isValidTo(currentK);
+  return ProofSet{E, knownFactors, power}.isValidTo(currentK);
 }
 
 u32 ProofSet::bestPower(u32 E) {
@@ -205,10 +277,10 @@ double ProofSet::diskUsageGB(u32 E, u32 power) {
   return power ? ldexp(E, -33 + int(power)) * 1.05 : 0.0;
 }
 
-u32 ProofSet::effectivePower(u32 E, u32 power, u32 currentK) {
+u32 ProofSet::effectivePower(u32 E, const vector<string>& knownFactors, u32 power, u32 currentK) {
   for (u32 p = power; p > 0; --p) {
     // log("validating proof residues for power %u\n", p);
-    if (canDo(E, p, currentK)) { return p; }
+    if (canDo(E, knownFactors, p, currentK)) { return p; }
   }
   return 0;
 }
@@ -293,5 +365,5 @@ std::pair<Proof, vector<u64>> ProofSet::computeProof(Gpu *gpu) const {
 
     log("proof [%u] : M %016" PRIx64 ", h %016" PRIx64 "\n", p, res64(middles.back()), hashes.back());
   }
-  return {Proof{E, std::move(B), std::move(middles)}, hashes};
+  return {Proof{E, knownFactors, std::move(B), std::move(middles)}, hashes};
 }

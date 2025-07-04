@@ -103,6 +103,7 @@ private:
   std::unique_ptr<Saver<PRPState>> saver;
 
   u32 E;
+  vector<string> knownFactors;
   u32 N;
 
   u32 WIDTH;
@@ -253,9 +254,15 @@ private:
   static bool equals9(const Words& words);
   void selftestTrig();
 
+  // Test if Mersenne cofactor is PRP
+  static bool isCofactorPRP(const Words& finalResidue, 
+                            const std::vector<std::string>& factors,
+                            int base, int exponent);
+
 public:
-  Gpu(Queue* q, GpuCommon shared, FFTConfig fft, u32 E, const vector<KeyVal>& extraConf, bool logFftSize);
-  static unique_ptr<Gpu> make(Queue* q, u32 E, GpuCommon shared, FFTConfig fft,
+  Gpu(Queue* q, GpuCommon shared, FFTConfig fft, u32 E, const vector<string>& knownFactors,
+      const vector<KeyVal>& extraConf, bool logFftSize);
+  static unique_ptr<Gpu> make(Queue* q, u32 E, const vector<string>& knownFactors, GpuCommon shared, FFTConfig fft,
                               const vector<KeyVal>& extraConf = {}, bool logFftSize = true);
 
   ~Gpu();

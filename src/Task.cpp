@@ -101,6 +101,18 @@ template<typename T> string json(const string& key, const T& value) { return jso
 
 string maybe(const string& key, const string& value) { return value.empty() ? ""s : json(key, value); }
 
+string json_array(const string& key, const vector<string>& v) {
+  bool isFirst = true;
+  string s = "[";
+  for (const std::string& e : v) {
+    if (e.empty()) { continue; }
+    if (!isFirst) { s += ", "; } else { isFirst = false; }
+    s += json(e);
+  }
+  s += ']';
+  return (json(key) + ':' + s);
+}
+
 template<typename T> void operator+=(vector<T>& a, const vector<T>& b) { a.insert(a.end(), b.begin(), b.end()); }
 
 
@@ -147,7 +159,7 @@ void writeResult(u32 E, const char *workType, const string &status, const std::s
 void Task::writeResultPRP(const Args &args, bool isPrime, u64 res64, const string& res2048, u32 fftSize, u32 nErrors, const fs::path& proofPath) const {
   vector<string> fields{json("res64", hex(res64)),
                         json("res2048", res2048),
-                        json("residue-type", 1),
+                        json("residue-type", residueType),
                         json("errors", vector<string>{json("gerbicz", nErrors)}),
                         json("fft-length", fftSize)
   };
@@ -163,6 +175,10 @@ void Task::writeResultPRP(const Args &args, bool isPrime, u64 res64, const strin
                               json("md5", info.md5)
                             }));
     }
+  }
+  
+  if (isCofactor()) {
+    fields.push_back(json_array("known-factors", knownFactors));
   }
   
   writeResult(exponent, "PRP-3", isPrime ? "P" : "C", AID, args, fields);
@@ -195,7 +211,11 @@ void Task::writeResultCERT(const Args &args, array <u64, 4> hash, u32 squarings,
 }
 
 void Task::execute(GpuCommon shared, Queue *q, u32 instance) {
-  if (kind == VERIFY) { exponent = proof::getInfo(verifyPath).exp; }
+  if (kind == VERIFY) {
+    ProofInfo info = proof::getInfo(verifyPath);
+    exponent = info.exp;
+    knownFactors = info.knownFactors;
+  }
 
   assert(exponent);
 
@@ -203,7 +223,7 @@ void Task::execute(GpuCommon shared, Queue *q, u32 instance) {
 
   FFTConfig fft = FFTConfig::bestFit(*shared.args, exponent, shared.args->fftSpec);
 
-  auto gpu = Gpu::make(q, exponent, shared, fft);
+  auto gpu = Gpu::make(q, exponent, knownFactors, shared, fft);
 
   if (kind == VERIFY) {
     Proof proof{Proof::load(verifyPath)};

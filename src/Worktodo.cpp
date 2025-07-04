@@ -12,6 +12,7 @@
 #include <string>
 #include <optional>
 #include <charconv>
+#include <gmpxx.h>
 
 namespace {
 
@@ -22,8 +23,88 @@ bool isHex(const string& s) {
   return (ptr == end);
 }
 
+// Split string respecting quoted sections (for PRP-CF assignment parsing)
+vector<string> splitRespectingQuotes(const string& s, char delim) {
+  vector<string> result;
+  string current;
+  bool inQuotes = false;
+  
+  for (char c : s) {
+    if (c == '"') {
+      inQuotes = !inQuotes;
+      current += c;
+    } else if (c == delim && !inQuotes) {
+      result.push_back(current);
+      current.clear();
+    } else {
+      current += c;
+    }
+  }
+  if (!current.empty()) {
+    result.push_back(current);
+  }
+  return result;
+}
+
+// Validate that factors are actually factors of the Mersenne number 2^p - 1
+bool validateMersenneFactors(u64 exponent, const std::vector<string>& factors) {
+  try {
+    // Compute 2^p - 1
+    mpz_class mersenne = (mpz_class{1} << exponent) - 1;
+    
+    // Check each factor divides the Mersenne number
+    for (const auto& factorStr : factors) {
+      if (factorStr.empty()) continue;
+      
+      mpz_class factor{factorStr};
+      if (factor <= 1) {
+        log("Failed to parse PRP-CF assignment: factor '%s' must be > 1\n", factorStr.c_str());
+        return false;
+      }
+      
+      if (mersenne % factor != 0) {
+        log("Failed to parse PRP-CF assignment: '%s' is not a factor of M%lu\n", factorStr.c_str(), exponent);
+        return false;
+      }
+    }
+    
+    return true;
+    
+  } catch (const std::exception& e) {
+    log("Failed to parse PRP-CF assignment: %s\n", e.what());
+    return false;
+  }
+}
+
+// Parse comma-separated factors from quoted string like "36357263,145429049,8411216206439"
+std::vector<string> parseFactors(const string& factorStr) {
+  string trimmed = rstripNewline(factorStr);
+  
+  std::vector<string> factors;
+  if (trimmed.size() >= 2 && trimmed.front() == '"' && trimmed.back() == '"') {
+    string content = trimmed.substr(1, trimmed.size() - 2); // Remove quotes
+    factors = split(content, ',');
+    // Validate factors are numeric (using GMP for large factor support)
+    for (const auto& factor : factors) {
+      if (factor.empty()) continue;
+      try {
+        mpz_class test{factor};
+        if (test <= 0) {
+          log("parseFactors: invalid factor '%s' (not positive)\n", factor.c_str());
+          return {}; // Factor must be positive
+        }
+      } catch (const std::invalid_argument&) {
+        log("parseFactors: invalid factor '%s' (not numeric)\n", factor.c_str());
+        return {}; // Invalid factor format
+      }
+    }
+  }
+  return factors;
+}
+
 // Examples:
 // PRP=FEEE9DCD59A0855711265C1165C4C693,1,2,124647911,-1,77,0
+// PRP=D01D05DD3394CFF8887960999DC0D9EE,1,2,18178631,-1,99,2,"36357263,145429049,8411216206439"
 // DoubleCheck=E0F583710728343C61643028FBDBA0FB,70198703,75,1
 // Cert=B2EE67DC0A514753E488794C9DD6F6BD,1,2,82997591,-1,162105
 std::optional<Task> parse(const std::string& line) {
@@ -47,7 +128,7 @@ std::optional<Task> parse(const std::string& line) {
   }
 
   if (isPRP || isLL) {
-    vector<string> parts = split(topParts.back(), ',');
+    vector<string> parts = splitRespectingQuotes(topParts.back(), ',');
     if (!parts.empty() && (parts.front() == "N/A" || parts.front().empty())) {
       parts.erase(parts.begin()); // skip empty AID
     }
@@ -65,7 +146,26 @@ std::optional<Task> parse(const std::string& line) {
     u64 exp{};
     auto [ptr, _] = from_chars(s.c_str(), end, exp, 10);
     if (ptr != end) { exp = 0; }
-    if (exp > 1000) { return {{isPRP ? Task::PRP : Task::LL, u32(exp), AID, line, 0}}; }
+    
+    if (exp > 1000) {
+      Task task{isPRP ? Task::PRP : Task::LL, u32(exp), AID, line, 0};
+      
+      // Check for cofactor format: PRP=AID,1,2,exponent,-1,how_far_factored,tests_saved,"factors"
+      if (isPRP && parts.size() >= 7) {
+        const string& lastPart = parts.back();
+        auto factors = parseFactors(lastPart);
+        if (!factors.empty() && validateMersenneFactors(exp, factors)) {
+          task.knownFactors = factors;
+          task.residueType = 5; // Type 5 for cofactor tests
+        }
+        else {
+          log("Skipping PRP-CF assignment with invalid factors: \"%s\"\n", rstripNewline(line).c_str());
+          return {}; // Skip this assignment
+        }
+      }
+      
+      return task;
+    }
   }
   if (isCERT) {
     vector<string> parts = split(topParts.back(), ',');
