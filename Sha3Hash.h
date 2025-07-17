@@ -3,6 +3,7 @@
 #pragma once
 
 #include "sha3.h"
+#include <array>
 
 class Sha3Hash {
   SHA3Context context;
