@@ -2,8 +2,6 @@
 
 #include "trig.cl"
 
-void fft2(T2* u) { X2(u[0], u[1]); }
-
 #if MIDDLE == 3
 #include "fft3.cl"
 #elif MIDDLE == 4
@@ -34,7 +32,29 @@ void fft2(T2* u) { X2(u[0], u[1]); }
 #include "fft16.cl"
 #endif
 
-void fft_MIDDLE(T2 *u) {
+#if !defined(MM_CHAIN) && !defined(MM2_CHAIN) && FFT_VARIANT_M == 0
+#define MM_CHAIN 0
+#define MM2_CHAIN 0
+#endif
+
+#if !defined(MM_CHAIN) && !defined(MM2_CHAIN) && FFT_VARIANT_M == 1
+#define MM_CHAIN 1
+#define MM2_CHAIN 2
+#endif
+
+// Apply the twiddles needed after fft_MIDDLE and before fft_HEIGHT in forward FFT.
+// Also used after fft_HEIGHT and before fft_MIDDLE in inverse FFT.
+
+#define WADD(i, w) u[i] = cmul(u[i], w)
+#define WSUB(i, w) u[i] = cmul_by_conjugate(u[i], w)
+#define WADDF(i, w) u[i] = cmulFancy(u[i], w)
+#define WSUBF(i, w) u[i] = cmulFancy(u[i], conjugate(w))
+
+#if FFT_FP64
+
+void OVERLOAD fft2(T2* u) { X2(u[0], u[1]); }
+
+void OVERLOAD fft_MIDDLE(T2 *u) {
 #if MIDDLE == 1
   // Do nothing
 #elif MIDDLE == 2
@@ -72,28 +92,17 @@ void fft_MIDDLE(T2 *u) {
 #endif
 }
 
-// Apply the twiddles needed after fft_MIDDLE and before fft_HEIGHT in forward FFT.
-// Also used after fft_HEIGHT and before fft_MIDDLE in inverse FFT.
-
-#define WADD(i, w) u[i] = cmul(u[i], w)
-#define WSUB(i, w) u[i] = cmul_by_conjugate(u[i], w)
-
-#define WADDF(i, w) u[i] = cmulFancy(u[i], w)
-#define WSUBF(i, w) u[i] = cmulFancy(u[i], conjugate(w))
-
 // Keep in sync with TrigBufCache.cpp, see comment there.
 #define SHARP_MIDDLE 5
 
-#if !defined(MM_CHAIN) && !defined(MM2_CHAIN) && FFT_VARIANT_M == 1
-#define MM_CHAIN 1
-#define MM2_CHAIN 2
-#endif
-
-void middleMul(T2 *u, u32 s, Trig trig) {
+void OVERLOAD middleMul(T2 *u, u32 s, Trig trig) {
   assert(s < SMALL_HEIGHT);
   if (MIDDLE == 1) { return; }
 
-  T2 w = trig[s]; // s / BIG_HEIGHT
+#if WIDTH == SMALL_HEIGHT
+  trig += SMALL_HEIGHT;     // In this case we can share the MiddleMul2 trig table.  Skip over the MiddleMul trig table.
+#endif
+  T2 w = trig[s];           // s / BIG_HEIGHT
 
   if (MIDDLE < SHARP_MIDDLE) {
     WADD(1, w);
@@ -175,7 +184,7 @@ void middleMul(T2 *u, u32 s, Trig trig) {
   }
 }
 
-void middleMul2(T2 *u, u32 x, u32 y, double factor, Trig trig) {
+void OVERLOAD middleMul2(T2 *u, u32 x, u32 y, double factor, Trig trig) {
   assert(x < WIDTH);
   assert(y < SMALL_HEIGHT);
 
@@ -184,7 +193,8 @@ void middleMul2(T2 *u, u32 x, u32 y, double factor, Trig trig) {
     return;
   }
 
-  T2 w = trig[SMALL_HEIGHT + x]; // x / (MIDDLE * WIDTH)
+  trig += SMALL_HEIGHT;     // Skip over the MiddleMul trig table
+  T2 w = trig[x];           // x / (MIDDLE * WIDTH)
 
   if (MIDDLE < SHARP_MIDDLE) {
     T2 base = slowTrig_N(x * y + x * SMALL_HEIGHT, ND / MIDDLE * 2) * factor;
@@ -196,7 +206,19 @@ void middleMul2(T2 *u, u32 x, u32 y, double factor, Trig trig) {
   } else { // MIDDLE >= 5
     // T2 w = slowTrig_N(x * SMALL_HEIGHT, ND / MIDDLE);
 
-#if AMDGPU && MM2_CHAIN == 0		// Oddly, Radeon 7 is faster with this version that uses more F64 ops
+#if 0                                   // Slower on Radeon 7, but proves the concept for use in GF61.  Might be worthwhile on poor FP64 GPUs
+
+    Trig trig2 = trig + WIDTH;          // Skip over the fist MiddleMul2 trig table
+    u32 desired_root = x * y;
+    T2 base = cmulFancy(trig2[desired_root % SMALL_HEIGHT], trig[desired_root / SMALL_HEIGHT]) * factor;   //Optimization to do: put multiply by factor in trig2 table
+
+    WADD(0, base);
+    for (u32 k = 1; k < MIDDLE; ++k) {
+      base = cmulFancy(base, w);
+      WADD(k, base);
+    }
+
+#elif AMDGPU && MM2_CHAIN == 0          // Oddly, Radeon 7 is faster with this version that uses more F64 ops
 
     T2 base = slowTrig_N(x * y + x * SMALL_HEIGHT, ND / MIDDLE * 2) * factor;
     WADD(0, base);
@@ -281,13 +303,8 @@ void middleMul2(T2 *u, u32 x, u32 y, double factor, Trig trig) {
   }
 }
 
-#undef WADD
-#undef WADDF
-#undef WSUB
-#undef WSUBF
-
 // Do a partial transpose during fftMiddleIn/Out
-void middleShuffle(local T *lds, T2 *u, u32 workgroupSize, u32 blockSize) {
+void OVERLOAD middleShuffle(local T *lds, T2 *u, u32 workgroupSize, u32 blockSize) {
   u32 me = get_local_id(0);
   if (MIDDLE <= 8) {
     local T *p1 = lds + (me % blockSize) * (workgroupSize / blockSize) + me / blockSize;
@@ -323,10 +340,273 @@ void middleShuffle(local T *lds, T2 *u, u32 workgroupSize, u32 blockSize) {
   }
 }
 
-
 // Do a partial transpose during fftMiddleIn/Out and write the results to global memory
-void middleShuffleWrite(global T2 *out, T2 *u, u32 workgroupSize, u32 blockSize) {
+void OVERLOAD middleShuffleWrite(global T2 *out, T2 *u, u32 workgroupSize, u32 blockSize) {
   u32 me = get_local_id(0);
   out += (me % blockSize) * (workgroupSize / blockSize) + me / blockSize;
   for (int i = 0; i < MIDDLE; ++i) { out[i * workgroupSize] = u[i]; }
 }
+
+#endif
+
+
+
+/**************************************************************************/
+/*          Similar to above, but for an NTT based on GF(M31^2)           */
+/**************************************************************************/
+
+#if NTT_GF31
+
+void OVERLOAD fft2(GF31* u) { X2(u[0], u[1]); }
+
+void OVERLOAD fft_MIDDLE(GF31 *u) {
+#if MIDDLE == 1
+  // Do nothing
+#elif MIDDLE == 2
+  fft2(u);
+#elif MIDDLE == 4
+  fft4(u);
+#elif MIDDLE == 8
+  fft8(u);
+#elif MIDDLE == 16
+  fft16(u);
+#else
+#error UNRECOGNIZED MIDDLE
+#endif
+}
+
+void OVERLOAD middleMul(GF31 *u, u32 s, TrigGF31 trig) {
+  assert(s < SMALL_HEIGHT);
+  if (MIDDLE == 1) { return; }
+
+#if WIDTH == SMALL_HEIGHT
+  trig += SMALL_HEIGHT;     // In this case we can share the MiddleMul2 trig table.  Skip over the MiddleMul trig table.
+#endif
+  GF31 w = trig[s];         // s / BIG_HEIGHT
+
+  WADD(1, w);
+  GF31 base = csq(w);
+  for (u32 k = 2; k < MIDDLE; ++k) {
+    WADD(k, base);
+    base = cmul(base, w);
+  }
+}
+
+void OVERLOAD middleMul2(GF31 *u, u32 x, u32 y, TrigGF31 trig) {
+  assert(x < WIDTH);
+  assert(y < SMALL_HEIGHT);
+
+  trig += SMALL_HEIGHT;     // Skip over the MiddleMul trig table
+  GF31 w = trig[x];         // x / (MIDDLE * WIDTH)
+
+  TrigGF31 trig2 = trig + WIDTH;          // Skip over first MiddleMul2 trig table
+  u32 desired_root = x * y;
+  GF31 base = cmul(trig2[desired_root % SMALL_HEIGHT], trig[desired_root / SMALL_HEIGHT]);
+
+  WADD(0, base);
+  for (u32 k = 1; k < MIDDLE; ++k) {
+    base = cmul(base, w);
+    WADD(k, base);
+  }
+
+#if 0   // Might save a couple of muls with cmul_a_by_b_and_conjb if we can compute "desired_root = x * y + x * SMALL_HEIGHT" with a slightly expanded trig table
+  GF31 base = slowTrigGF31(x * y + x * SMALL_HEIGHT, ND / MIDDLE * 2);
+  WADD(1, base);
+
+  if (MIDDLE == 2) {
+    WADD(0, base);
+    WSUB(0, w);
+    return;
+  }
+
+  GF31 basehi, baselo;
+  cmul_a_by_b_and_conjb(&basehi, &baselo, base, w);
+  WADD(0, baselo);
+  WADD(2, basehi);
+
+  for (int i = 3; i < MIDDLE; ++i) {
+    basehi = cmul(basehi, w);
+    WADD(i, basehi);
+  }
+#endif
+}
+
+// Do a partial transpose during fftMiddleIn/Out
+void OVERLOAD middleShuffle(local Z31 *lds, GF31 *u, u32 workgroupSize, u32 blockSize) {
+  u32 me = get_local_id(0);
+  if (MIDDLE <= 8) {
+    local Z31 *p1 = lds + (me % blockSize) * (workgroupSize / blockSize) + me / blockSize;
+    local Z31 *p2 = lds + me;
+    for (int i = 0; i < MIDDLE; ++i) { p1[i * workgroupSize] = u[i].x; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { u[i].x = p2[workgroupSize * i]; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { p1[i * workgroupSize] = u[i].y; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { u[i].y = p2[workgroupSize * i]; }
+  } else {
+    local int *p1 = ((local int*) lds) + (me % blockSize) * (workgroupSize / blockSize) + me / blockSize;
+    local int *p2 = (local int*) lds + me;
+    int4 *pu = (int4 *)u;
+
+    for (int i = 0; i < MIDDLE; ++i) { p1[i * workgroupSize] = pu[i].x; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { pu[i].x = p2[workgroupSize * i]; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { p1[i * workgroupSize] = pu[i].y; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { pu[i].y = p2[workgroupSize * i]; }
+    bar();
+
+    for (int i = 0; i < MIDDLE; ++i) { p1[i * workgroupSize] = pu[i].z; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { pu[i].z = p2[workgroupSize * i]; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { p1[i * workgroupSize] = pu[i].w; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { pu[i].w = p2[workgroupSize * i]; }
+  }
+}
+
+// Do a partial transpose during fftMiddleIn/Out and write the results to global memory
+void OVERLOAD middleShuffleWrite(global GF31 *out, GF31 *u, u32 workgroupSize, u32 blockSize) {
+  u32 me = get_local_id(0);
+  out += (me % blockSize) * (workgroupSize / blockSize) + me / blockSize;
+  for (int i = 0; i < MIDDLE; ++i) { out[i * workgroupSize] = u[i]; }
+}
+
+#endif
+
+
+
+/**************************************************************************/
+/*          Similar to above, but for an NTT based on GF(M61^2)           */
+/**************************************************************************/
+
+#if NTT_GF61
+
+void OVERLOAD fft2(GF61* u) { X2(u[0], u[1]); }
+
+void OVERLOAD fft_MIDDLE(GF61 *u) {
+#if MIDDLE == 1
+  // Do nothing
+#elif MIDDLE == 2
+  fft2(u);
+#elif MIDDLE == 4
+  fft4(u);
+#elif MIDDLE == 8
+  fft8(u);
+#elif MIDDLE == 16
+  fft16(u);
+#else
+#error UNRECOGNIZED MIDDLE
+#endif
+}
+
+void OVERLOAD middleMul(GF61 *u, u32 s, TrigGF61 trig) {
+  assert(s < SMALL_HEIGHT);
+  if (MIDDLE == 1) { return; }
+
+#if WIDTH == SMALL_HEIGHT
+  trig += SMALL_HEIGHT;     // In this case we can share the MiddleMul2 trig table.  Skip over the MiddleMul trig table.
+#endif
+  GF61 w = trig[s];         // s / BIG_HEIGHT
+
+  WADD(1, w);
+  GF61 base = csq(w);
+  for (u32 k = 2; k < MIDDLE; ++k) {
+    WADD(k, base);
+    base = cmul(base, w);
+  }
+}
+
+void OVERLOAD middleMul2(GF61 *u, u32 x, u32 y, TrigGF61 trig) {
+  assert(x < WIDTH);
+  assert(y < SMALL_HEIGHT);
+
+  trig += SMALL_HEIGHT;     // Skip over the MiddleMul trig table
+  GF61 w = trig[x];         // x / (MIDDLE * WIDTH)
+
+  TrigGF61 trig2 = trig + WIDTH;          // Skip over first MiddleMul2 trig table
+  u32 desired_root = x * y;
+  GF61 base = cmul(trig2[desired_root % SMALL_HEIGHT], trig[desired_root / SMALL_HEIGHT]);
+
+  WADD(0, base);
+  for (u32 k = 1; k < MIDDLE; ++k) {
+    base = cmul(base, w);
+    WADD(k, base);
+  }
+
+#if 0   // Might save a couple of muls with cmul_a_by_b_and_conjb if we can compute "desired_root = x * y + x * SMALL_HEIGHT" with a slightly expanded trig table
+  GF61 base = slowTrigGF61(x * y + x * SMALL_HEIGHT, ND / MIDDLE * 2);
+  WADD(1, base);
+
+  if (MIDDLE == 2) {
+    WADD(0, base);
+    WSUB(0, w);
+    return;
+  }
+
+  GF61 basehi, baselo;
+  cmul_a_by_b_and_conjb(&basehi, &baselo, base, w);
+  WADD(0, baselo);
+  WADD(2, basehi);
+
+  for (int i = 3; i < MIDDLE; ++i) {
+    basehi = cmul(basehi, w);
+    WADD(i, basehi);
+  }
+#endif
+}
+
+// Do a partial transpose during fftMiddleIn/Out
+void OVERLOAD middleShuffle(local Z61 *lds, GF61 *u, u32 workgroupSize, u32 blockSize) {
+  u32 me = get_local_id(0);
+  if (MIDDLE <= 8) {
+    local Z61 *p1 = lds + (me % blockSize) * (workgroupSize / blockSize) + me / blockSize;
+    local Z61 *p2 = lds + me;
+    for (int i = 0; i < MIDDLE; ++i) { p1[i * workgroupSize] = u[i].x; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { u[i].x = p2[workgroupSize * i]; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { p1[i * workgroupSize] = u[i].y; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { u[i].y = p2[workgroupSize * i]; }
+  } else {
+    local int *p1 = ((local int*) lds) + (me % blockSize) * (workgroupSize / blockSize) + me / blockSize;
+    local int *p2 = (local int*) lds + me;
+    int4 *pu = (int4 *)u;
+
+    for (int i = 0; i < MIDDLE; ++i) { p1[i * workgroupSize] = pu[i].x; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { pu[i].x = p2[workgroupSize * i]; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { p1[i * workgroupSize] = pu[i].y; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { pu[i].y = p2[workgroupSize * i]; }
+    bar();
+
+    for (int i = 0; i < MIDDLE; ++i) { p1[i * workgroupSize] = pu[i].z; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { pu[i].z = p2[workgroupSize * i]; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { p1[i * workgroupSize] = pu[i].w; }
+    bar();
+    for (int i = 0; i < MIDDLE; ++i) { pu[i].w = p2[workgroupSize * i]; }
+  }
+}
+
+// Do a partial transpose during fftMiddleIn/Out and write the results to global memory
+void OVERLOAD middleShuffleWrite(global GF61 *out, GF61 *u, u32 workgroupSize, u32 blockSize) {
+  u32 me = get_local_id(0);
+  out += (me % blockSize) * (workgroupSize / blockSize) + me / blockSize;
+  for (int i = 0; i < MIDDLE; ++i) { out[i * workgroupSize] = u[i]; }
+}
+
+#endif
+
+
+#undef WADD
+#undef WADDF
+#undef WSUB
+#undef WSUBF

@@ -5,6 +5,8 @@
 #include "fft-middle.cl"
 #include "middle.cl"
 
+#if FFT_FP64
+
 KERNEL(OUT_WG) fftMiddleOut(P(T2) out, P(T2) in, Trig trig) {
   T2 u[MIDDLE];
 
@@ -56,3 +58,121 @@ KERNEL(OUT_WG) fftMiddleOut(P(T2) out, P(T2) in, Trig trig) {
 
   writeMiddleOutLine(out, u, gy, gx);
 }
+
+#endif
+
+
+
+/**************************************************************************/
+/*          Similar to above, but for an NTT based on GF(M31^2)           */
+/**************************************************************************/
+
+#if NTT_GF31
+
+KERNEL(OUT_WG) fftMiddleOutGF31(P(GF31) out, P(GF31) in, TrigGF31 trig) {
+  GF31 u[MIDDLE];
+
+  in += DISTGF31, out += DISTGF31;
+
+  u32 SIZEY = OUT_WG / OUT_SIZEX;
+
+  u32 N = SMALL_HEIGHT / OUT_SIZEX;
+
+  u32 g = get_group_id(0);
+  u32 gx = g % N;
+  u32 gy = g / N;
+
+  u32 me = get_local_id(0);
+  u32 mx = me % OUT_SIZEX;
+  u32 my = me / OUT_SIZEX;
+
+  // Kernels read OUT_SIZEX consecutive T2.
+  // Each WG-thread kernel processes OUT_SIZEX columns from a needed SMALL_HEIGHT columns
+  // Each WG-thread kernel processes SIZEY rows out of a needed WIDTH rows
+
+  u32 startx = gx * OUT_SIZEX;  // Each input column increases FFT element by one
+  u32 starty = gy * SIZEY;  // Each input row increases FFT element by BIG_HEIGHT
+
+  u32 x = startx + mx;
+  u32 y = starty + my;
+
+  readMiddleOutLine(u, in, y, x);
+
+  middleMul(u, x, trig);
+
+  fft_MIDDLE(u);
+
+  middleMul2(u, y, x, trig);
+
+#if MIDDLE_OUT_LDS_TRANSPOSE
+  // Transpose the x and y values
+  local Z31 lds[OUT_WG / 2 * (MIDDLE <= 8 ? 2 * MIDDLE : MIDDLE)];
+  middleShuffle(lds, u, OUT_WG, OUT_SIZEX);
+  out += me;  // Threads write sequentially to memory since x and y values are already transposed
+#else
+  // Adjust out pointer to effect a transpose of x and y values
+  out += mx * SIZEY + my;
+#endif
+
+  writeMiddleOutLine(out, u, gy, gx);
+}
+
+#endif
+
+
+
+/**************************************************************************/
+/*          Similar to above, but for an NTT based on GF(M61^2)           */
+/**************************************************************************/
+
+#if NTT_GF61
+
+KERNEL(OUT_WG) fftMiddleOutGF61(P(GF61) out, P(GF61) in, TrigGF61 trig) {
+  GF61 u[MIDDLE];
+
+  in += DISTGF61, out += DISTGF61;
+
+  u32 SIZEY = OUT_WG / OUT_SIZEX;
+
+  u32 N = SMALL_HEIGHT / OUT_SIZEX;
+
+  u32 g = get_group_id(0);
+  u32 gx = g % N;
+  u32 gy = g / N;
+
+  u32 me = get_local_id(0);
+  u32 mx = me % OUT_SIZEX;
+  u32 my = me / OUT_SIZEX;
+
+  // Kernels read OUT_SIZEX consecutive T2.
+  // Each WG-thread kernel processes OUT_SIZEX columns from a needed SMALL_HEIGHT columns
+  // Each WG-thread kernel processes SIZEY rows out of a needed WIDTH rows
+
+  u32 startx = gx * OUT_SIZEX;  // Each input column increases FFT element by one
+  u32 starty = gy * SIZEY;  // Each input row increases FFT element by BIG_HEIGHT
+
+  u32 x = startx + mx;
+  u32 y = starty + my;
+
+  readMiddleOutLine(u, in, y, x);
+
+  middleMul(u, x, trig);
+
+  fft_MIDDLE(u);
+
+  middleMul2(u, y, x, trig);
+
+#if MIDDLE_OUT_LDS_TRANSPOSE
+  // Transpose the x and y values
+  local Z61 lds[OUT_WG / 2 * (MIDDLE <= 8 ? 2 * MIDDLE : MIDDLE)];
+  middleShuffle(lds, u, OUT_WG, OUT_SIZEX);
+  out += me;  // Threads write sequentially to memory since x and y values are already transposed
+#else
+  // Adjust out pointer to effect a transpose of x and y values
+  out += mx * SIZEY + my;
+#endif
+
+  writeMiddleOutLine(out, u, gy, gx);
+}
+
+#endif

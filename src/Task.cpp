@@ -83,6 +83,16 @@ OsInfo getOsInfo() { return getOsInfoMinimum(); }
 
 #endif
 
+#if FFT_FP64
+#define JSON_FFT_TYPE          json("fft-type", "FP64")
+#elif NTT_GF31 & NTT_GF61
+#define JSON_FFT_TYPE          json("fft-type", "M31+M61")
+#elif NTT_GF31
+#define JSON_FFT_TYPE          json("fft-type", "M31")
+#elif NTT_GF61
+#define JSON_FFT_TYPE          json("fft-type", "M61")
+#endif
+
 string json(const vector<string>& v) {
   bool isFirst = true;
   string s = "{";
@@ -150,6 +160,7 @@ void Task::writeResultPRP(const Args &args, u32 instance, bool isPrime, u64 res6
                         json("res2048", res2048),
                         json("residue-type", 1),
                         json("errors", vector<string>{json("gerbicz", nErrors)}),
+		        JSON_FFT_TYPE,
                         json("fft-length", fftSize)
   };
 
@@ -171,6 +182,7 @@ void Task::writeResultPRP(const Args &args, u32 instance, bool isPrime, u64 res6
 
 void Task::writeResultLL(const Args &args, u32 instance, bool isPrime, u64 res64, u32 fftSize) const {
   vector<string> fields{json("res64", hex(res64)),
+		        JSON_FFT_TYPE,
                         json("fft-length", fftSize),
                         json("shift-count", 0),
                         json("error-code", "00000000"), // I don't know the meaning of this
@@ -182,9 +194,10 @@ void Task::writeResultLL(const Args &args, u32 instance, bool isPrime, u64 res64
 void Task::writeResultCERT(const Args &args, u32 instance, array <u64, 4> hash, u32 squarings, u32 fftSize) const {
   string hexhash = hex(hash[3]) + hex(hash[2]) + hex(hash[1]) + hex(hash[0]);
   vector<string> fields{json("worktype", "Cert"),
-			json("exponent", exponent),
-			json("sha3-hash", hexhash.c_str()),
-			json("squarings", squarings),
+                        json("exponent", exponent),
+                        json("sha3-hash", hexhash.c_str()),
+                        json("squarings", squarings),
+		        JSON_FFT_TYPE,
                         json("fft-length", fftSize),
                         json("shift-count", 0),
                         json("error-code", "00000000"), // I don't know the meaning of this

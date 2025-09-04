@@ -63,6 +63,11 @@ G_H        "group height" == SMALL_HEIGHT / NH
 #endif
 #endif // AMDGPU
 
+// Default is not adding -2 to results for LL
+#if !defined(LL)
+#define LL 0
+#endif
+
 // On Nvidia we need the old sync between groups in carryFused
 #if !defined(OLD_FENCE) && !AMDGPU
 #define OLD_FENCE 1
@@ -144,13 +149,60 @@ typedef int i32;
 typedef uint u32;
 typedef long i64;
 typedef ulong u64;
+typedef __int128 i128;
+typedef unsigned __int128 u128;
 
+// Typedefs and defines for supporting hybrid FFTs
+#if !defined(FFT_FP64)
+#define FFT_FP64 0
+#endif
+#if !defined(FFT_FP32)
+#define FFT_F2 0
+#endif
+#if !defined(NTT_GF31)
+#define NTT_GF31 0
+#endif
+#if !defined(NTT_GF61)
+#define NTT_GF61 1
+#endif
+#if !defined(NTT_NCW)
+#define NTT_NCW 0
+#endif
+
+// Data types for data stored in FFTs and NTTs duruing the transform
+typedef double T;           // For historical reasons, classic FFTs using doubles call their data T and T2.
+typedef double2 T2;         // A complex value using doubles in a classic FFT.
+typedef float F;            // A classic FFT using floats.  Use typedefs F and F2.
+typedef float2 F2;
+typedef uint Z31;           // A value calculated mod M31.  For a GF(M31^2) NTT.
+typedef uint2 GF31;         // A complex value using two Z31s.  For a GF(M31^2) NTT.
+typedef u64 Z61;            // A value calculated mod M61.  For a GF(M61^2) NTT.
+typedef ulong2 GF61;	    // A complex value using two Z61s.  For a GF(M61^2) NTT.
+//typedef ulong NCW;          // A value calculated mod 2^64 - 2^32 + 1.
+//typedef ulong2 NCW2;        // A complex value using NCWs.  For a Nick Craig-Wood's insipred NTT using prime 2^64 - 2^32 + 1.
+
+// Typedefs for "combo" FFT/NTTs (multiple NTT primes or hybrid FFT/NTT).
+// Word and Word2 define the data type for FFT integers passed between the CPU and GPU.
+#define COMBO_FFT (FFT_FP64 + FFT_FP32 + NTT_GF31 + NTT_GF61 + NTT_NCW > 1)
+#if NTT_GF31 & NTT_GF61 & !FFT_FP64 & !FFT_FP32 & !NTT_NCW
+typedef i64 Word;
+typedef long2 Word2;
+#elif FFT_FP32 | NTT_NCW | COMBO_FFT
+error - unsupported FFT/NTT combination
+#else
 typedef i32 Word;
 typedef int2 Word2;
+#endif
 
-typedef double T;
-typedef double2 T2;
+// Routine to create a pair
+double2 OVERLOAD U2(double a, double b) { return (double2) (a, b); }
+float2 OVERLOAD U2(float a, float b) { return (float2) (a, b); }
+int2 OVERLOAD U2(int a, int b) { return (int2) (a, b); }
+long2 OVERLOAD U2(long a, long b) { return (long2) (a, b); }
+uint2 OVERLOAD U2(uint a, uint b) { return (uint2) (a, b); }
+ulong2 OVERLOAD U2(ulong a, ulong b) { return (ulong2) (a, b); }
 
+// Other handy macros
 #define RE(a) (a.x)
 #define IM(a) (a.y)
 
@@ -170,9 +222,13 @@ typedef double2 T2;
 #if AMDGPU
 typedef constant const T2* Trig;
 typedef constant const T* TrigSingle;
+typedef constant const GF31* TrigGF31;
+typedef constant const GF61* TrigGF61;
 #else
 typedef global const T2* Trig;
 typedef global const T* TrigSingle;
+typedef global const GF31* TrigGF31;
+typedef global const GF61* TrigGF61;
 #endif
 // However, caching weights in nVidia's constant cache improves performance.
 // Even better is to not pollute the constant cache with weights that are used only once.
@@ -186,7 +242,8 @@ typedef global const double2* BigTab;
 #endif
 
 #define KERNEL(x) kernel __attribute__((reqd_work_group_size(x, 1, 1))) void
-   
+
+#if FFT_FP64
 void read(u32 WG, u32 N, T2 *u, const global T2 *in, u32 base) {
   in += base + (u32) get_local_id(0);
   for (u32 i = 0; i < N; ++i) { u[i] = in[i * WG]; }
@@ -196,8 +253,31 @@ void write(u32 WG, u32 N, T2 *u, global T2 *out, u32 base) {
   out += base + (u32) get_local_id(0);
   for (u32 i = 0; i < N; ++i) { out[i * WG] = u[i]; }
 }
+#endif
 
-T2 U2(T a, T b) { return (T2) (a, b); }
+#if NTT_GF31
+void read(u32 WG, u32 N, GF31 *u, const global GF31 *in, u32 base) {
+  in += base + (u32) get_local_id(0);
+  for (u32 i = 0; i < N; ++i) { u[i] = in[i * WG]; }
+}
+
+void write(u32 WG, u32 N, GF31 *u, global GF31 *out, u32 base) {
+  out += base + (u32) get_local_id(0);
+  for (u32 i = 0; i < N; ++i) { out[i * WG] = u[i]; }
+}
+#endif
+
+#if NTT_GF61
+void read(u32 WG, u32 N, GF61 *u, const global GF61 *in, u32 base) {
+  in += base + (u32) get_local_id(0);
+  for (u32 i = 0; i < N; ++i) { u[i] = in[i * WG]; }
+}
+
+void write(u32 WG, u32 N, GF61 *u, global GF61 *out, u32 base) {
+  out += base + (u32) get_local_id(0);
+  for (u32 i = 0; i < N; ++i) { out[i * WG] = u[i]; }
+}
+#endif
 
 // On "classic" AMD GCN GPUs such as Radeon VII, the wavefront size was always 64. On RDNA GPUs the wavefront can
 // be configured to be either 64 or 32. We use the FAST_BARRIER define as an indicator for GCN GPUs.

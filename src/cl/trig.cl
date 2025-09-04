@@ -4,7 +4,9 @@
 
 #include "math.cl"
 
-double2 reducedCosSin(int k, double cosBase) {
+#if FFT_FP64
+
+T2 reducedCosSin(int k, double cosBase) {
   const double S[] = TRIG_SIN;
   const double C[] = TRIG_COS;
 
@@ -36,12 +38,12 @@ double2 reducedCosSin(int k, double cosBase) {
   return U2(c, s);
 }
 
-double2 fancyTrig_N(u32 k) {
+T2 fancyTrig_N(u32 k) {
   return reducedCosSin(k, 0);
 }
 
 // Returns e^(i * tau * k / n), (tau == 2*pi represents a full circle). So k/n is the ratio of a full circle.
-double2 slowTrig_N(u32 k, u32 kBound)   {
+T2 OVERLOAD slowTrig_N(u32 k, u32 kBound)   {
   u32 n = ND;
   assert(n % 8 == 0);
   assert(k < kBound);       // kBound actually bounds k
@@ -61,11 +63,13 @@ double2 slowTrig_N(u32 k, u32 kBound)   {
 
   assert(k <= n / 8);
 
-  double2 r = reducedCosSin(k, 1);
+  T2 r = reducedCosSin(k, 1);
 
-  if (flip) { r = swap(r); }
+  if (flip) { r = SWAP_XY(r); }
   if (negateCos) { r.x = -r.x; }
   if (negate) { r = -r; }
 
   return r;
 }
+
+#endif

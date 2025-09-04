@@ -3,6 +3,8 @@
 #define STEP (NWORDS - (EXP % NWORDS))
 // bool isBigWord(u32 extra) { return extra < NWORDS - STEP; }
 
+#if FFT_FP64
+
 T fweightStep(u32 i) {
   const T TWO_TO_NTH[8] = {
     // 2^(k/8) -1 for k in [0..8)
@@ -69,3 +71,5 @@ T optionalHalve(T w) {    // return w >= 4 ? w / 2 : w;
   //u.y = bfi(u.y, 0xffefffff, 0);
   return as_double(u);
 }
+
+#endif

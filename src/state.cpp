@@ -10,7 +10,7 @@
 
 static int lowBits(int u, int bits) { return (u << (32 - bits)) >> (32 - bits); }
 
-static u32 unbalance(int w, int nBits, int *carry) {
+static uWord unbalance(Word w, int nBits, int *carry) {
   assert(*carry == 0 || *carry == -1);
   w += *carry;
   *carry = 0;
@@ -23,14 +23,14 @@ static u32 unbalance(int w, int nBits, int *carry) {
   return w;
 }
 
-std::vector<u32> compactBits(const vector<int> &dataVect, u32 E) {
+std::vector<u32> compactBits(const vector<Word> &dataVect, u32 E) {
   if (dataVect.empty()) { return {}; } // Indicating all zero
 
   std::vector<u32> out;
   out.reserve((E - 1) / 32 + 1);
 
   u32 N = dataVect.size();
-  const int *data = dataVect.data();
+  const Word *data = dataVect.data();
 
   int carry = 0;
   u32 outWord = 0;
@@ -38,7 +38,7 @@ std::vector<u32> compactBits(const vector<int> &dataVect, u32 E) {
 
   for (u32 p = 0; p < N; ++p) {
     int nBits = bitlen(N, E, p);
-    u32 w = unbalance(data[p], nBits, &carry);
+    uWord w = unbalance(data[p], nBits, &carry);
 
     assert(nBits > 0);
     assert(w < (1u << nBits));
@@ -90,17 +90,17 @@ struct BitBucket {
   }
 };
 
-vector<int> expandBits(const vector<u32> &compactBits, u32 N, u32 E) {
+vector<Word> expandBits(const vector<u32> &compactBits, u32 N, u32 E) {
   assert(E % 32 != 0);
 
-  std::vector<int> out(N);
-  int *data = out.data();
+  std::vector<Word> out(N);
+  Word *data = out.data();
   BitBucket bucket;
   
   auto it = compactBits.cbegin();
   [[maybe_unused]] auto itEnd = compactBits.cend();
   for (u32 p = 0; p < N; ++p) {
-    u32 len = bitlen(N, E, p);    
+    u32 len = bitlen(N, E, p);
     if (bucket.size < len) {
       assert(it != itEnd);
       bucket.put32(*it++);

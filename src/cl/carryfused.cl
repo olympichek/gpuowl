@@ -16,6 +16,8 @@ void spin() {
 #endif
 }
 
+#if FFT_FP64 & !COMBO_FFT
+
 // The "carryFused" is equivalent to the sequence: fftW, carryA, carryB, fftPremul.
 // It uses "stairway forwarding" (forwarding carry data from one workgroup to the next)
 KERNEL(G_W) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShuttle, P(u32) ready, Trig smallTrig,
@@ -50,9 +52,8 @@ KERNEL(G_W) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShuttle, P(
 // Try this weird FFT_width call that adds a "hidden zero" when unrolling.  This prevents the compiler from finding
 // common sub-expressions to re-use in the second fft_WIDTH call.  Re-using this data requires dozens of VGPRs
 // which causes a terrible reduction in occupancy.
-//  fft_WIDTH(lds + (get_group_id(0) / 131072), u, smallTrig + (get_group_id(0) / 131072));
 #if ZEROHACK_W
-  new_fft_WIDTH1(lds + (get_group_id(0) / 131072), u, smallTrig + (get_group_id(0) / 131072));
+  new_fft_WIDTH1(lds + ((u32) get_group_id(0) / 131072), u, smallTrig + ((u32) get_group_id(0) / 131072));
 #else
   new_fft_WIDTH1(lds, u, smallTrig);
 #endif
@@ -82,12 +83,12 @@ KERNEL(G_W) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShuttle, P(
   float roundMax = 0;
   float carryMax = 0;
 
-  // On Titan V it is faster to derive the big vs. little flags from the fractional number of bits in each FFT word rather read the flags from memory.
+  // On Titan V it is faster to derive the big vs. little flags from the fractional number of bits in each FFT word rather than read the flags from memory.
   // On Radeon VII this code is about the same speed.  Not sure which is better on other GPUs.
 #if BIGLIT
-  // Calculate the most significant 32-bits of FRAC_BPW * the index of the FFT word.  Also add FRAC_BPW_HI to test first biglit flag.
-  u32 fft_word_index = (me * H + line) * 2;
-  u32 frac_bits = fft_word_index * FRAC_BPW_HI + mad_hi (fft_word_index, FRAC_BPW_LO, FRAC_BPW_HI);
+  // Calculate the most significant 32-bits of FRAC_BPW * the word index.  Also add FRAC_BPW_HI to test first biglit flag.
+  u32 word_index = (me * H + line) * 2;
+  u32 frac_bits = word_index * FRAC_BPW_HI + mad_hi (word_index, FRAC_BPW_LO, FRAC_BPW_HI);
 #endif
 
   // Apply the inverse weights and carry propagate pairs to generate the output carries
@@ -110,10 +111,10 @@ KERNEL(G_W) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShuttle, P(
     // Apply the inverse weights, optionally compute roundoff error, and convert to integer.  Also apply MUL3 here.
     // Then propagate carries through two words (the first carry does not have to be accurately calculated because it will
     // be accurately calculated by carryFinal later on).  The second carry must be accurate for output to the carry shuttle.
-    wu[i] = weightAndCarryPairSloppy(conjugate(u[i]), U2(invWeight1, invWeight2),
+    wu[i] = weightAndCarryPairSloppy(SWAP_XY(u[i]), U2(invWeight1, invWeight2),
                       // For an LL test, add -2 as the very initial "carry in"
                       // We'd normally use logical &&, but the compiler whines with warning and bitwise fixes it
-                      (LL & (i == 0) & (line==0) & (me == 0)) ? -2 : 0, &roundMax, &carry[i], biglit0, biglit1, &carryMax);
+                      (LL & (i == 0) & (line==0) & (me == 0)) ? -2 : 0, biglit0, biglit1, &carry[i], &roundMax, &carryMax);
   }
 
 #if ROE
@@ -212,7 +213,7 @@ KERNEL(G_W) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShuttle, P(
     bool biglit0 = test(b, 2 * i);
 #endif
     wu[i] = carryFinal(wu[i], carry[i], biglit0);
-    u[i] *= U2(wu[i].x, wu[i].y);
+    u[i] = U2(u[i].x * wu[i].x, u[i].y * wu[i].y);
   }
 
   bar();
@@ -222,3 +223,699 @@ KERNEL(G_W) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShuttle, P(
 
   writeCarryFusedLine(u, out, line);
 }
+
+
+/**************************************************************************/
+/*          Similar to above, but for an NTT based on GF(M31^2)           */
+/**************************************************************************/
+
+#elif NTT_GF31 & !COMBO_FFT
+
+// The "carryFused" is equivalent to the sequence: fftW, carryA, carryB, fftPremul.
+// It uses "stairway forwarding" (forwarding carry data from one workgroup to the next)
+KERNEL(G_W) carryFused(P(GF31) out, CP(GF31) in, u32 posROE, P(i64) carryShuttle, P(u32) ready, TrigGF31 smallTrig, P(uint) bufROE) {
+
+#if 0   // fft_WIDTH uses shufl_int instead of shufl
+  local GF31 lds[WIDTH / 4];
+#else
+  local GF31 lds[WIDTH / 2];
+#endif
+  u32 gr = get_group_id(0);
+  u32 me = get_local_id(0);
+
+  u32 H = BIG_HEIGHT;
+  u32 line = gr % H;
+
+  GF31 u[NW];
+
+#if HAS_ASM
+  __asm("s_setprio 3");
+#endif
+
+  readCarryFusedLine(in, u, line);
+
+// Try this weird FFT_width call that adds a "hidden zero" when unrolling.  This prevents the compiler from finding
+// common sub-expressions to re-use in the second fft_WIDTH call.  Re-using this data requires dozens of VGPRs
+// which causes a terrible reduction in occupancy.
+//  fft_WIDTH(lds + (get_group_id(0) / 131072), u, (u32) smallTrig + (get_group_id(0) / 131072));
+#if ZEROHACK_W
+  new_fft_WIDTH1(lds + (get_group_id(0) / 131072), u, smallTrig + ((u32) get_group_id(0) / 131072));
+#else
+  new_fft_WIDTH1(lds, u, smallTrig);
+#endif
+
+  Word2 wu[NW];
+
+#if MUL3
+  P(i64) carryShuttlePtr = (P(i64)) carryShuttle;
+  i64 carry[NW+1];
+#else
+  P(CFcarry) carryShuttlePtr = (P(CFcarry)) carryShuttle;
+  CFcarry carry[NW+1];
+#endif
+
+#if AMDGPU
+#define CarryShuttleAccess(me,i)        ((me) * NW + (i))                       // Generates denser global_load_dwordx4 instructions
+//#define CarryShuttleAccess(me,i)      ((me) * 4 + (i)%4 + (i)/4 * 4*G_W)      // Also generates global_load_dwordx4 instructions and unit stride when NW=8
+#else
+#define CarryShuttleAccess(me,i)        ((me) + (i) * G_W)                      // nVidia likes this unit stride better
+#endif
+
+  u32 roundMax = 0;
+  float carryMax = 0;
+
+  u32 word_index = (me * H + line) * 2;
+
+  // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
+  // Weights can be applied with shifts because 2 is the 60th root GF31.
+  // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
+  const u32 log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 31;
+
+  // Derive the big vs. little flags from the fractional number of bits in each word.
+  // Create a 64-bit counter that tracks both weight shifts and frac_bits (adding 0xFFFFFFFF to effect the ceil operation required for weight shift).
+  union { uint2 a; u64 b; } combo;
+#define frac_bits       combo.a[0]
+#define weight_shift    combo.a[1]
+#define combo_counter   combo.b
+
+  const u64 combo_step = ((u64)(bigword_weight_shift - 1) << 32) + FRAC_BPW_HI;
+  const u64 combo_bigstep = ((G_W * H * 2 - 1) * combo_step + (((u64) (G_W * H * 2 - 1) * FRAC_BPW_LO) >> 32)) % (31ULL << 32);
+  combo_counter = word_index * combo_step + mul_hi(word_index, FRAC_BPW_LO) + 0xFFFFFFFFULL;
+  weight_shift = weight_shift % 31;
+  u64 starting_combo_counter = combo_counter;     // Save starting counter before adding log2_NWORDS+1 for applying weights after carry propagation
+
+  // We also adjust shift amount for the fact that NTT returns results multiplied by 2*NWORDS.
+  const u32 log2_NWORDS = (WIDTH == 256 ? 8 : WIDTH == 512 ? 9 : WIDTH == 1024 ? 10 : 12) +
+                          (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4) +
+                          (SMALL_HEIGHT == 256 ? 8 : SMALL_HEIGHT == 512 ? 9 : SMALL_HEIGHT == 1024 ? 10 : 12) + 1;
+  weight_shift = weight_shift + log2_NWORDS + 1;
+  if (weight_shift > 31) weight_shift -= 31;
+
+  // Apply the inverse weights and carry propagate pairs to generate the output carries
+
+  for (u32 i = 0; i < NW; ++i) {
+    // Generate the second weight shift
+    u32 weight_shift0 = weight_shift;
+    combo_counter += combo_step;
+    if (weight_shift > 31) weight_shift -= 31;
+    u32 weight_shift1 = weight_shift;
+
+    // Generate big-word/little-word flags
+    bool biglit0 = frac_bits <= FRAC_BPW_HI;
+    bool biglit1 = frac_bits >= -FRAC_BPW_HI;   // Same as frac_bits + FRAC_BPW_HI <= FRAC_BPW_HI;
+
+    // Apply the inverse weights, optionally compute roundoff error, and convert to integer.  Also apply MUL3 here.
+    // Then propagate carries through two words (the first carry does not have to be accurately calculated because it will
+    // be accurately calculated by carryFinal later on).  The second carry must be accurate for output to the carry shuttle.
+    wu[i] = weightAndCarryPairSloppy(SWAP_XY(u[i]), weight_shift0, weight_shift1,
+                      // For an LL test, add -2 as the very initial "carry in"
+                      // We'd normally use logical &&, but the compiler whines with warning and bitwise fixes it
+                      (LL & (i == 0) & (line==0) & (me == 0)) ? -2 : 0, biglit0, biglit1, &carry[i], &roundMax, &carryMax);
+
+    // Generate weight shifts and frac_bits for next pair
+    combo_counter += combo_bigstep;
+    if (weight_shift > 31) weight_shift -= 31;
+  }
+  combo_counter = starting_combo_counter;     // Restore starting counter for applying weights after carry propagation
+
+#if ROE
+  float fltRoundMax = (float) roundMax / (float) M31;      // For speed, roundoff was computed as 32-bit integer.  Convert to float.
+  updateStats(bufROE, posROE, fltRoundMax);
+#elif STATS & (1 << MUL3)
+  updateStats(bufROE, posROE, carryMax);
+#endif
+
+  // Write out our carries. Only groups 0 to H-1 need to write carries out.
+  // Group H is a duplicate of group 0 (producing the same results) so we don't care about group H writing out,
+  // but it's fine either way.
+  if (gr < H) { for (i32 i = 0; i < NW; ++i) { carryShuttlePtr[gr * WIDTH + CarryShuttleAccess(me, i)] = carry[i]; } }
+
+  // Tell next line that its carries are ready
+  if (gr < H) {
+#if OLD_FENCE
+    // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
+    write_mem_fence(CLK_GLOBAL_MEM_FENCE);
+    bar();
+    if (me == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
+#else
+    write_mem_fence(CLK_GLOBAL_MEM_FENCE);
+    if (me % WAVEFRONT == 0) { 
+      u32 pos = gr * (G_W / WAVEFRONT) + me / WAVEFRONT;
+      atomic_store((atomic_uint *) &ready[pos], 1);
+    }
+#endif
+  }
+
+  // Line zero will be redone when gr == H
+  if (gr == 0) { return; }
+
+  // Do some work while our carries may not be ready
+#if HAS_ASM
+  __asm("s_setprio 0");
+#endif
+
+  // Wait until our carries are ready
+#if OLD_FENCE
+  if (me == 0) { do { spin(); } while(!atomic_load_explicit((atomic_uint *) &ready[gr - 1], memory_order_relaxed, memory_scope_device)); }
+  // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
+  bar();
+  read_mem_fence(CLK_GLOBAL_MEM_FENCE);
+  // Clear carry ready flag for next iteration
+  if (me == 0) ready[gr - 1] = 0;
+#else
+  u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
+  if (me % WAVEFRONT == 0) {
+    do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+  }
+  mem_fence(CLK_GLOBAL_MEM_FENCE);
+  // Clear carry ready flag for next iteration
+  if (me % WAVEFRONT == 0) ready[(gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT] = 0;
+#endif
+#if HAS_ASM
+  __asm("s_setprio 1");
+#endif
+
+  // Read from the carryShuttle carries produced by the previous WIDTH row.  Rotate carries from the last WIDTH row.
+  // The new carry layout lets the compiler generate global_load_dwordx4 instructions.
+  if (gr < H) {
+    for (i32 i = 0; i < NW; ++i) {
+      carry[i] = carryShuttlePtr[(gr - 1) * WIDTH + CarryShuttleAccess(me, i)];
+    }
+  } else {
+
+#if !OLD_FENCE
+    // For gr==H we need the barrier since the carry reading is shifted, thus the per-wavefront trick does not apply.
+    bar();
+#endif
+
+    for (i32 i = 0; i < NW; ++i) {
+      carry[i] = carryShuttlePtr[(gr - 1) * WIDTH + CarryShuttleAccess((me + G_W - 1) % G_W, i) /* ((me!=0) + NW - 1 + i) % NW*/];
+    }
+
+    if (me == 0) {
+      carry[NW] = carry[NW-1];
+      for (i32 i = NW-1; i; --i) { carry[i] = carry[i-1]; }
+      carry[0] = carry[NW];
+    }
+  }
+
+  // Apply each 32 or 64 bit carry to the 2 words.  Apply weights.
+  for (i32 i = 0; i < NW; ++i) {
+    // Generate the second weight shift
+    u32 weight_shift0 = weight_shift;
+    combo_counter += combo_step;
+    if (weight_shift > 31) weight_shift -= 31;
+    u32 weight_shift1 = weight_shift;
+    // Generate big-word/little-word flag, propagate final carry
+    bool biglit0 = frac_bits <= FRAC_BPW_HI;
+    wu[i] = carryFinal(wu[i], carry[i], biglit0);
+    u[i] = U2(shl(make_Z31(wu[i].x), weight_shift0), shl(make_Z31(wu[i].y), weight_shift1));
+    // Generate weight shifts and frac_bits for next pair
+    combo_counter += combo_bigstep;
+    if (weight_shift > 31) weight_shift -= 31;
+  }
+
+  bar();
+
+  new_fft_WIDTH2(lds, u, smallTrig);
+
+  writeCarryFusedLine(u, out, line);
+}
+
+
+/**************************************************************************/
+/*          Similar to above, but for an NTT based on GF(M61^2)           */
+/**************************************************************************/
+
+#elif NTT_GF61 & !COMBO_FFT
+
+// The "carryFused" is equivalent to the sequence: fftW, carryA, carryB, fftPremul.
+// It uses "stairway forwarding" (forwarding carry data from one workgroup to the next)
+KERNEL(G_W) carryFused(P(GF61) out, CP(GF61) in, u32 posROE, P(i64) carryShuttle, P(u32) ready, TrigGF61 smallTrig, P(uint) bufROE) {
+
+#if 0   // fft_WIDTH uses shufl_int instead of shufl
+  local GF61 lds[WIDTH / 4];
+#else
+  local GF61 lds[WIDTH / 2];
+#endif
+  u32 gr = get_group_id(0);
+  u32 me = get_local_id(0);
+
+  u32 H = BIG_HEIGHT;
+  u32 line = gr % H;
+
+  GF61 u[NW];
+
+#if HAS_ASM
+  __asm("s_setprio 3");
+#endif
+
+  readCarryFusedLine(in, u, line);
+
+// Try this weird FFT_width call that adds a "hidden zero" when unrolling.  This prevents the compiler from finding
+// common sub-expressions to re-use in the second fft_WIDTH call.  Re-using this data requires dozens of VGPRs
+// which causes a terrible reduction in occupancy.
+//  fft_WIDTH(lds + (get_group_id(0) / 131072), u, (u32) smallTrig + (get_group_id(0) / 131072));
+#if ZEROHACK_W
+  new_fft_WIDTH1(lds + (get_group_id(0) / 131072), u, smallTrig + ((u32) get_group_id(0) / 131072));
+#else
+  new_fft_WIDTH1(lds, u, smallTrig);
+#endif
+
+  Word2 wu[NW];
+
+#if MUL3
+  P(i64) carryShuttlePtr = (P(i64)) carryShuttle;
+  i64 carry[NW+1];
+#else
+  P(CFcarry) carryShuttlePtr = (P(CFcarry)) carryShuttle;
+  CFcarry carry[NW+1];
+#endif
+
+#if AMDGPU
+#define CarryShuttleAccess(me,i)        ((me) * NW + (i))                       // Generates denser global_load_dwordx4 instructions
+//#define CarryShuttleAccess(me,i)      ((me) * 4 + (i)%4 + (i)/4 * 4*G_W)      // Also generates global_load_dwordx4 instructions and unit stride when NW=8
+#else
+#define CarryShuttleAccess(me,i)        ((me) + (i) * G_W)                      // nVidia likes this unit stride better
+#endif
+
+  u32 roundMax = 0;
+  float carryMax = 0;
+
+  u32 word_index = (me * H + line) * 2;
+
+  // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
+  // Weights can be applied with shifts because 2 is the 60th root GF61.
+  // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 61.
+  const u32 log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 61;
+
+  // Derive the big vs. little flags from the fractional number of bits in each word.
+  // Create a 64-bit counter that tracks both weight shifts and frac_bits (adding 0xFFFFFFFF to effect the ceil operation required for weight shift).
+  union { uint2 a; u64 b; } combo;
+#define frac_bits       combo.a[0]
+#define weight_shift    combo.a[1]
+#define combo_counter   combo.b
+
+  const u64 combo_step = ((u64)(bigword_weight_shift - 1) << 32) + FRAC_BPW_HI;
+  const u64 combo_bigstep = ((G_W * H * 2 - 1) * combo_step + (((u64) (G_W * H * 2 - 1) * FRAC_BPW_LO) >> 32)) % (61ULL << 32);
+  combo_counter = word_index * combo_step + mul_hi(word_index, FRAC_BPW_LO) + 0xFFFFFFFFULL;
+  weight_shift = weight_shift % 61;
+  u64 starting_combo_counter = combo_counter;     // Save starting counter before adding log2_NWORDS+1 for applying weights after carry propagation
+
+  // We also adjust shift amount for the fact that NTT returns results multiplied by 2*NWORDS.
+  const u32 log2_NWORDS = (WIDTH == 256 ? 8 : WIDTH == 512 ? 9 : WIDTH == 1024 ? 10 : 12) +
+                          (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4) +
+                          (SMALL_HEIGHT == 256 ? 8 : SMALL_HEIGHT == 512 ? 9 : SMALL_HEIGHT == 1024 ? 10 : 12) + 1;
+  weight_shift = weight_shift + log2_NWORDS + 1;
+  if (weight_shift > 61) weight_shift -= 61;
+
+  // Apply the inverse weights and carry propagate pairs to generate the output carries
+
+  for (u32 i = 0; i < NW; ++i) {
+    // Generate the second weight shift
+    u32 weight_shift0 = weight_shift;
+    combo_counter += combo_step;
+    if (weight_shift > 61) weight_shift -= 61;
+    u32 weight_shift1 = weight_shift;
+
+    // Generate big-word/little-word flags
+    bool biglit0 = frac_bits <= FRAC_BPW_HI;
+    bool biglit1 = frac_bits >= -FRAC_BPW_HI;   // Same as frac_bits + FRAC_BPW_HI <= FRAC_BPW_HI;
+
+    // Apply the inverse weights, optionally compute roundoff error, and convert to integer.  Also apply MUL3 here.
+    // Then propagate carries through two words (the first carry does not have to be accurately calculated because it will
+    // be accurately calculated by carryFinal later on).  The second carry must be accurate for output to the carry shuttle.
+    wu[i] = weightAndCarryPairSloppy(SWAP_XY(u[i]), weight_shift0, weight_shift1,
+                      // For an LL test, add -2 as the very initial "carry in"
+                      // We'd normally use logical &&, but the compiler whines with warning and bitwise fixes it
+                      (LL & (i == 0) & (line==0) & (me == 0)) ? -2 : 0, biglit0, biglit1, &carry[i], &roundMax, &carryMax);
+
+    // Generate weight shifts and frac_bits for next pair
+    combo_counter += combo_bigstep;
+    if (weight_shift > 61) weight_shift -= 61;
+  }
+  combo_counter = starting_combo_counter;     // Restore starting counter for applying weights after carry propagation
+
+#if ROE
+  float fltRoundMax = (float) roundMax / (float) (M61 >> 32);      // For speed, roundoff was computed as 32-bit integer.  Convert to float.
+  updateStats(bufROE, posROE, fltRoundMax);
+#elif STATS & (1 << MUL3)
+  updateStats(bufROE, posROE, carryMax);
+#endif
+
+  // Write out our carries. Only groups 0 to H-1 need to write carries out.
+  // Group H is a duplicate of group 0 (producing the same results) so we don't care about group H writing out,
+  // but it's fine either way.
+  if (gr < H) { for (i32 i = 0; i < NW; ++i) { carryShuttlePtr[gr * WIDTH + CarryShuttleAccess(me, i)] = carry[i]; } }
+
+  // Tell next line that its carries are ready
+  if (gr < H) {
+#if OLD_FENCE
+    // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
+    write_mem_fence(CLK_GLOBAL_MEM_FENCE);
+    bar();
+    if (me == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
+#else
+    write_mem_fence(CLK_GLOBAL_MEM_FENCE);
+    if (me % WAVEFRONT == 0) { 
+      u32 pos = gr * (G_W / WAVEFRONT) + me / WAVEFRONT;
+      atomic_store((atomic_uint *) &ready[pos], 1);
+    }
+#endif
+  }
+
+  // Line zero will be redone when gr == H
+  if (gr == 0) { return; }
+
+  // Do some work while our carries may not be ready
+#if HAS_ASM
+  __asm("s_setprio 0");
+#endif
+
+  // Wait until our carries are ready
+#if OLD_FENCE
+  if (me == 0) { do { spin(); } while(!atomic_load_explicit((atomic_uint *) &ready[gr - 1], memory_order_relaxed, memory_scope_device)); }
+  // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
+  bar();
+  read_mem_fence(CLK_GLOBAL_MEM_FENCE);
+  // Clear carry ready flag for next iteration
+  if (me == 0) ready[gr - 1] = 0;
+#else
+  u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
+  if (me % WAVEFRONT == 0) {
+    do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+  }
+  mem_fence(CLK_GLOBAL_MEM_FENCE);
+  // Clear carry ready flag for next iteration
+  if (me % WAVEFRONT == 0) ready[(gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT] = 0;
+#endif
+#if HAS_ASM
+  __asm("s_setprio 1");
+#endif
+
+  // Read from the carryShuttle carries produced by the previous WIDTH row.  Rotate carries from the last WIDTH row.
+  // The new carry layout lets the compiler generate global_load_dwordx4 instructions.
+  if (gr < H) {
+    for (i32 i = 0; i < NW; ++i) {
+      carry[i] = carryShuttlePtr[(gr - 1) * WIDTH + CarryShuttleAccess(me, i)];
+    }
+  } else {
+
+#if !OLD_FENCE
+    // For gr==H we need the barrier since the carry reading is shifted, thus the per-wavefront trick does not apply.
+    bar();
+#endif
+
+    for (i32 i = 0; i < NW; ++i) {
+      carry[i] = carryShuttlePtr[(gr - 1) * WIDTH + CarryShuttleAccess((me + G_W - 1) % G_W, i) /* ((me!=0) + NW - 1 + i) % NW*/];
+    }
+
+    if (me == 0) {
+      carry[NW] = carry[NW-1];
+      for (i32 i = NW-1; i; --i) { carry[i] = carry[i-1]; }
+      carry[0] = carry[NW];
+    }
+  }
+
+  // Apply each 32 or 64 bit carry to the 2 words.  Apply weights.
+  for (i32 i = 0; i < NW; ++i) {
+    // Generate the second weight shift
+    u32 weight_shift0 = weight_shift;
+    combo_counter += combo_step;
+    if (weight_shift > 61) weight_shift -= 61;
+    u32 weight_shift1 = weight_shift;
+    // Generate big-word/little-word flag, propagate final carry
+    bool biglit0 = frac_bits <= FRAC_BPW_HI;
+    wu[i] = carryFinal(wu[i], carry[i], biglit0);
+    u[i] = U2(shl(make_Z61(wu[i].x), weight_shift0), shl(make_Z61(wu[i].y), weight_shift1));
+    // Generate weight shifts and frac_bits for next pair
+    combo_counter += combo_bigstep;
+    if (weight_shift > 61) weight_shift -= 61;
+  }
+
+  bar();
+
+  new_fft_WIDTH2(lds, u, smallTrig);
+
+  writeCarryFusedLine(u, out, line);
+}
+
+
+/**************************************************************************/
+/*    Similar to above, but for an NTT based on GF(M31^2)*GF(M61^2)       */
+/**************************************************************************/
+
+#elif NTT_GF31 & NTT_GF61
+
+// The "carryFused" is equivalent to the sequence: fftW, carryA, carryB, fftPremul.
+// It uses "stairway forwarding" (forwarding carry data from one workgroup to the next)
+KERNEL(G_W) carryFused(P(GF31) out31, CP(GF31) in31, u32 posROE, P(i64) carryShuttle, P(u32) ready, TrigGF31 smallTrig31, P(uint) bufROE) {
+
+#if 0   // fft_WIDTH uses shufl_int instead of shufl
+  local GF61 lds[WIDTH / 4];
+#else
+  local GF61 lds[WIDTH / 2];
+#endif
+  u32 gr = get_group_id(0);
+  u32 me = get_local_id(0);
+
+  u32 H = BIG_HEIGHT;
+  u32 line = gr % H;
+
+  CP(GF61) in61 = CP(GF61) in31 + distGF61;
+  P(GF61) out61 = P(GF61) out31 + distGF61;
+need smalltrig61 ptr or pass separate arg?
+
+  GF31 u31[NW];
+  GF61 u61[NW];
+
+#if HAS_ASM
+  __asm("s_setprio 3");
+#endif
+
+  readCarryFusedLine(in31, u31, line);
+  readCarryFusedLine(in61, u61, line);
+
+// Try this weird FFT_width call that adds a "hidden zero" when unrolling.  This prevents the compiler from finding
+// common sub-expressions to re-use in the second fft_WIDTH call.  Re-using this data requires dozens of VGPRs
+// which causes a terrible reduction in occupancy.
+//  fft_WIDTH(lds + (get_group_id(0) / 131072), u, (u32) smallTrig + (get_group_id(0) / 131072));
+#if ZEROHACK_W
+  new_fft_WIDTH1(lds + (get_group_id(0) / 131072), u31, smallTrig31 + ((u32) get_group_id(0) / 131072));
+  new_fft_WIDTH1(lds + (get_group_id(0) / 131072), u61, smallTrig61 + ((u32) get_group_id(0) / 131072));
+#else
+  new_fft_WIDTH1(lds, u31, smallTrig31);
+  new_fft_WIDTH1(lds, u61, smallTrig61);
+#endif
+
+  Word2 wu[NW];
+
+#if MUL3
+  P(i64) carryShuttlePtr = (P(i64)) carryShuttle;
+  i64 carry[NW+1];
+#else
+  P(CFcarry) carryShuttlePtr = (P(CFcarry)) carryShuttle;
+  CFcarry carry[NW+1];
+#endif
+
+#if AMDGPU
+#define CarryShuttleAccess(me,i)        ((me) * NW + (i))                       // Generates denser global_load_dwordx4 instructions
+//#define CarryShuttleAccess(me,i)      ((me) * 4 + (i)%4 + (i)/4 * 4*G_W)      // Also generates global_load_dwordx4 instructions and unit stride when NW=8
+#else
+#define CarryShuttleAccess(me,i)        ((me) + (i) * G_W)                      // nVidia likes this unit stride better
+#endif
+
+  u32 roundMax = 0;
+  float carryMax = 0;
+
+  u32 word_index = (me * H + line) * 2;
+
+  // Weight is 2^[ceil(qj / n) - qj/n] where j is the word index, q is the Mersenne exponent, and n is the number of words.
+  // Weights can be applied with shifts because 2 is the 60th root GF31.
+  // Let s be the shift amount for word 1.  The shift amount for word x is ceil(x * (s - 1) + num_big_words_less_than_x) % 31.
+  const u32 M31_log2_root_two = (u32) (((1ULL << 30) / NWORDS) % 31);
+  const u32 M31_bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 31;
+  const u32 M61_log2_root_two = (u32) (((1ULL << 60) / NWORDS) % 61);
+  const u32 M61_bigword_weight_shift = (NWORDS - EXP % NWORDS) * log2_root_two % 61;
+
+  // Derive the big vs. little flags from the fractional number of bits in each word.
+  // Create a 64-bit counter that tracks both weight shifts and frac_bits (adding 0xFFFFFFFF to effect the ceil operation required for weight shift).
+  union { uint2 a; u64 b; } m31_combo, m61_combo;
+#define frac_bits           m31_combo.a[0]
+#define m31_weight_shift    m31_combo.a[1]
+#define m31_combo_counter   m31_combo.b
+#define m61_weight_shift    m61_combo.a[1]
+#define m61_combo_counter   m61_combo.b
+
+  const u64 m31_combo_step = ((u64)(m31_bigword_weight_shift - 1) << 32) + FRAC_BPW_HI;
+  const u64 m31_combo_bigstep = ((G_W * H * 2 - 1) * m31_combo_step + (((u64) (G_W * H * 2 - 1) * FRAC_BPW_LO) >> 32)) % (31ULL << 32);
+  m31_combo_counter = word_index * m31_combo_step + mul_hi(word_index, FRAC_BPW_LO) + 0xFFFFFFFFULL;
+  m31_weight_shift = m31_weight_shift % 31;
+  u64 m31_starting_combo_counter = m31_combo_counter;     // Save starting counter before adding log2_NWORDS+1 for applying weights after carry propagation
+  const u64 m61_combo_step = ((u64)(m61_bigword_weight_shift - 1) << 32) + FRAC_BPW_HI;
+  const u64 m61_combo_bigstep = ((G_W * H * 2 - 1) * m61_combo_step + (((u64) (G_W * H * 2 - 1) * FRAC_BPW_LO) >> 32)) % (61ULL << 32);
+  m61_combo_counter = word_index * m61_combo_step + mul_hi(word_index, FRAC_BPW_LO) + 0xFFFFFFFFULL;
+  m61_weight_shift = m61_weight_shift % 61;
+  u64 m61_starting_combo_counter = m61_combo_counter;     // Save starting counter before adding log2_NWORDS+1 for applying weights after carry propagation
+
+  // We also adjust shift amount for the fact that NTT returns results multiplied by 2*NWORDS.
+  const u32 log2_NWORDS = (WIDTH == 256 ? 8 : WIDTH == 512 ? 9 : WIDTH == 1024 ? 10 : 12) +
+                          (MIDDLE == 1 ? 0 : MIDDLE == 2 ? 1 : MIDDLE == 4 ? 2 : MIDDLE == 8 ? 3 : 4) +
+                          (SMALL_HEIGHT == 256 ? 8 : SMALL_HEIGHT == 512 ? 9 : SMALL_HEIGHT == 1024 ? 10 : 12) + 1;
+  m31_weight_shift = m31_weight_shift + log2_NWORDS + 1;
+  if (m31_weight_shift > 31) m31_weight_shift -= 31;
+  m61_weight_shift = m61_weight_shift + log2_NWORDS + 1;
+  if (m61_weight_shift > 61) m61_weight_shift -= 61;
+
+  // Apply the inverse weights and carry propagate pairs to generate the output carries
+
+  for (u32 i = 0; i < NW; ++i) {
+    // Generate the second weight shifts
+    u32 m31_weight_shift0 = m31_weight_shift;
+    m31_combo_counter += m31_combo_step;
+    if (m31_weight_shift > 31) m31_weight_shift -= 31;
+    u32 m31_weight_shift1 = m31_weight_shift;
+    u32 m61_weight_shift0 = m61_weight_shift;
+    m61_combo_counter += m61_combo_step;
+    if (m61_weight_shift > 61) m61_weight_shift -= 61;
+    u32 m61_weight_shift1 = m61_weight_shift;
+
+    // Generate big-word/little-word flags
+    bool biglit0 = frac_bits <= FRAC_BPW_HI;
+    bool biglit1 = frac_bits >= -FRAC_BPW_HI;   // Same as frac_bits + FRAC_BPW_HI <= FRAC_BPW_HI;
+
+    // Apply the inverse weights, optionally compute roundoff error, and convert to integer.  Also apply MUL3 here.
+    // Then propagate carries through two words (the first carry does not have to be accurately calculated because it will
+    // be accurately calculated by carryFinal later on).  The second carry must be accurate for output to the carry shuttle.
+    wu[i] = weightAndCarryPairSloppy(SWAP_XY(u31[i]), SWAP_XY(u61[i]), m31_weight_shift0, m31_weight_shift1, m61_weight_shift0, m61_weight_shift1,
+                      // For an LL test, add -2 as the very initial "carry in"
+                      // We'd normally use logical &&, but the compiler whines with warning and bitwise fixes it
+                      (LL & (i == 0) & (line==0) & (me == 0)) ? -2 : 0, biglit0, biglit1, &carry[i], &roundMax, &carryMax);
+
+    // Generate weight shifts and frac_bits for next pair
+    m31_combo_counter += m31_combo_bigstep;
+    if (m31_weight_shift > 31) m31_weight_shift -= 31;
+    m61_combo_counter += m61_combo_bigstep;
+    if (m61_weight_shift > 61) m61_weight_shift -= 61;
+  }
+  m31_combo_counter = m31_starting_combo_counter;     // Restore starting counter for applying weights after carry propagation
+  m61_combo_counter = m61_starting_combo_counter;
+
+#if ROE
+  float fltRoundMax = (float) roundMax / (float) 0x0FFFFFFF;      // For speed, roundoff was computed as 32-bit integer.  Convert to float.
+  updateStats(bufROE, posROE, fltRoundMax);
+#elif STATS & (1 << MUL3)
+  updateStats(bufROE, posROE, carryMax);
+#endif
+
+  // Write out our carries. Only groups 0 to H-1 need to write carries out.
+  // Group H is a duplicate of group 0 (producing the same results) so we don't care about group H writing out,
+  // but it's fine either way.
+  if (gr < H) { for (i32 i = 0; i < NW; ++i) { carryShuttlePtr[gr * WIDTH + CarryShuttleAccess(me, i)] = carry[i]; } }
+
+  // Tell next line that its carries are ready
+  if (gr < H) {
+#if OLD_FENCE
+    // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
+    write_mem_fence(CLK_GLOBAL_MEM_FENCE);
+    bar();
+    if (me == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
+#else
+    write_mem_fence(CLK_GLOBAL_MEM_FENCE);
+    if (me % WAVEFRONT == 0) { 
+      u32 pos = gr * (G_W / WAVEFRONT) + me / WAVEFRONT;
+      atomic_store((atomic_uint *) &ready[pos], 1);
+    }
+#endif
+  }
+
+  // Line zero will be redone when gr == H
+  if (gr == 0) { return; }
+
+  // Do some work while our carries may not be ready
+#if HAS_ASM
+  __asm("s_setprio 0");
+#endif
+
+  // Wait until our carries are ready
+#if OLD_FENCE
+  if (me == 0) { do { spin(); } while(!atomic_load_explicit((atomic_uint *) &ready[gr - 1], memory_order_relaxed, memory_scope_device)); }
+  // work_group_barrier(CLK_GLOBAL_MEM_FENCE, memory_scope_device);
+  bar();
+  read_mem_fence(CLK_GLOBAL_MEM_FENCE);
+  // Clear carry ready flag for next iteration
+  if (me == 0) ready[gr - 1] = 0;
+#else
+  u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
+  if (me % WAVEFRONT == 0) {
+    do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+  }
+  mem_fence(CLK_GLOBAL_MEM_FENCE);
+  // Clear carry ready flag for next iteration
+  if (me % WAVEFRONT == 0) ready[(gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT] = 0;
+#endif
+#if HAS_ASM
+  __asm("s_setprio 1");
+#endif
+
+  // Read from the carryShuttle carries produced by the previous WIDTH row.  Rotate carries from the last WIDTH row.
+  // The new carry layout lets the compiler generate global_load_dwordx4 instructions.
+  if (gr < H) {
+    for (i32 i = 0; i < NW; ++i) {
+      carry[i] = carryShuttlePtr[(gr - 1) * WIDTH + CarryShuttleAccess(me, i)];
+    }
+  } else {
+
+#if !OLD_FENCE
+    // For gr==H we need the barrier since the carry reading is shifted, thus the per-wavefront trick does not apply.
+    bar();
+#endif
+
+    for (i32 i = 0; i < NW; ++i) {
+      carry[i] = carryShuttlePtr[(gr - 1) * WIDTH + CarryShuttleAccess((me + G_W - 1) % G_W, i) /* ((me!=0) + NW - 1 + i) % NW*/];
+    }
+
+    if (me == 0) {
+      carry[NW] = carry[NW-1];
+      for (i32 i = NW-1; i; --i) { carry[i] = carry[i-1]; }
+      carry[0] = carry[NW];
+    }
+  }
+
+  // Apply each 32 or 64 bit carry to the 2 words.  Apply weights.
+  for (i32 i = 0; i < NW; ++i) {
+    // Generate the second weight shifts
+    u32 m31_weight_shift0 = m31_weight_shift;
+    m31_combo_counter += m31_combo_step;
+    if (m31_weight_shift > 31) m31_weight_shift -= 31;
+    u32 m31_weight_shift1 = m31_weight_shift;
+    u32 m61_weight_shift0 = m61_weight_shift;
+    m61_combo_counter += m61_combo_step;
+    if (m61_weight_shift > 61) m61_weight_shift -= 61;
+    u32 m61_weight_shift1 = m61_weight_shift;
+    // Generate big-word/little-word flag, propagate final carry
+    bool biglit0 = frac_bits <= FRAC_BPW_HI;
+    wu[i] = carryFinal(wu[i], carry[i], biglit0);
+    u31[i] = U2(shl(make_Z31(wu[i].x), m31_weight_shift0), shl(make_Z31(wu[i].y), m31_weight_shift1));
+    u61[i] = U2(shl(make_Z61(wu[i].x), m61_weight_shift0), shl(make_Z61(wu[i].y), m61_weight_shift1));
+    // Generate weight shifts and frac_bits for next pair
+    m31_combo_counter += m31_combo_bigstep;
+    if (m31_weight_shift > 31) m31_weight_shift -= 31;
+    m61_combo_counter += m61_combo_bigstep;
+    if (m61_weight_shift > 61) m61_weight_shift -= 61;
+  }
+
+  bar();
+
+  new_fft_WIDTH2(lds, u31, smallTrig31);
+  writeCarryFusedLine(u31, out31, line);
+  new_fft_WIDTH2(lds, u61, smallTrig61);
+  writeCarryFusedLine(u61, out61, line);
+}
+
+
+#else
+error - missing CarryFused kernel implementation
+#endif

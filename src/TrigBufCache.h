@@ -6,7 +6,6 @@
 
 #include <mutex>
 
-using double2 = pair<double, double>;
 using TrigBuf = Buffer<double2>;
 using TrigPtr = shared_ptr<TrigBuf>;
 
@@ -47,7 +46,16 @@ public:
   TrigPtr middleTrig(u32 SMALL_H, u32 MIDDLE, u32 W);
 };
 
-// For small angles, return "fancy" cos - 1 for increased precision
-double2 root1Fancy(u32 N, u32 k);
 
+#if FFT_FP64
+double2 root1Fancy(u32 N, u32 k);               // For small angles, return "fancy" cos - 1 for increased precision
 double2 root1(u32 N, u32 k);
+#endif
+
+#if NTT_GF31
+uint2 root1GF31(u32 N, u32 k);
+#endif
+
+#if NTT_GF61
+long2 root1GF61(u32 N, u32 k);
+#endif

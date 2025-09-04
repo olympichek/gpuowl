@@ -26,11 +26,8 @@ struct Task;
 class Signal;
 class ProofSet;
 
-using double2 = pair<double, double>;
 using TrigBuf = Buffer<double2>;
 using TrigPtr = shared_ptr<TrigBuf>;
-
-namespace fs = std::filesystem;
 
 inline u64 residue(const Words& words) { return (u64(words[1]) << 32) | words[0]; }
 
@@ -84,7 +81,6 @@ struct Weights {
   vector<double> weightsConstIF;
   vector<double> weightsIF;
   vector<u32> bitsCF;
-  vector<u32> bitsC;
 };
 
 class Gpu {
@@ -104,42 +100,63 @@ private:
   u32 SMALL_H;
   u32 BIG_H;
 
-  u32 hN, nW, nH, bufSize;
+  u32 hN, nW, nH;
   bool useLongCarry;
   u32 wantROE{};
 
   Profile profile{};
 
   KernelCompiler compiler;
-  
-  Kernel kCarryFused;
-  Kernel kCarryFusedROE;
-  Kernel kCarryFusedMul;
-  Kernel kCarryFusedMulROE;
-  Kernel kCarryFusedLL;
+
+#if FFT_FP64
+  Kernel kfftP;
+  Kernel kfftMidIn;
+  Kernel kfftHin;
+  Kernel ktailSquareZero;
+  Kernel ktailSquare;
+  Kernel ktailMul;
+  Kernel ktailMulLow;
+  Kernel kfftMidOut;
+  Kernel kfftW;
+#endif
+
+#if NTT_GF31
+  Kernel kfftPGF31;
+  Kernel kfftMidInGF31;
+  Kernel kfftHinGF31;
+  Kernel ktailSquareZeroGF31;
+  Kernel ktailSquareGF31;
+  Kernel ktailMulGF31;
+  Kernel ktailMulLowGF31;
+  Kernel kfftMidOutGF31;
+  Kernel kfftWGF31;
+#endif
+
+#if NTT_GF61
+  Kernel kfftPGF61;
+  Kernel kfftMidInGF61;
+  Kernel kfftHinGF61;
+  Kernel ktailSquareZeroGF61;
+  Kernel ktailSquareGF61;
+  Kernel ktailMulGF61;
+  Kernel ktailMulLowGF61;
+  Kernel kfftMidOutGF61;
+  Kernel kfftWGF61;
+#endif
 
   Kernel kCarryA;
   Kernel kCarryAROE;
   Kernel kCarryM;
   Kernel kCarryMROE;
   Kernel kCarryLL;
+  Kernel kCarryFused;
+  Kernel kCarryFusedROE;
+  Kernel kCarryFusedMul;
+  Kernel kCarryFusedMulROE;
+  Kernel kCarryFusedLL;
+
   Kernel carryB;
-
-  Kernel fftP;
-  Kernel fftW;
-
-  Kernel fftHin;
-
-  Kernel tailSquareZero;
-  Kernel tailSquare;
-  Kernel tailMul;
-  Kernel tailMulLow;
-
-  Kernel fftMidIn;
-  Kernel fftMidOut;
-
   Kernel transpIn, transpOut;
-
   Kernel readResidue;
   Kernel kernIsEqual;
   Kernel sum64;
@@ -156,7 +173,7 @@ private:
   bool tail_single_wide;                // TailSquare processes one line at a time
   bool tail_single_kernel;              // TailSquare does not use a separate kernel for line zero
   u32 tail_trigs;                       // 0,1,2.  Increasing values use more DP and less memory accesses
-  u32 pad_size;                         // Pad size in bytes
+  u32 pad_size;                         // Pad size in bytes as specified on the command line or config.txt.  Maximum value is 512.
 
   // Twiddles: trigonometry constant buffers, used in FFTs.
   // The twiddles depend only on FFT config and do not depend on the exponent.
@@ -164,31 +181,30 @@ private:
   TrigPtr bufTrigH;
   TrigPtr bufTrigM;
 
-  Weights weights;
-
   // The weights and the "bigWord bits" depend on the exponent.
+#if FFT_FP64
+  Weights weights;
   Buffer<double> bufConstWeights;
   Buffer<double> bufWeights;
-
   Buffer<u32> bufBits;  // bigWord bits aligned for CarryFused/fftP
-  Buffer<u32> bufBitsC; // bigWord bits aligned for CarryA/M
+#endif
+
+  // Padding size needed for allocating some buffers
+  u32 total_padding;     // Total padding (in number of doubles)
 
   // "integer word" buffers. These are "small buffers": N x int.
-  Buffer<int> bufData;   // Main int buffer with the words.
-  Buffer<int> bufAux;    // Auxiliary int buffer, used in transposing data in/out and in check.
-  Buffer<int> bufCheck;  // Buffers used with the error check.
-  Buffer<int> bufBase;   // used in P-1 error check.
+  Buffer<Word> bufData;   // Main int buffer with the words.
+  Buffer<Word> bufAux;    // Auxiliary int buffer, used in transposing data in/out and in check.
+  Buffer<Word> bufCheck;  // Buffers used with the error check.
 
   // Carry buffers, used in carry and fusedCarry.
   Buffer<i64> bufCarry;  // Carry shuttle.
-
   Buffer<int> bufReady;  // Per-group ready flag for stairway carry propagation.
 
   // Small aux buffers.
-  Buffer<int> bufSmallOut;
+  Buffer<Word> bufSmallOut;
   Buffer<u64> bufSumOut;
   Buffer<int> bufTrue;
-
   Buffer<float> bufROE; // The round-off error ("ROE"), one float element per iteration.
   Buffer<float> bufStatsCarry;
 
@@ -207,46 +223,64 @@ private:
   TimeInfo* timeBufVect;
   ZAvg zAvg;
 
-  vector<int> readOut(Buffer<int> &buf);
-  void writeIn(Buffer<int>& buf, vector<i32>&& words);
+  void fftP(Buffer<double>& out, Buffer<double>& in) { fftP(out, reinterpret_cast<Buffer<Word>&>(in)); }
+  void fftP(Buffer<double>& out, Buffer<Word>& in);
+  void fftMidIn(Buffer<double>& out, Buffer<double>& in);
+  void fftMidOut(Buffer<double>& out, Buffer<double>& in);
+  void fftHin(Buffer<double>& out, Buffer<double>& in);
+  void tailSquareZero(Buffer<double>& out, Buffer<double>& in);
+  void tailSquare(Buffer<double>& out, Buffer<double>& in);
+  void tailMul(Buffer<double>& out, Buffer<double>& in1, Buffer<double>& in2);
+  void tailMulLow(Buffer<double>& out, Buffer<double>& in1, Buffer<double>& in2);
+  void fftW(Buffer<double>& out, Buffer<double>& in);
+  void carryA(Buffer<double>& out, Buffer<double>& in) { carryA(reinterpret_cast<Buffer<Word>&>(out), in); }
+  void carryA(Buffer<Word>& out, Buffer<double>& in);
+  void carryM(Buffer<Word>& out, Buffer<double>& in);
+  void carryLL(Buffer<Word>& out, Buffer<double>& in);
+  void carryFused(Buffer<double>& out, Buffer<double>& in);
+  void carryFusedMul(Buffer<double>& out, Buffer<double>& in);
+  void carryFusedLL(Buffer<double>& out, Buffer<double>& in);
 
-  void square(Buffer<int>& out, Buffer<int>& in, bool leadIn, bool leadOut, bool doMul3 = false, bool doLL = false);
-  void squareCERT(Buffer<int>& io, bool leadIn, bool leadOut) { square(io, io, leadIn, leadOut, false, false); }
-  void squareLL(Buffer<int>& io, bool leadIn, bool leadOut) { square(io, io, leadIn, leadOut, false, true); }
+  vector<Word> readOut(Buffer<Word> &buf);
+  void writeIn(Buffer<Word>& buf, vector<i32>&& words);
 
-  void square(Buffer<int>& io);
+  void square(Buffer<Word>& out, Buffer<Word>& in, bool leadIn, bool leadOut, bool doMul3 = false, bool doLL = false);
+  void squareCERT(Buffer<Word>& io, bool leadIn, bool leadOut) { square(io, io, leadIn, leadOut, false, false); }
+  void squareLL(Buffer<Word>& io, bool leadIn, bool leadOut) { square(io, io, leadIn, leadOut, false, true); }
 
-  u32 squareLoop(Buffer<int>& out, Buffer<int>& in, u32 from, u32 to, bool doTailMul3);
-  u32 squareLoop(Buffer<int>& io, u32 from, u32 to) { return squareLoop(io, io, from, to, false); }
+  void square(Buffer<Word>& io);
 
-  bool isEqual(Buffer<int>& bufCheck, Buffer<int>& bufAux);
-  u64 bufResidue(Buffer<int>& buf);
+  u32 squareLoop(Buffer<Word>& out, Buffer<Word>& in, u32 from, u32 to, bool doTailMul3);
+  u32 squareLoop(Buffer<Word>& io, u32 from, u32 to) { return squareLoop(io, io, from, to, false); }
+
+  bool isEqual(Buffer<Word>& bufCheck, Buffer<Word>& bufAux);
+  u64 bufResidue(Buffer<Word>& buf);
   
   vector<u32> writeBase(const vector<u32> &v);
   
-  void exponentiate(Buffer<int>& bufInOut, u64 exp, Buffer<double>& buf1, Buffer<double>& buf2, Buffer<double>& buf3);
+  void exponentiate(Buffer<Word>& bufInOut, u64 exp, Buffer<double>& buf1, Buffer<double>& buf2, Buffer<double>& buf3);
 
   void bottomHalf(Buffer<double>& out, Buffer<double>& inTmp);
 
   void writeState(const vector<u32>& check, u32 blockSize);
-  
+
   // does either carrryFused() or the expanded version depending on useLongCarry
   void doCarry(Buffer<double>& out, Buffer<double>& in);
 
-  void mul(Buffer<int>& ioA, Buffer<double>& inB, Buffer<double>& tmp1, Buffer<double>& tmp2, bool mul3 = false);
-  void mul(Buffer<int>& io, Buffer<double>& inB);
+  void mul(Buffer<Word>& ioA, Buffer<double>& inB, Buffer<double>& tmp1, Buffer<double>& tmp2, bool mul3 = false);
+  void mul(Buffer<Word>& io, Buffer<double>& inB);
 
-  void modMul(Buffer<int>& ioA, Buffer<int>& inB, bool mul3 = false);
-  
+  void modMul(Buffer<Word>& ioA, Buffer<Word>& inB, bool mul3 = false);
+
   fs::path saveProof(const Args& args, const ProofSet& proofSet);
   std::pair<RoeInfo, RoeInfo> readROE();
   RoeInfo readCarryStats();
-  
+
   u32 updateCarryPos(u32 bit);
 
   PRPState loadPRP(Saver<PRPState>& saver);
 
-  vector<int> readChecked(Buffer<int>& buf);
+  vector<Word> readChecked(Buffer<Word>& buf);
 
   // void measureTransferSpeed();
 
@@ -272,21 +306,7 @@ public:
 
   Saver<PRPState> *getSaver();
 
-  void carryA(Buffer<double>& a, Buffer<double>& b) { carryA(reinterpret_cast<Buffer<int>&>(a), b); }
-
-  void carryA(Buffer<int>& a, Buffer<double>& b);
-
-  void carryM(Buffer<int>& a, Buffer<double>& b);
-
-  void carryLL(Buffer<int>& a, Buffer<double>& b);
-
-  void carryFused(Buffer<double>& a, Buffer<double>& b);
-
-  void carryFusedMul(Buffer<double>& a, Buffer<double>& b);
-
-  void carryFusedLL(Buffer<double>& a, Buffer<double>& b)  { kCarryFusedLL(a, b, updateCarryPos(1<<0));}
-
-  void writeIn(Buffer<int>& buf, const vector<u32> &words);
+  void writeIn(Buffer<Word>& buf, const vector<u32> &words);
   
   u64 dataResidue()  { return bufResidue(bufData); }
   u64 checkResidue() { return bufResidue(bufCheck); }
@@ -295,7 +315,7 @@ public:
 
   void logTimeKernels();
 
-  Words readAndCompress(Buffer<int>& buf);
+  Words readAndCompress(Buffer<Word>& buf);
   vector<u32> readCheck();
   vector<u32> readData();
 

@@ -25,25 +25,30 @@
 
 #if FFT_FP64
 
-// Handle the final squaring step on a pair of complex numbers.  Swap real and imaginary results for the inverse FFT.
-// We used to conjugate the results, but swapping real and imaginary can save some negations in carry propagation.
+// Why does this alternate implementation work?  Let t' be the conjugate of t and note that t*t' = 1.
+// Now consider these lines from the original implementation (comments appear alongside):
+//      b = mul(b, t);                                  bt
+//      X2(a, b);                                       a + bt, a - bt
+//      a = sq(a);                                      a^2 + 2abt + (bt)^2
+//      b = sq(b);                                      a^2 - 2abt + (bt)^2
+//      X2(a, b);                                       2a^2 + 2(bt)^2, 4abt
+//      b = mul_by_conjugate(b, t);                                     4ab
+
 void OVERLOAD onePairSq(T2* pa, T2* pb, T2 t_squared) {
   T2 a = *pa;
   T2 b = *pb;
 
 //  X2conjb(a, b);
 //  *pb = mul2(cmul(a, b));
-//  *pa = csqa(a, cmul(csq(b), -t_squared));
-//  X2_conjb(*pa, *pb);
-//  *pa = SWAP_XY(*pa), *pb = SWAP_XY(*pb)
+//  *pa = csqa(a, cmul(csq(b), t_squared));
+//  X2_conja(*pa, *pb);
 
   // Less readable version of the above that saves one complex add by using FMA instructions
   X2conjb(a, b);
-  T2 twoab = mul2(cmul(a, b));                          // 2ab
-  *pa = csqa(a, cfma(csq(b), -t_squared, twoab));       // final a = a^2 + 2ab - (bt)^2
-  (*pb).x = fma(-2.0, twoab.x, (*pa).x);                // final b = a^2 - 2ab - (bt)^2
-  (*pb).y = fma(2.0, twoab.y, -(*pa).y);                // conjugate(final b)
-  *pa = SWAP_XY(*pa), *pb = SWAP_XY(*pb);
+  T2 minusnewb = mulminus2(cmul(a, b));                          // -newb = -2ab
+  *pb = csqa(a, cfma(csq(b), t_squared, minusnewb));             // final b = newa - newb = a^2 + (bt)^2 - newb
+  (*pa).x = fma(-2.0, minusnewb.x, (*pb).x);                     // final a = newa + newb = finalb + 2 * newb
+  (*pa).y = fma(2.0, minusnewb.y, -(*pb).y);                     // conjugate(final a)
 }
 
 void OVERLOAD pairSq(u32 N, T2 *u, T2 *v, T2 base_squared, bool special) {
@@ -51,21 +56,21 @@ void OVERLOAD pairSq(u32 N, T2 *u, T2 *v, T2 base_squared, bool special) {
 
   for (i32 i = 0; i < NH / 4; ++i, base_squared = mul_t8(base_squared)) {
     if (special && i == 0 && me == 0) {
-      u[i] = SWAP_XY(2 * foo(u[i]));
-      v[i] = SWAP_XY(4 * csq(v[i]));
+      u[i] = 2 * foo(conjugate(u[i]));
+      v[i] = 4 * csq(conjugate(v[i]));
     } else {
-      onePairSq(&u[i], &v[i], base_squared);
+      onePairSq(&u[i], &v[i], -base_squared);
     }
 
     if (N == NH) {
-      onePairSq(&u[i+NH/2], &v[i+NH/2], -base_squared);
+      onePairSq(&u[i+NH/2], &v[i+NH/2], base_squared);
     }
 
     T2 new_base_squared = mul_t4(base_squared);
-    onePairSq(&u[i+NH/4], &v[i+NH/4], new_base_squared);
+    onePairSq(&u[i+NH/4], &v[i+NH/4], -new_base_squared);
 
     if (N == NH) {
-      onePairSq(&u[i+3*NH/4], &v[i+3*NH/4], -new_base_squared);
+      onePairSq(&u[i+3*NH/4], &v[i+3*NH/4], new_base_squared);
     }
   }
 }
@@ -133,9 +138,9 @@ KERNEL(G_H) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig) {
 #endif
 
 #if ZEROHACK_H
-  fft_HEIGHT(lds + ((u32) get_group_id(0) / 131072), u, smallTrig + ((u32) get_group_id(0) / 131072), w);
+  fft_HEIGHT(lds + (get_group_id(0) / 131072), u, smallTrig + (get_group_id(0) / 131072), w);
   bar();
-  fft_HEIGHT(lds + ((u32) get_group_id(0) / 131072), v, smallTrig + ((u32) get_group_id(0) / 131072), w);
+  fft_HEIGHT(lds + (get_group_id(0) / 131072), v, smallTrig + (get_group_id(0) / 131072), w);
 #else
   fft_HEIGHT(lds, u, smallTrig, w);
   bar();
@@ -209,13 +214,13 @@ void OVERLOAD pairSq2_special(T2 *u, T2 base_squared) {
   u32 me = get_local_id(0);
   for (i32 i = 0; i < NH / 4; ++i, base_squared = mul_t8(base_squared)) {
     if (i == 0 && me == 0) {
-      u[0] = SWAP_XY(2 * foo(u[0]));
-      u[NH/2] = SWAP_XY(4 * csq(u[NH/2]));
+      u[0] = 2 * foo(conjugate(u[0]));
+      u[NH/2] = 4 * csq(conjugate(u[NH/2]));
     } else {
-      onePairSq(&u[i], &u[NH/2+i], base_squared);
+      onePairSq(&u[i], &u[NH/2+i], -base_squared);
     }
     T2 new_base_squared = mul_t4(base_squared);
-    onePairSq(&u[i+NH/4], &u[NH/2+i+NH/4], new_base_squared);
+    onePairSq(&u[i+NH/4], &u[NH/2+i+NH/4], -new_base_squared);
   }
 }
 
@@ -252,7 +257,7 @@ KERNEL(G_H * 2) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig) {
 #endif
 
 #if ZEROHACK_H
-  new_fft_HEIGHT2_1(lds + ((u32) get_group_id(0) / 131072), u, smallTrig + ((u32) get_group_id(0) / 131072), w);
+  new_fft_HEIGHT2_1(lds + (get_group_id(0) / 131072), u, smallTrig + (get_group_id(0) / 131072), w);
 #else
   new_fft_HEIGHT2_1(lds, u, smallTrig, w);
 #endif
@@ -295,7 +300,11 @@ KERNEL(G_H * 2) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig) {
 #endif
     revCrossLine(G_H, lds, u + NH/2, NH/2, isSecondHalf);
     pairSq(NH/2, u, u + NH/2, trig, false);
+if (line_u == 2)
+for (int i = 0; i < NH; i++) printf ("F64post: %g %g   %u, %lu, %d\n", u[i].x, u[i].y, line_u, get_local_id(0), i);
+
     bar(G_H);
+    // We change the LDS halves we're using in order to enable half-bars
     revCrossLine(G_H, lds, u + NH/2, NH/2, !isSecondHalf);
   }
 
@@ -311,295 +320,6 @@ KERNEL(G_H * 2) tailSquare(P(T2) out, CP(T2) in, Trig smallTrig) {
 
 #endif
 
-  
-
-/**************************************************************************/
-/*          Similar to above, but for an NTT based on GF(M31^2)           */
-/**************************************************************************/
-
-#if NTT_GF31
-
-void OVERLOAD onePairSq(GF31* pa, GF31* pb, GF31 t_squared) {
-  GF31 a = *pa, b = *pb;
-
-  X2conjb(a, b);
-  GF31 c = sub(csq(a), cmul(csq(b), t_squared));
-  GF31 d = mul2(cmul(a, b));
-  X2_conjb(c, d);
-  *pa = SWAP_XY(c), *pb = SWAP_XY(d);
-}
-
-void OVERLOAD pairSq(u32 N, GF31 *u, GF31 *v, GF31 base_squared, bool special) {
-  u32 me = get_local_id(0);
-
-  for (i32 i = 0; i < NH / 4; ++i, base_squared = mul_t8(base_squared)) {
-    if (special && i == 0 && me == 0) {
-      u[i] = SWAP_XY(mul2(foo(u[i])));
-      v[i] = SWAP_XY(shl(csq(v[i]), 2));
-    } else {
-      onePairSq(&u[i], &v[i], base_squared);
-    }
-
-    if (N == NH) {
-      onePairSq(&u[i+NH/2], &v[i+NH/2], neg(base_squared));         //GWBUG -- can we write a special onepairsq that expects a base_squared that needs negation?
-    }
-
-    GF31 new_base_squared = mul_t4(base_squared);
-    onePairSq(&u[i+NH/4], &v[i+NH/4], new_base_squared);           //GWBUG -- or another special onePairSq that expects mul_t4'ed base_squared
-
-    if (N == NH) {
-      onePairSq(&u[i+3*NH/4], &v[i+3*NH/4], neg(new_base_squared));           //GWBUG -- or another special onePairSq that expects mul_t4'ed and negated base_squared
-    }
-  }
-}
-
-// The kernel tailSquareZero handles the special cases in tailSquare, i.e. the lines 0 and H/2
-// This kernel is launched with 2 workgroups (handling line 0, resp. H/2)
-KERNEL(G_H) tailSquareZeroGF31(P(GF31) out, CP(GF31) in, TrigGF31 smallTrig) {
-  local GF31 lds[SMALL_HEIGHT / 2];
-
-  in += DISTGF31, out += DISTGF31;
-
-  GF31 u[NH];
-  u32 H = ND / SMALL_HEIGHT;
-
-  // This kernel in executed in two workgroups.
-  u32 which = get_group_id(0);
-  assert(which < 2);
-
-  u32 line = which ? (H/2) : 0;
-  u32 me = get_local_id(0);
-  readTailFusedLine(in, u, line, me);
-
-  // Calculate number of trig values used by fft_HEIGHT (see genSmallTrigCombo in trigBufCache.cpp)
-  // The trig values used here are pre-computed and stored after the fft_HEIGHT trig values.
-  u32 height_trigs = SMALL_HEIGHT*1;
-#if TAIL_TRIGS >= 1
-  GF31 trig = smallTrig[height_trigs + me];
-#if SINGLE_WIDE
-  GF31 mult = smallTrig[height_trigs + G_H + line];
-#else
-  GF31 mult = smallTrig[height_trigs + G_H + which];
-#endif
-  trig = cmul(trig, mult);
-#else
-#if SINGLE_WIDE
-  GF31 trig = NTLOAD(smallTrig[height_trigs + line*G_H + me]);
-#else
-  GF31 trig = NTLOAD(smallTrig[height_trigs + which*G_H + me]);
-#endif
-#endif
-
-  fft_HEIGHT(lds, u, smallTrig);
-  reverse(G_H, lds, u + NH/2, !which);
-  pairSq(NH/2, u,   u + NH/2, trig, !which);
-  reverse(G_H, lds, u + NH/2, !which);
-  bar();
-  fft_HEIGHT(lds, u, smallTrig);
-  writeTailFusedLine(u, out, transPos(line, MIDDLE, WIDTH), me);
-}
-
-#if SINGLE_WIDE
-
-KERNEL(G_H) tailSquareGF31(P(GF31) out, CP(GF31) in, TrigGF31 smallTrig) {
-  local GF31 lds[SMALL_HEIGHT];
-
-  in += DISTGF31, out += DISTGF31;
-
-  GF31 u[NH], v[NH];
-
-  u32 H = ND / SMALL_HEIGHT;
-
-#if SINGLE_KERNEL
-  u32 line1 = get_group_id(0);
-  u32 line2 = line1 ? H - line1 : (H / 2);
-#else
-  u32 line1 = get_group_id(0) + 1;
-  u32 line2 = H - line1;
-#endif
-  u32 memline1 = transPos(line1, MIDDLE, WIDTH);
-  u32 memline2 = transPos(line2, MIDDLE, WIDTH);
-
-  u32 me = get_local_id(0);
-  readTailFusedLine(in, u, line1, me);
-  readTailFusedLine(in, v, line2, me);
-
-#if ZEROHACK_H
-  fft_HEIGHT(lds + ((u32) get_group_id(0) / 131072), u, smallTrig + ((u32) get_group_id(0) / 131072));
-  bar();
-  fft_HEIGHT(lds + ((u32) get_group_id(0) / 131072), v, smallTrig + ((u32) get_group_id(0) / 131072));
-#else
-  fft_HEIGHT(lds, u, smallTrig);
-  bar();
-  fft_HEIGHT(lds, v, smallTrig);
-#endif
-
-  // Compute trig values from scratch.  Good on GPUs with relatively slow memory.
-#if 0 && TAIL_TRIGS == 2
-  GF31 trig = slowTrigGF31(line1 + me * H, ND / NH);
-
-  // Do a little bit of memory access and a little bit of math.
-#elif TAIL_TRIGS >= 1
-  // Calculate number of trig values used by fft_HEIGHT (see genSmallTrigCombo in trigBufCache.cpp)
-  // The trig values used here are pre-computed and stored after the fft_HEIGHT trig values.
-  u32 height_trigs = SMALL_HEIGHT*1;
-  // Read a hopefully cached line of data and one non-cached GF31 per line
-  GF31 trig = smallTrig[height_trigs + me];                    // Trig values for line zero, should be cached
-  GF31 mult = smallTrig[height_trigs + G_H + line1];           // Line multiplier
-  trig = cmul(trig, mult);
-
-  // On consumer-grade GPUs, it is likely beneficial to read all trig values.
-#else
-  // Calculate number of trig values used by fft_HEIGHT (see genSmallTrigCombo in trigBufCache.cpp)
-  // The trig values used here are pre-computed and stored after the fft_HEIGHT trig values.
-  u32 height_trigs = SMALL_HEIGHT*1;
-  // Read pre-computed trig values
-  GF31 trig = NTLOAD(smallTrig[height_trigs + line1*G_H + me]);
-#endif
-
-#if SINGLE_KERNEL
-  if (line1 == 0) {
-    // Line 0 is special: it pairs with itself, offseted by 1.
-    reverse(G_H, lds, u + NH/2, true);
-    pairSq(NH/2, u,   u + NH/2, trig, true);
-    reverse(G_H, lds, u + NH/2, true);
-
-    // Line H/2 also pairs with itself (but without offset).
-    GF31 trig2 = cmul(trig, TAILTGF31);
-    reverse(G_H, lds, v + NH/2, false);
-    pairSq(NH/2, v,   v + NH/2, trig2, false);
-    reverse(G_H, lds, v + NH/2, false);
-  }
-  else {
-#else
-  if (1) {
-#endif
-    reverseLine(G_H, lds, v);
-    pairSq(NH, u, v, trig, false);
-    reverseLine(G_H, lds, v);
-  }
-
-  bar();
-  fft_HEIGHT(lds, v, smallTrig);
-  bar();
-  fft_HEIGHT(lds, u, smallTrig);
-
-  writeTailFusedLine(v, out, memline2, me);
-  writeTailFusedLine(u, out, memline1, me);
-}
-
-
-//
-// Create a kernel that uses a double-wide workgroup (u in half the workgroup, v in the other half)
-// We hope to get better occupancy with the reduced register usage
-//
-
-#else
-
-// Special pairSq for double-wide line 0
-void OVERLOAD pairSq2_special(GF31 *u, GF31 base_squared) {
-  u32 me = get_local_id(0);
-  for (i32 i = 0; i < NH / 4; ++i, base_squared = mul_t8(base_squared)) {
-    if (i == 0 && me == 0) {
-      u[0] = SWAP_XY(mul2(foo(u[0])));
-      u[NH/2] = SWAP_XY(shl(csq(u[NH/2]), 2));
-    } else {
-      onePairSq(&u[i], &u[NH/2+i], base_squared);   //GWBUG - why are we only using neg(base squareds)  onePairSq could easily compensate for this
-    }
-    GF31 new_base_squared = mul_t4(base_squared);
-    onePairSq(&u[i+NH/4], &u[NH/2+i+NH/4], new_base_squared);
-  }
-}
-
-KERNEL(G_H * 2) tailSquareGF31(P(GF31) out, CP(GF31) in, TrigGF31 smallTrig) {
-  local GF31 lds[SMALL_HEIGHT];
-
-  in += DISTGF31, out += DISTGF31;
-
-  GF31 u[NH];
-
-  u32 H = ND / SMALL_HEIGHT;
-
-#if SINGLE_KERNEL
-  u32 line_u = get_group_id(0);
-  u32 line_v = line_u ? H - line_u : (H / 2);
-#else
-  u32 line_u = get_group_id(0) + 1;
-  u32 line_v = H - line_u;
-#endif
-
-  u32 me = get_local_id(0);
-  u32 lowMe = me % G_H;  // lane-id in one of the two halves (half-workgroups).
-
-  // We're going to call the halves "first-half" and "second-half".
-  bool isSecondHalf = me >= G_H;
-
-  u32 line = !isSecondHalf ? line_u : line_v;
-
-  // Read lines u and v
-  readTailFusedLine(in, u, line, lowMe);
-
-#if ZEROHACK_H
-  new_fft_HEIGHT2_1(lds + ((u32) get_group_id(0) / 131072), u, smallTrig + (get_group_id(0) / 131072));
-#else
-  new_fft_HEIGHT2_1(lds, u, smallTrig);
-#endif
-
-  // Compute trig values from scratch.  Good on GPUs with high MUL throughput.
-#if 0 && TAIL_TRIGS == 2
-  GF31 trig = slowTrigGF31(line + H * lowMe, ND / NH * 2);
-
-  // Do a little bit of memory access and a little bit of math.  Good on a Radeon VII.
-#elif TAIL_TRIGS >= 1
-  // Calculate number of trig values used by fft_HEIGHT (see genSmallTrigCombo in trigBufCache.cpp)
-  // The trig values used here are pre-computed and stored after the fft_HEIGHT trig values.
-  u32 height_trigs = SMALL_HEIGHT*1;
-  // Read a hopefully cached line of data and one non-cached GF31 per line
-  GF31 trig = smallTrig[height_trigs + lowMe];                                 // Trig values for line zero, should be cached
-  GF31 mult = smallTrig[height_trigs + G_H + line_u*2 + isSecondHalf];         // Two multipliers.  One for line u, one for line v.
-  trig = cmul(trig, mult);
-
-  // On consumer-grade GPUs, it is likely beneficial to read all trig values.
-#else
-  // Calculate number of trig values used by fft_HEIGHT (see genSmallTrigCombo in trigBufCache.cpp)
-  // The trig values used here are pre-computed and stored after the fft_HEIGHT trig values.
-  u32 height_trigs = SMALL_HEIGHT*1;
-  // Read pre-computed trig values
-  GF31 trig = NTLOAD(smallTrig[height_trigs + line_u*G_H*2 + me]);
-#endif
-
-  bar(G_H);
-
-#if SINGLE_KERNEL
-  // Line 0 and H/2 are special: they pair with themselves, line 0 is offseted by 1.
-  if (line_u == 0) {
-    reverse2(lds, u);
-    pairSq2_special(u, trig);
-    reverse2(lds, u);
-  }
-  else {
-#else
-  if (1) {
-#endif
-    revCrossLine(G_H, lds, u + NH/2, NH/2, isSecondHalf);
-    pairSq(NH/2, u, u + NH/2, trig, false);
-    bar(G_H);
-    revCrossLine(G_H, lds, u + NH/2, NH/2, !isSecondHalf);
-  }
-
-  bar(G_H);
-
-  new_fft_HEIGHT2_2(lds, u, smallTrig);
-
-  // Write lines u and v
-  writeTailFusedLine(u, out, transPos(line, MIDDLE, WIDTH), lowMe);
-}
-
-#endif
-
-#endif
-
-  
 
 /**************************************************************************/
 /*          Similar to above, but for an NTT based on GF(M61^2)           */
@@ -610,20 +330,71 @@ KERNEL(G_H * 2) tailSquareGF31(P(GF31) out, CP(GF31) in, TrigGF31 smallTrig) {
 void OVERLOAD onePairSq(GF61* pa, GF61* pb, GF61 t_squared) {
   GF61 a = *pa, b = *pb;
 
-  X2conjb(a, b);
-  GF61 c = csqs(a, cmul(csq(b), t_squared));
-  GF61 d = cmul(a, b);
-  X2mul2b_conjb(c, d);
-  *pa = SWAP_XY(c), *pb = SWAP_XY(d);
+// Mimic FP64:
+//  X2conjb(a, b);
+//  *pa = add(csq(a), cmul(csq(b), t_squared));         // a^2 + (bt)^2
+//  *pb = mul2(cmul(a, b));                             // 2ab
+//  X2_conja(*pa, *pb);
+
+//Mimic Yves:
+#if 1
+X2conjb(a, b);
+GF61 c = sub(csq(a), cmul(csq(b), t_squared)), d = shl(cmul(a, b), 1);
+X2_conja(c, d);
+*pa = c; *pb = d;
+
+//*pa = conjugate(*pa), *pb = conjugate(*pb);  // deconjugate
+//swapper(*pa, *pb);
+#else
+
+//a = conjugate(a), b = conjugate(b);
+
+//X2conjb(a, b);
+//GF61 c = sub(csq(a), cmul(csq(b), t_squared)), d = shl(cmul(a, b), 1);
+//X2(c, d), d = conjugate(d);
+
+//c = conjugate(c), d = conjugate(d);
+//*pa = c; *pb = d;
+#endif
 }
 
+#if 0
 void OVERLOAD pairSq(u32 N, GF61 *u, GF61 *v, GF61 base_squared, bool special) {
   u32 me = get_local_id(0);
 
   for (i32 i = 0; i < NH / 4; ++i, base_squared = mul_t8(base_squared)) {
     if (special && i == 0 && me == 0) {
-      u[i] = SWAP_XY(mul2(foo(u[i])));
-      v[i] = SWAP_XY(shl(csq(v[i]), 2));
+      u[i] = mul2(foo(conjugate(u[i])));
+      v[i] = shl(csq(conjugate(v[i])), 2);
+    } else {
+      onePairSq(&u[i], &v[i], neg(base_squared));                       //GWBUG -- can we write a special onepairsq that expects a base_squared that needs negation?
+    }
+
+    if (N == NH) {
+      onePairSq(&u[i+NH/2], &v[i+NH/2], base_squared);
+    }
+
+    GF61 new_base_squared = mul_t4(base_squared);
+    onePairSq(&u[i+NH/4], &v[i+NH/4], neg(new_base_squared));           //GWBUG -- or another special onePairSq that expects mul_t4'ed base_squared
+
+    if (N == NH) {
+      onePairSq(&u[i+3*NH/4], &v[i+3*NH/4], new_base_squared);
+    }
+  }
+}
+#else
+void OVERLOAD pairSq(u32 N, GF61 *u, GF61 *v, GF61 base_squared, bool special) {
+  u32 me = get_local_id(0);
+
+  for (i32 i = 0; i < NH / 4; ++i, base_squared = mul_t8(base_squared)) {
+    if (special && i == 0 && me == 0) {
+//u[i] = conjugate(u[i]), v[i] = conjugate(v[i]);
+      u[i] = mul2(foo(u[i]));
+      v[i] = shl(csq(v[i]), 2);
+
+u[i] = conjugate(u[i]), v[i] = conjugate(v[i]);
+//swapper(u[i], v[i]);
+
     } else {
       onePairSq(&u[i], &v[i], base_squared);
     }
@@ -640,6 +411,7 @@ void OVERLOAD pairSq(u32 N, GF61 *u, GF61 *v, GF61 base_squared, bool special) {
     }
   }
 }
+#endif
 
 // The kernel tailSquareZero handles the special cases in tailSquare, i.e. the lines 0 and H/2
 // This kernel is launched with 2 workgroups (handling line 0, resp. H/2)
@@ -664,23 +436,18 @@ KERNEL(G_H) tailSquareZeroGF61(P(GF61) out, CP(GF61) in, TrigGF61 smallTrig) {
   u32 height_trigs = SMALL_HEIGHT*1;
 #if TAIL_TRIGS >= 1
   GF61 trig = smallTrig[height_trigs + me];
-#if SINGLE_WIDE
   GF61 mult = smallTrig[height_trigs + G_H + line];
-#else
-  GF61 mult = smallTrig[height_trigs + G_H + which];
-#endif
   trig = cmul(trig, mult);
 #else
-#if SINGLE_WIDE
   GF61 trig = NTLOAD(smallTrig[height_trigs + line*G_H + me]);
-#else
-  GF61 trig = NTLOAD(smallTrig[height_trigs + which*G_H + me]);
-#endif
 #endif
 
   fft_HEIGHT(lds, u, smallTrig);
   reverse(G_H, lds, u + NH/2, !which);
+GF61 uu[NH]; for (int i = 0; i < NH; i++) uu[i] = u[i];
   pairSq(NH/2, u,   u + NH/2, trig, !which);
+//if (line==0)
+//for (int i = 0; i < NH; i++) printf ("Zpre: %lX %lX Zpost: %lX %lX  Trig: %lX %lX   %u, %lu, %d\n", uu[i].x, uu[i].y, u[i].x, u[i].y, trig.x, trig.y, line, get_local_id(0), i);
   reverse(G_H, lds, u + NH/2, !which);
   bar();
   fft_HEIGHT(lds, u, smallTrig);
@@ -689,7 +456,7 @@ KERNEL(G_H) tailSquareZeroGF61(P(GF61) out, CP(GF61) in, TrigGF61 smallTrig) {
 
 #if SINGLE_WIDE
 
-KERNEL(G_H) tailSquareGF61(P(GF61) out, CP(GF61) in, TrigGF61 smallTrig) {
+KERNEL(G_H) tailSquareGF61(P(GF61) out, CP(GF61) in, Trig smallTrig) {
   local GF61 lds[SMALL_HEIGHT];
 
   in += DISTGF61, out += DISTGF61;
@@ -713,9 +480,9 @@ KERNEL(G_H) tailSquareGF61(P(GF61) out, CP(GF61) in, TrigGF61 smallTrig) {
   readTailFusedLine(in, v, line2, me);
 
 #if ZEROHACK_H
-  fft_HEIGHT(lds + ((u32) get_group_id(0) / 131072), u, smallTrig + ((u32) get_group_id(0) / 131072));
+  fft_HEIGHT(lds + (get_group_id(0) / 131072), u, smallTrig + (get_group_id(0) / 131072));
   bar();
-  fft_HEIGHT(lds + ((u32) get_group_id(0) / 131072), v, smallTrig + ((u32) get_group_id(0) / 131072));
+  fft_HEIGHT(lds + (get_group_id(0) / 131072), v, smallTrig + (get_group_id(0) / 131072));
 #else
   fft_HEIGHT(lds, u, smallTrig);
   bar();
@@ -753,7 +520,7 @@ KERNEL(G_H) tailSquareGF61(P(GF61) out, CP(GF61) in, TrigGF61 smallTrig) {
     reverse(G_H, lds, u + NH/2, true);
 
     // Line H/2 also pairs with itself (but without offset).
-    GF61 trig2 = cmul(trig, U2((Z61) TAILTGF61.x, (Z61) TAILTGF61.y);
+    T2 trig2 = cmul(trig, TAILT);
     reverse(G_H, lds, v + NH/2, false);
     pairSq(NH/2, v,   v + NH/2, trig2, false);
     reverse(G_H, lds, v + NH/2, false);
@@ -785,12 +552,31 @@ KERNEL(G_H) tailSquareGF61(P(GF61) out, CP(GF61) in, TrigGF61 smallTrig) {
 #else
 
 // Special pairSq for double-wide line 0
+#if 0
 void OVERLOAD pairSq2_special(GF61 *u, GF61 base_squared) {
   u32 me = get_local_id(0);
   for (i32 i = 0; i < NH / 4; ++i, base_squared = mul_t8(base_squared)) {
     if (i == 0 && me == 0) {
-      u[0] = SWAP_XY(mul2(foo(u[0])));
-      u[NH/2] = SWAP_XY(shl(csq(u[NH/2]), 2));
+      u[0] = mul2(foo(conjugate(u[0])));
+      u[NH/2] = shl(csq(conjugate(u[NH/2])), 2);
+    } else {
+      onePairSq(&u[i], &u[NH/2+i], neg(base_squared));   //GWBUG - why are we only using neg(base squareds)  onePairSq could easily compensate for this
+    }
+    GF61 new_base_squared = mul_t4(base_squared);
+    onePairSq(&u[i+NH/4], &u[NH/2+i+NH/4], neg(new_base_squared));
+  }
+}
+#else
+void OVERLOAD pairSq2_special(GF61 *u, GF61 base_squared) {
+  u32 me = get_local_id(0);
+  for (i32 i = 0; i < NH / 4; ++i, base_squared = mul_t8(base_squared)) {
+    if (i == 0 && me == 0) {
+//u[0] = conjugate(u[0]), u[NH/2] = conjugate(u[NH/2]);
+      u[0] = mul2(foo(u[0]));
+      u[NH/2] = shl(csq(u[NH/2]), 2);
+
+u[0] = conjugate(u[0]), u[NH/2] = conjugate(u[NH/2]);
+//swapper(u[0], u[NH/2]);
     } else {
       onePairSq(&u[i], &u[NH/2+i], base_squared);   //GWBUG - why are we only using neg(base squareds)  onePairSq could easily compensate for this
     }
@@ -798,6 +584,7 @@ void OVERLOAD pairSq2_special(GF61 *u, GF61 base_squared) {
     onePairSq(&u[i+NH/4], &u[NH/2+i+NH/4], new_base_squared);
   }
 }
+#endif
 
 KERNEL(G_H * 2) tailSquareGF61(P(GF61) out, CP(GF61) in, TrigGF61 smallTrig) {
   local GF61 lds[SMALL_HEIGHT];
@@ -828,7 +615,7 @@ KERNEL(G_H * 2) tailSquareGF61(P(GF61) out, CP(GF61) in, TrigGF61 smallTrig) {
   readTailFusedLine(in, u, line, lowMe);
 
 #if ZEROHACK_H
-  new_fft_HEIGHT2_1(lds + ((u32) get_group_id(0) / 131072), u, smallTrig + (get_group_id(0) / 131072));
+  new_fft_HEIGHT2_1(lds + (get_group_id(0) / 131072), u, smallTrig + (get_group_id(0) / 131072));
 #else
   new_fft_HEIGHT2_1(lds, u, smallTrig);
 #endif
@@ -862,7 +649,9 @@ KERNEL(G_H * 2) tailSquareGF61(P(GF61) out, CP(GF61) in, TrigGF61 smallTrig) {
   // Line 0 and H/2 are special: they pair with themselves, line 0 is offseted by 1.
   if (line_u == 0) {
     reverse2(lds, u);
+//for (int i = 0; i < NH; i++)  printf ("pre-sq: %lX %lX   %lu, %d\n", u[i].x, u[i].y, get_local_id(0), i);
     pairSq2_special(u, trig);
+//for (int i = 0; i < NH; i++)  printf ("post-sq: %lX %lX   %lu %lu   %lu, %d\n", u[i].x, u[i].y, trig.x, trig.y, get_local_id(0), i);
     reverse2(lds, u);
   }
   else {
@@ -870,8 +659,13 @@ KERNEL(G_H * 2) tailSquareGF61(P(GF61) out, CP(GF61) in, TrigGF61 smallTrig) {
   if (1) {
 #endif
     revCrossLine(G_H, lds, u + NH/2, NH/2, isSecondHalf);
+GF61 uu[NH]; for (int i = 0; i < NH; i++) uu[i] = u[i];
     pairSq(NH/2, u, u + NH/2, trig, false);
+if (line_u == 2)
+for (int i = 0; i < NH; i++) printf ("pre: %lX %lX post: %lX %lX  Trig: %lX %lX   %u, %lu, %d\n", uu[i].x, uu[i].y, u[i].x, u[i].y, trig.x, trig.y, line_u, get_local_id(0), i);
+
     bar(G_H);
+    // We change the LDS halves we're using in order to enable half-bars
     revCrossLine(G_H, lds, u + NH/2, NH/2, !isSecondHalf);
   }
 
