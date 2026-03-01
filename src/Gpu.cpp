@@ -737,7 +737,6 @@ Gpu::Gpu(Queue* q, GpuCommon shared, FFTConfig fft, u64 E, const vector<KeyVal>&
     selftestTrig();
   }
 
-  queue->setSquareKernels(1 + 3 * (fft.FFT_FP64 + fft.FFT_FP32 + fft.NTT_GF31 + fft.NTT_GF61));
   queue->finish();
 }
 
@@ -1748,7 +1747,6 @@ double Gpu::timePRP(int quick) {        // Quick varies from 1 (slowest, longest
   if (Signal::stopRequested()) { throw "stop requested"; }
 
   Timer t;
-  queue->setSquareTime(0);     // Busy wait on nVidia to get the most accurate timings while tuning
   while (true) {
     while (k % blockSize < blockSize-1) {
       square(bufData, bufData, leadIn, leadOut);
@@ -1887,11 +1885,15 @@ PRPResult Gpu::isPrimePRP(const Task& task) {
       log("%s %8" PRIu64 " / %" PRIu64 ", %s\n", isPrime ? "PP" : "CC", kEnd, E, hex(finalRes64).c_str());
     }
 
-    if (!doCheck && !doLog) continue;
+    if (!leadOut || (!doCheck && !doLog)) {
+      if (k % args.flushStep == 0) { queue->finish(); }
+      continue;
+    }
+
+    assert(doCheck || doLog);
 
     u64 res = dataResidue();
     float secsPerIt = iterationTimer.reset(k);
-    queue->setSquareTime((int) (secsPerIt * 1'000'000));
 
     vector<Word> rawCheck = readChecked(bufCheck);
     if (rawCheck.empty()) {
@@ -2009,7 +2011,10 @@ LLResult Gpu::isPrimeLL(const Task& task) {
     squareLL(bufData, leadIn, leadOut);
     leadIn = leadOut;
 
-    if (!doLog) continue;
+    if (!doLog) {
+      if (k % args.flushStep == 0) { queue->finish(); } // Periodically flush the queue
+      continue;
+    }
 
     u64 res64 = 0;
     auto data = readData();
@@ -2032,7 +2037,6 @@ LLResult Gpu::isPrimeLL(const Task& task) {
     }
 
     float secsPerIt = iterationTimer.reset(k);
-    queue->setSquareTime((int) (secsPerIt * 1'000'000));
     log("%9" PRIu64 " %016" PRIx64 " %4.0f\n", k, res64, secsPerIt * 1'000'000);
 
     if (k >= kEnd) { return {isAllZero, res64}; }
@@ -2085,14 +2089,16 @@ array<u64, 4> Gpu::isCERT(const Task& task) {
     squareCERT(bufData, leadIn, leadOut);
     leadIn = leadOut;
 
-    if (!doLog) continue;
+    if (!doLog) {
+      if (k % args.flushStep == 0) { queue->finish(); } // Periodically flush the queue
+      continue;
+    }
 
     Words data = readData();
     assert(data.size() >= 2);
     u64 res64 = (u64(data[1]) << 32) | data[0];
 
     float secsPerIt = iterationTimer.reset(k);
-    queue->setSquareTime((int) (secsPerIt * 1'000'000));
     log("%7u / %7u %016" PRIx64 " %4.0f ETA %s\n", k, kEnd, res64, secsPerIt * 1'000'000, getETA(k, kEnd, secsPerIt).c_str());
 
     if (k >= kEnd) {

@@ -75,6 +75,7 @@ public:
   u32 workers = 1;
   u32 blockSize = 1000;
   u32 logStep = 20000;
+  u32 flushStep = 400;
   string fftSpec;
 
   u64 prpExp = 0;
