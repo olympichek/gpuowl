@@ -1885,7 +1885,7 @@ PRPResult Gpu::isPrimePRP(const Task& task) {
       log("%s %8" PRIu64 " / %" PRIu64 ", %s\n", isPrime ? "PP" : "CC", kEnd, E, hex(finalRes64).c_str());
     }
 
-    if (!leadOut || (!doCheck && !doLog)) {
+    if (leadOut == LEAD_WIDTH || (!doCheck && !doLog)) {
       if (k % args.flushStep == 0) { queue->finish(); }
       continue;
     }
