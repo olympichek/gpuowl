@@ -6231,3 +6231,61 @@ product.  Independent product scheduling cannot hide a roughly twentyfold
 primitive deficit.  Decision: **reject exact FP64 offload inside M61 before an
 NTT tile or production integration.**  This also rules out a hybrid FP64
 pipeline as the missing complement to the power-limited integer transform.
+
+## Fused two-dimensional lazy M61 limbs
+
+The persistent-radix-`2^31` rejection above ended with one explicit reopening
+condition: a future limb representation must avoid normalizing each scalar
+product independently across the quadratic-field multiply.  That condition had
+not been tested.  The new gate combines the radix-`2^31` and Gaussian algebra
+before reduction instead of repeating the old limb multiplier.
+
+Write a centered M61 scalar as `a0 + B*a1`, `B=2^31`.  Because
+`B^2=2 (mod M61)`, an unreduced scalar product is the coefficient pair
+
+```text
+(a0*b0 + 2*a1*b1, a0*b1 + a1*b0).
+```
+
+Balanced digits bound every coefficient in signed 64 bits.  The first exact
+form uses three 32-bit Karatsuba products for each of `ac`, `bd`, and
+`(a+b)(c+d)`, combines the three raw pairs into the real and imaginary results,
+and only then performs two final Mersenne normalizations.  A single carry fold
+is sufficient: after folding the low coefficient, the high digit is in
+`[0,B)` and the remaining low digit is within roughly `(-1.5B,2.5B)`, so its
+signed assembly fits 64 bits and needs at most one M61 correction.
+
+The strengthened representation stores both quadratic components persistently
+as four balanced 32-bit digits, retaining the incumbent 16-byte state size.  A
+second variant removes modular normalization of the complex Karatsuba sums:
+`ac` and `bd` use three products each, while the unnormalised joined term uses
+four schoolbook products.  This **ten-product** form eliminates two balanced
+add/recenter paths and is the fastest result.  It is materially different from
+both earlier limb gates, which reduced three scalar M61 products separately.
+
+[`src/cuda/m61_limb_bench.cu`](src/cuda/m61_limb_bench.cu) checks all
+2,097,152 quadratic values after the accumulated warm-up/timed chains against
+the incumbent, and independently recomputes the first complete chain with host
+`unsigned __int128`.  All variants pass.  The best
+persistent-ten-product kernel uses 34 registers with no stack or spills, versus
+32 for the incumbent.  Fresh 31-sample medians are:
+
+| Dependent quadratic products | incumbent wide M61 | persistent fused ten-product | candidate/incumbent |
+|---:|---:|---:|---:|
+| 1 | 15.712 us | 16.448 us | 1.047x |
+| 8 | 50.400 us | 56.800 us | 1.127x |
+| 32 | 175.648 us | 208.256 us | 1.186x |
+
+This is substantially better than the old persistent-limb result, which was
+about 2.9x at long chains, and confirms that fusing both algebra dimensions was
+the right strengthening.  It still loses before charging limb-wise butterfly
+addition, subtraction, rotation, or transform integration.  Final SASS has only
+ten signed `IMAD.WIDE` products in the loop but pays a longer serial network of
+signed shifts, carry folds, and 64-bit additions; reducing the multiply count
+does not reduce the critical dependency graph enough.
+
+Decision: **reject the persistent fused-limb M61 representation at the exact
+arithmetic gate.**  Do not repeat separately-normalized limb transforms.  A
+future reopening would need to remove the remaining cross-limb normalization
+from an entire radix group, not merely from one quadratic product; the current
+candidate is already 12--19% behind before those group operations.
