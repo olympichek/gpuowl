@@ -6544,3 +6544,68 @@ M31 stream by a second wide field removes the incumbent's complementary
 arithmetic scheduling.  Do not repeat this design with a larger complement;
 the selected q is already the most reduction-favorable compatible candidate
 found, and generic Montgomery was faster than its pseudo-Mersenne fold.
+
+## Width ownership reduction at fixed `512x8x512`
+
+After the two-61-bit rejection, the registry was checked for an experiment
+that changed the number of width values owned by each thread without changing
+the exact production transform shape.  The existing shape sweeps changed both
+the width factorization and ownership together; the one-warp tail work instead
+increased ownership.  There was no prior test of fewer values per thread in
+the production `512x8x512` M31/M61 pipeline.
+
+The first scaffold overrode `NW=8` with `NW=4`, giving 128 threads and four
+values per thread.  It exposed two assumptions that made its early timings
+invalid:
+
+1. when width and height are both 512, the production radix-eight width table
+   aliases the larger height/tail trig table; a different width radix needs a
+   standalone table and different per-field offsets; and
+2. the radix-four padded shared-memory formulas were sized for the original
+   256-point case.  Compute Sanitizer found out-of-bounds shared reads in
+   `fftP`; disabling padding removed the memory error.
+
+Even after both layout issues were removed, radix four is not an exact
+factorization of a 512-point transform.  The generic loop performs five
+radix-four levels, algebraically describing 1024 points.  Its apparently fast
+output was therefore an incorrect timing scaffold and must not be quoted as a
+candidate result.  A correct mixed-radix implementation would require a real
+binary coupling stage, not just a smaller `NW` define.
+
+The decisive implementation instead adds a true radix-two width transform:
+`NW=2`, `G_W=256`, two values per thread, nine exact binary levels, and the
+compact unpadded shuffle layout.  It retains the production 4M coefficient
+population, M31/M61 fields, middle/height transforms, Hermitian square, CRT,
+and carry.  It matched the production residues at every checked point:
+
+```text
+iteration  2,000: 05d6515c416b83e2
+iteration 10,000: 52316d51aa52e6b7
+iteration 20,000: 6a5c8b8989125413
+iteration 40,000: b597cca6031938ff
+iteration 50,000: cce5a14b7c17aecb
+```
+
+A matched pair of fresh 50,000-iteration runs on the RTX PRO 6000 Blackwell
+Max-Q measured:
+
+| Exact p136 path | Final timing | Relative |
+|---|---:|---:|
+| production radix eight, eight values/thread | **202.3 us** | 1.000 |
+| radix two, two values/thread | 264.8 us | **1.309** |
+
+Event profiling explains the regression.  The kernels outside the fused edge
+were essentially unchanged, but `kCarryFused` increased from 71.0 to 136.1
+us/call.  Reducing live vectors does lower per-thread state, but it doubles the
+thread population and replaces three radix-eight levels with nine
+shuffle/barrier/twiddle levels inside the already critical fused carry kernel.
+Changing `WMUL` from two to one did not recover the loss (259.7 versus 260.6
+us in matched 10,000-iteration smoke runs).
+
+Decision: **reject reduced width ownership for this production shape.**  The
+exact radix-two prototype is useful evidence that register ownership is not
+the limiting resource: the incumbent's coarse radix and low synchronization
+count are substantially more valuable.  Do not implement the missing
+radix-four-by-radix-two mixed path unless a new design removes rather than
+adds fused-edge synchronization; its best plausible behavior lies between
+the rejected binary path and the already faster radix-eight incumbent.

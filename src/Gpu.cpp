@@ -433,6 +433,7 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
                               "OUT_WG",
                               "UNROLL_H",
                               "UNROLL_W",
+                              "WIDTH_NW",              // Experimental per-thread width ownership (2, 4, or 8)
                               "ZEROHACK_H",
                               "ZEROHACK_W",
                               "NO_ASM",
@@ -491,6 +492,13 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
     if (k == "PAD") pad_size = atoi(v.c_str());
   }
 
+  // The padded shuffle layouts only have specialized address formulas for
+  // radix 4 and radix 8.  Radix 2 uses the compact, generic shuffle layout.
+  if (config.contains("WIDTH_NW") &&
+      stoul(config.at("WIDTH_NW")) == 2) {
+    config["LDSPAD_W"] = "0";
+  }
+
   // Maximum WMUL is 32KB / (WIDTH * SHUFL_BYTES_W).  If using the 32KB maximum, LDS padding must be disabled.
   // Furthermore, I've seen the CUDA compiler refuse to create a kernel with 1024 threads.  Thus, we limit WMUL to 2 for a 1K width and to 1 for a 4K width.
   {
@@ -536,12 +544,19 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
   if (doLog) { log("config: %s\n", defines.c_str()); }
 
   defines += toDefine("EXP", E);
+  u32 const widthNW = config.contains("WIDTH_NW") ?
+    u32(stoul(config.at("WIDTH_NW"))) : fft.shape.nW();
+  if ((widthNW != 2 && widthNW != 4 && widthNW != 8) ||
+      fft.shape.width % widthNW != 0) {
+    throw runtime_error("WIDTH_NW must be 2, 4, or 8 and divide the FFT width");
+  }
+
   defines += toDefine(initializer_list<pair<string, u32>>{
                     {"WIDTH", fft.shape.width},
                     {"SMALL_HEIGHT", fft.shape.height},
                     {"MIDDLE", fft.shape.middle},
                     {"CARRY_LEN", carryLength(args, fft)},
-                    {"NW", fft.shape.nW()},
+                    {"NW", widthNW},
                     {"NH", fft.shape.nH()}
                   });
 
@@ -674,13 +689,18 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
 
   // When using multiple NTT primes or hybrid FFT/NTT, each FFT/NTT prime's data buffer and trig values are combined into one buffer.
   // The openCL code needs to know the offset to the data and trig values.  Distances are in "number of double2 values".
+  bool const widthTrigUsesCombo = fft.shape.width == fft.shape.height &&
+                                  widthNW == fft.shape.nH();
+  u32 const wTrigMiddle = widthTrigUsesCombo ? fft.shape.middle : 0;
+  u32 const wTrigHeight = widthTrigUsesCombo ? fft.shape.height : 0;
+  u32 const wTrigNH = widthTrigUsesCombo ? fft.shape.nH() : 0;
   if (fft.NTT_RIESEL) {
     u32 const data31Plane = GF31_DATA_SIZE(fft.shape.width, fft.shape.middle, fft.shape.height, in_place, pad_size) / 2;
     u32 const data61Plane = fft.NTT_GF61 ?
       GF61_DATA_SIZE(fft.shape.width, fft.shape.middle, fft.shape.height, in_place, pad_size) / 2 : 0;
-    u32 const w31Plane = SMALLTRIG_GF31_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH());
+    u32 const w31Plane = SMALLTRIG_GF31_DIST(fft.shape.width, wTrigMiddle, wTrigHeight, wTrigNH);
     u32 const w61Plane = fft.NTT_GF61 ?
-      SMALLTRIG_GF61_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()) : 0;
+      SMALLTRIG_GF61_DIST(fft.shape.width, wTrigMiddle, wTrigHeight, wTrigNH) : 0;
     u32 const m31Plane = MIDDLETRIG_GF31_DIST(fft.shape.width, fft.shape.middle, fft.shape.height);
     u32 const m61Plane = fft.NTT_GF61 ?
       MIDDLETRIG_GF61_DIST(fft.shape.width, fft.shape.middle, fft.shape.height) : 0;
@@ -707,7 +727,7 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
   else if (fft.FFT_FP64 && fft.NTT_GF31) {
     // GF31 data is located after the FP64 data.  Compute size of the FP64 data and trigs.
     defines += toDefine("DISTGF31",      FP64_DATA_SIZE(fft.shape.width, fft.shape.middle, fft.shape.height, in_place, pad_size) / 2);
-    defines += toDefine("DISTWTRIGGF31", SMALLTRIG_FP64_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
+    defines += toDefine("DISTWTRIGGF31", SMALLTRIG_FP64_DIST(fft.shape.width, wTrigMiddle, wTrigHeight, wTrigNH));
     defines += toDefine("DISTMTRIGGF31", MIDDLETRIG_FP64_DIST(fft.shape.width, fft.shape.middle, fft.shape.height));
     defines += toDefine("DISTHTRIGGF31", SMALLTRIGCOMBO_FP64_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
   }
@@ -715,25 +735,25 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
     // GF31 and GF61 data is located after the FP32 data.  Compute size of the FP32 data and trigs.
     u32 sz1, sz2, sz3, sz4;
     defines += toDefine("DISTGF31",      sz1 = FP32_DATA_SIZE(fft.shape.width, fft.shape.middle, fft.shape.height, in_place, pad_size) / 2);
-    defines += toDefine("DISTWTRIGGF31", sz2 = SMALLTRIG_FP32_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
+    defines += toDefine("DISTWTRIGGF31", sz2 = SMALLTRIG_FP32_DIST(fft.shape.width, wTrigMiddle, wTrigHeight, wTrigNH));
     defines += toDefine("DISTMTRIGGF31", sz3 = MIDDLETRIG_FP32_DIST(fft.shape.width, fft.shape.middle, fft.shape.height));
     defines += toDefine("DISTHTRIGGF31", sz4 = SMALLTRIGCOMBO_FP32_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
     defines += toDefine("DISTGF61",      sz1 + GF31_DATA_SIZE(fft.shape.width, fft.shape.middle, fft.shape.height, in_place, pad_size) / 2);
-    defines += toDefine("DISTWTRIGGF61", sz2 + SMALLTRIG_GF31_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
+    defines += toDefine("DISTWTRIGGF61", sz2 + SMALLTRIG_GF31_DIST(fft.shape.width, wTrigMiddle, wTrigHeight, wTrigNH));
     defines += toDefine("DISTMTRIGGF61", sz3 + MIDDLETRIG_GF31_DIST(fft.shape.width, fft.shape.middle, fft.shape.height));
     defines += toDefine("DISTHTRIGGF61", sz4 + SMALLTRIGCOMBO_GF31_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
   }
   else if (fft.FFT_FP32 && fft.NTT_GF31) {
     // GF31 data is located after the FP32 data.  Compute size of the FP32 data and trigs.
     defines += toDefine("DISTGF31",      FP32_DATA_SIZE(fft.shape.width, fft.shape.middle, fft.shape.height, in_place, pad_size) / 2);
-    defines += toDefine("DISTWTRIGGF31", SMALLTRIG_FP32_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
+    defines += toDefine("DISTWTRIGGF31", SMALLTRIG_FP32_DIST(fft.shape.width, wTrigMiddle, wTrigHeight, wTrigNH));
     defines += toDefine("DISTMTRIGGF31", MIDDLETRIG_FP32_DIST(fft.shape.width, fft.shape.middle, fft.shape.height));
     defines += toDefine("DISTHTRIGGF31", SMALLTRIGCOMBO_FP32_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
   }
   else if (fft.FFT_FP32 && fft.NTT_GF61) {
     // GF61 data is located after the FP32 data.  Compute size of the FP32 data and trigs.
     defines += toDefine("DISTGF61",      FP32_DATA_SIZE(fft.shape.width, fft.shape.middle, fft.shape.height, in_place, pad_size) / 2);
-    defines += toDefine("DISTWTRIGGF61", SMALLTRIG_FP32_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
+    defines += toDefine("DISTWTRIGGF61", SMALLTRIG_FP32_DIST(fft.shape.width, wTrigMiddle, wTrigHeight, wTrigNH));
     defines += toDefine("DISTMTRIGGF61", MIDDLETRIG_FP32_DIST(fft.shape.width, fft.shape.middle, fft.shape.height));
     defines += toDefine("DISTHTRIGGF61", SMALLTRIGCOMBO_FP32_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
   }
@@ -744,7 +764,7 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
     defines += toDefine("DISTHTRIGGF31", 0);
     // GF61 data is located after the GF31 data.  Compute size of the GF31 data and trigs.
     defines += toDefine("DISTGF61",      GF31_DATA_SIZE(fft.shape.width, fft.shape.middle, fft.shape.height, in_place, pad_size) / 2);
-    defines += toDefine("DISTWTRIGGF61", SMALLTRIG_GF31_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
+    defines += toDefine("DISTWTRIGGF61", SMALLTRIG_GF31_DIST(fft.shape.width, wTrigMiddle, wTrigHeight, wTrigNH));
     defines += toDefine("DISTMTRIGGF61", MIDDLETRIG_GF31_DIST(fft.shape.width, fft.shape.middle, fft.shape.height));
     defines += toDefine("DISTHTRIGGF61", SMALLTRIGCOMBO_GF31_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
   }
@@ -1303,7 +1323,7 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   SMALL_H(fft.shape.height),
   BIG_H(SMALL_H * fft.shape.middle),
   hN(N / 2),
-  nW(fft.shape.nW()),
+  nW(args.value("WIDTH_NW", fft.shape.nW())),
   nH(fft.shape.nH()),
   carryLen{carryLength(args, fft)},
   useLongCarry{args.carry == CARRY_64},

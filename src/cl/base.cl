@@ -225,8 +225,8 @@ G_H        "group height" == SMALL_HEIGHT / NH
 #define NWORDS (ND * 2u)
 #define NWORDS_IS_POWER_OF_TWO  !(NWORDS & (NWORDS - 1))
 
-#if (NW != 4 && NW != 8) || (NH != 4 && NH != 8)
-#error NW and NH must be passed in, expected value 4 or 8.
+#if (NW != 2 && NW != 4 && NW != 8) || (NH != 4 && NH != 8)
+#error NW must be 2, 4, or 8; NH must be 4 or 8.
 #endif
 
 #define G_W (WIDTH / NW)

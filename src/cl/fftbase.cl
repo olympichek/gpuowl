@@ -698,6 +698,8 @@ void OVERLOAD chainMul8(T2 *u, T2 w) {
 #endif
 
 void OVERLOAD chainMul(T2 *u, T2 w) {
+  // A radix-2 twiddle has only the first non-trivial lane.
+  if (RADIX == 2) u[1] = cmul(u[1], w);
   // Do a length 4 chain mul, w must not be in Fancy format
   if (RADIX == 4) chainMul4(u, w);
   // Do a length 8 chain mul, w must be in Fancy format
@@ -725,7 +727,9 @@ T2 bcast(T2 src, u32 span) {
 #endif
 
 void OVERLOAD fft_RADIX(T2 *u) {
-#if RADIX == 4
+#if RADIX == 2
+  X2(u[0], u[1]);
+#elif RADIX == 4
   fft4(u);
 #elif RADIX == 5
   fft5(u);
@@ -1200,7 +1204,9 @@ void OVERLOAD shufl(local F2 *lds, F2 *u, u32 f, u32 numWG, u32 lowMe) {
 }
 
 void OVERLOAD fft_RADIX(F2 *u) {
-#if RADIX == 4
+#if RADIX == 2
+  X2(u[0], u[1]);
+#elif RADIX == 4
   fft4(u);
 #elif RADIX == 8
   fft8(u);
@@ -1238,6 +1244,7 @@ void OVERLOAD chainMul8(F2 *u, F2 w) {
 }
 
 void OVERLOAD chainMul(F2 *u, F2 w) {
+  if (RADIX == 2) u[1] = cmul(u[1], w);
   // Do a length 4 chain mul
   if (RADIX == 4) chainMul4(u, w);
   // Do a length 8 chain mul
@@ -1663,7 +1670,9 @@ void OVERLOAD shufl(local GF31 *lds, GF31 *u, u32 f, u32 numWG, u32 lowMe) {
 }
 
 void OVERLOAD fft_RADIX(GF31 *u) {
-#if RADIX == 4
+#if RADIX == 2
+  X2(u[0], u[1]);
+#elif RADIX == 4
   fft4(u);
 #elif RADIX == 8
   fft8(u);
@@ -1696,6 +1705,7 @@ void OVERLOAD chainMul8(GF31 *u, GF31 w) {
 }
 
 void OVERLOAD chainMul(GF31 *u, GF31 w) {
+  if (RADIX == 2) u[1] = cmul(u[1], w);
   // Do a length 4 chain mul
   if (RADIX == 4) chainMul4(u, w);
   // Do a length 8 chain mul
@@ -1749,7 +1759,9 @@ void OVERLOAD shufl(local GF61 *lds, GF61 *u, u32 f, u32 numWG, u32 lowMe) {
 }
 
 void OVERLOAD fft_RADIX(GF61 *u) {
-#if RADIX == 4
+#if RADIX == 2
+  X2(u[0], u[1]);
+#elif RADIX == 4
   fft4(u);
 #elif RADIX == 8
   fft8(u);
@@ -1794,6 +1806,7 @@ void OVERLOAD chainMul8(GF61 *u, GF61 w) {
 }
 
 void OVERLOAD chainMul(GF61 *u, GF61 w) {
+  if (RADIX == 2) u[1] = cmul(u[1], w);
   // Do a length 4 chain mul
   if (RADIX == 4) chainMul4(u, w);
   // Do a length 8 chain mul
