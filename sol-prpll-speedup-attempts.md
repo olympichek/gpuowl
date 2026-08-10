@@ -6052,3 +6052,100 @@ speedup**.  Do not repeat the flat short-carry experiment, omit the cross-plane
 permutation, or compare the 192.9-us scaffold against production.  Any follow-up
 must first recover roughly 91 us by removing the split width/`fftP` boundary;
 small kernel tuning cannot close that structural gap.
+
+## Post-radix-nine architecture audit
+
+The exact radix-nine result was used as a new lower-bound gate before attempting
+another fused boundary.  Its earlier zero-cost-odd-edge timing was already
+182.272 us, and the real radix-nine edge raised that to 192.543 us while still
+using the wrong flat boundary.  Thus even a free Good--Thomas permutation would
+not meet 180 us.  A multi-channel fused implementation could make the 296.2-us
+reference much faster, but it cannot turn this transform into the requested
+speedup.  No second fused radix-nine kernel was implemented.
+
+### Dynamic-register warp specialization: stronger hardware no-go
+
+The prior field-specialized edge used ordinary divergent field ownership, so
+CUDA allocated every thread for the largest path.  Blackwell's architecture-
+specific `setmaxnreg` instruction appeared to offer a materially different
+test: decrease the M31 warpgroup's allocation and transfer registers to the
+M61 warpgroup at a synchronized handoff.  The existing production-population
+[`src/cuda/warp_specialized_edge_bench.cu`](src/cuda/warp_specialized_edge_bench.cu)
+was extended rather than creating another proxy.
+
+The dynamic kernel owns two tiles per 256-thread CTA and uses
+`setmaxnreg.dec.sync.aligned` / `setmaxnreg.inc.sync.aligned` around the
+field-specialized phases.  Its output matches the 64-thread per-thread-field
+reference exactly.  A fresh 2,097,152-value run measured:
+
+```text
+serial per-thread fields:       0.079 ms
+ordinary field-specialized:     0.090 ms  (1.146x serial)
+dynamic-register specialized:   0.137 ms  (1.734x serial)
+```
+
+The final cubin reports 128 registers, a 176-byte stack, and 25,600 bytes of
+shared memory for the dynamic kernel, versus 90 registers, no stack, and 9,216
+bytes shared for the serial reference.  Dynamic redistribution does not shorten
+the source-level live ranges or prevent ptxas from materializing the union of
+the phases; it adds synchronization and crosses the spill boundary.  This
+strengthens the previous warp-specialization rejection.  Do not repeat it with
+different `setmaxnreg` limits unless the algorithm first removes live state.
+
+### Exact-FP32 small-field 3M architecture: algebraic no-go
+
+A new resource-complementary proposal was screened before GPU implementation:
+shorten the critical M61 transform to `3*2^20` real words and replace the added
+integer q field with enough sub-25-bit fields to execute their modular products
+exactly through FP32/FMA.  Centered residues for `q < 2^25` fit exactly in one
+FP32 value, and an error-free product can recover the rounded product residual;
+the intent was to move the extra range work off the saturated integer pipelines.
+This differs from the rejected 4M q24 replacement and from approximate FP32
+coefficient repair.
+
+The required field set does not exist.  An exhaustive deterministic search over
+all primes `q = k*2^s +/- 1`, `19 <= s <= 24`, `q < 2^25`, applied all of:
+
+1. a radix-three base-field edge (`3 | q-1`);
+2. the power-of-two order for each packed 1M-word Good--Thomas channel; and
+3. the exact Crandall--Fagin weight condition
+   `2^((q^2-1)/gcd(3*2^20,q^2-1)) = 1 (mod q)`.
+
+Only `q=2^19-1=524287` passes.  It supplies 19 bits, far short of the several
+distinct fields needed beside M61 for the conservative p150 range.  In
+particular, the previously useful q24 field `14680063=7*2^21-1` returns
+`9024597`, not one, in the 3M weight test.
+
+The scalar-NTT alternative was also exhausted over the same exact-FP32 range.
+The only prime below `2^25` with `3*2^20 | q-1` is
+`q=28311553=27*2^20+1`; its scalar weight test returns `2^9=512`, not one.
+Consequently neither quadratic packing nor a full scalar small-field NTT can
+supply multiple FP32-exact 3M residue planes.  Decision: reject this
+representation algebraically; do not build a multi-field transform from q24
+primes that individually fail the target weight equation.
+
+### Independent native-PFA cross-check: also slower
+
+After completing and measuring the local exact prototype, the current PrMers
+tree was used as an independent architectural cross-check.  This was not used
+as a substitute for the local correctness tests above: it is a separately
+developed implementation with an Aevum native Good--Thomas path.  The tested
+tree was `cherubrock-seb/PrMers` commit `d1c2e07`, and the forced plan was
+`pfa9:1:512:9:512:202` at exponent 136279841 on the same RTX PRO 6000 Blackwell
+Max-Q GPU.
+
+After its OpenCL cache and checkpoint were warm, the representative interval
+reported 2,883.91 iterations/s, or **346.75 us/iteration**.  This is 141.25 us
+slower than the historical 205.5-us production path and misses the 180-us gate
+by 166.75 us.  Its launch trace also exposes separate GF31/GF61 width,
+carry/carryB, and forward-transform kernels.  In other words, this independent
+native-PFA implementation reaches the same architectural boundary as the local
+exact prototype: the odd-radix transform is feasible, but its cross-plane digit
+map prevents reuse of the exceptionally cheap fused M31/M61 carry boundary.
+
+For additional context, the same PrMers tree's independent Marin integer-IBDWT
+backend selected an 8,388,608-word transform and reported 1,999.08
+iterations/s, approximately **500.23 us/iteration**.  Neither external backend
+is a speedup on this machine.  The local 296.2-us exact prototype remains the
+faster of the completed radix-nine implementations, but all measured exact
+paths are decisively behind production.
