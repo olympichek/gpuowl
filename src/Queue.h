@@ -51,6 +51,10 @@ public:
   void copyBuf(cl_mem src, cl_mem dst, size_t size, TimeInfo* tInfo);
   void finish();
 
+#ifdef CUDA_BACKEND
+  void setCudaPriority(int priority) { cudaSetQueuePriority(get(), priority); }
+#endif
+
   EventHolder createSyncEvent() { if (!isAuxQueue && !graphRecording) queueCount++; return enqueueMarker(get()); }  // Enqueue a synchronization event.  Used to sync work among multiple queues.
   void waitForSyncEvent(EventHolder* e) { if (!isAuxQueue && !graphRecording) queueCount++; enqueueMarkerWithWaits(get(), {e->get()}); }  // Wait for a synchronization event to complete.
 
@@ -93,4 +97,3 @@ public:
 private:
   cl_graph graph;
 };
-

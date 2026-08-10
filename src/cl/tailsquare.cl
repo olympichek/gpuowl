@@ -797,7 +797,21 @@ KERNEL(G_H * 2) tailSquareGF31(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
   GF31 u[NH];
 
   u32 line_u = get_line_number(base);
+#if GOOD_THOMAS3 || GOOD_THOMAS7 || GOOD_THOMAS9
+  // Map the grid's Hermitian-pair ordinal to one independent power-of-two
+  // spectrum.  The odd Good--Thomas radix is coupled outside this tail.
+  u32 const gt_factor = GOOD_THOMAS9 ? 9 : GOOD_THOMAS7 ? 7 : 3;
+  u32 const gt_span = (MIDDLE / gt_factor) * WIDTH;
+  u32 const gt_pairs = gt_span / 2;
+  u32 const gt_channel = line_u / gt_pairs;
+  u32 const gt_line = line_u % gt_pairs;
+  u32 const gt_base = gt_channel * gt_span;
+  line_u = gt_base + gt_line;
+  u32 line_v = gt_base + (gt_line ? gt_span - gt_line : gt_pairs);
+#else
+  u32 const gt_line = line_u;
   u32 line_v = line_u ? H - line_u : (H / 2);
+#endif
   u32 me = get_local_id(0);
   u32 lowMe = me % G_H;  // lane-id in one of the two halves (half-workgroups).
 
@@ -821,7 +835,7 @@ KERNEL(G_H * 2) tailSquareGF31(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
   u32 height_trigs = SMALL_HEIGHT*1;
   // Read a hopefully cached line of data and one non-cached GF31 per line
   GF31 trig = TFLOAD(&smallTrig31[height_trigs + lowMe]);                                 // Trig values for line zero, should be cached
-  GF31 mult = TSLOAD(&smallTrig31[height_trigs + G_H + line_u*2 + isSecondHalf]);         // Two multipliers.  One for line u, one for line v.
+  GF31 mult = TSLOAD(&smallTrig31[height_trigs + G_H + gt_line*2 + isSecondHalf]);         // Two multipliers.  One for line u, one for line v.
   trig = cmul(trig, mult);
 
   // On consumer-grade GPUs, it is likely beneficial to read all trig values.
@@ -830,12 +844,12 @@ KERNEL(G_H * 2) tailSquareGF31(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
   // The trig values used here are pre-computed and stored after the fft_HEIGHT trig values.
   u32 height_trigs = SMALL_HEIGHT*1;
   // Read pre-computed trig values
-  GF31 trig = TOLOAD(&smallTrig31[height_trigs + line_u*G_H*2 + me]);
+  GF31 trig = TOLOAD(&smallTrig31[height_trigs + gt_line*G_H*2 + me]);
 #endif
 
 #if SINGLE_KERNEL
   // Line 0 and H/2 are special: they pair with themselves, line 0 is offseted by 1.
-  if (line_u == 0) {
+  if (gt_line == 0) {
     reverse2(lds, u);
     pairSq2_special(u, trig);
     reverse2(lds, u);
@@ -868,7 +882,97 @@ KERNEL(G_H * 2) tailSquareGF31(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
 
 #if NTT_GF61
 
+#if GOLD_PAIR
+
+// A GF61 value carries the two independent length-N/2 transforms of the even
+// and odd words of one length-N scalar Goldilocks transform.  At frequency k,
+// the missing radix-2 coupling followed by a pointwise square is
+//
+//   E' = E^2 + root_N/2^k O^2
+//   O' = 2 E O.
+//
+// The existing tail trig is precisely root_N/2^k.  The four register quarters
+// advance by 1, i, -1, and -i, as in pairSq below, but no Hermitian partner or
+// data conjugation is involved.
+GF61 goldPairSquareOne(GF61 a, Z61 root) {
+  Z61 const even2 = mul(a.x, a.x);
+  Z61 const odd2 = mul(a.y, a.y);
+  return U2(add(even2, mul(root, odd2)), mul2(mul(a.x, a.y)));
+}
+
+void goldPairSquareLine(GF61 *u, GF61 trig) {
+  Z61 root = trig.x;
+  for (u32 i = 0; i < NH / 4; ++i, root = mul(root, GOLD_T8)) {
+    u[i] = goldPairSquareOne(u[i], root);
+    u[i + NH / 4] = goldPairSquareOne(u[i + NH / 4],
+                                      mul(root, GOLD_I));
+    u[i + NH / 2] = goldPairSquareOne(u[i + NH / 2], neg(root));
+    u[i + 3 * NH / 4] = goldPairSquareOne(
+      u[i + 3 * NH / 4], neg(mul(root, GOLD_I)));
+  }
+}
+
+// The NTT kernels use the same (forward-root) transform for both directions.
+// The original quadratic-field tail obtains the inverse by reversing the
+// spectrum as part of pairSq.  Scalar even/odd planes need that permutation
+// explicitly.  The double-wide tail already co-locates line k with line -k;
+// reverse each height coordinate and cross the two LDS partitions, except for
+// the self-paired lines 0 and H/2.
+void goldPairReverseSpectrum(local GF61 *lds61, GF61 *u, u32 line, u32 lineCount) {
+  u32 const me = get_local_id(0);
+  u32 const lowMe = me % G_H;
+  u32 const half = me / G_H;
+  u32 const sourceHalf = half;
+  bool const crossLines = line != 0 && line != lineCount / 2;
+  u32 const destinationHalf = crossLines ? 1 - half : half;
+  u32 const stride = LDS_BYTES / sizeof(Z61);
+  local Z61 *lds = (local Z61 *)lds61;
+
+  bar();
+  for (u32 i = 0; i < NH; ++i) {
+    u32 const source = i * G_H + lowMe;
+    u32 const destination = line == 0 && source == 0 ? 0 :
+                            SMALL_HEIGHT - source - (line == 0 ? 0 : 1);
+    lds[destinationHalf * stride + destination] = u[i].x;
+  }
+  bar();
+  for (u32 i = 0; i < NH; ++i) {
+    u[i].x = lds[sourceHalf * stride + i * G_H + lowMe];
+  }
+
+  bar();
+  for (u32 i = 0; i < NH; ++i) {
+    u32 const source = i * G_H + lowMe;
+    u32 const destination = line == 0 && source == 0 ? 0 :
+                            SMALL_HEIGHT - source - (line == 0 ? 0 : 1);
+    lds[destinationHalf * stride + destination] = u[i].y;
+  }
+  bar();
+  for (u32 i = 0; i < NH; ++i) {
+    u[i].y = lds[sourceHalf * stride + i * G_H + lowMe];
+  }
+}
+
+#if SINGLE_WIDE
+#error GOLD_PAIR currently requires the double-wide tail (TAIL_KERNELS=2 or 3)
+#endif
+
+#endif
+
 void OVERLOAD onePairSq(GF61* pa, GF61* pb, GF61 t_squared, const u32 t_squared_type) {
+#if RIESEL_PAIR
+  GF61 a = *pa, b = *pb;
+  X2conjb(a, b);
+  GF61 b2t2 = cmul(csq(b), t_squared);
+  GF61 c;
+  if (t_squared_type == 0) c = csq_sub(a, b2t2);
+  if (t_squared_type == 1) c = csq_subi(a, b2t2);
+  if (t_squared_type == 2) c = csq_add(a, b2t2);
+  if (t_squared_type == 3) c = csq_addi(a, b2t2);
+  GF61 d = mul2(cmul(a, b));
+  X2_conjb(c, d);
+  *pa = SWAP_XY(c), *pb = SWAP_XY(d);
+#else
   GF61 a = *pa, b = *pb;
   GF61 a2, b2, b2t2, ab, addin, c, d;
 
@@ -943,6 +1047,7 @@ void OVERLOAD onePairSq(GF61* pa, GF61* pb, GF61 t_squared, const u32 t_squared_
   }
 #endif
   *pa = SWAP_XY(c), *pb = SWAP_XY(d);
+#endif
 }
 
 void OVERLOAD pairSq(u32 N, GF61 *u, GF61 *v, GF61 base_squared, bool special) {
@@ -1003,7 +1108,11 @@ KERNEL(G_H) tailSquareZeroGF61(P(T2) out, CP(T2) in, Trig smallTrig) {
 #else
   GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + which]);
 #endif
+  #if GOLD_PAIR
+  trig = cmulTrig(trig, mult);
+  #else
   trig = cmul(trig, mult);
+  #endif
 #else
 #if SINGLE_WIDE
   GF61 trig = TOLOAD(&smallTrig61[height_trigs + line*G_H + me]);
@@ -1013,9 +1122,13 @@ KERNEL(G_H) tailSquareZeroGF61(P(T2) out, CP(T2) in, Trig smallTrig) {
 #endif
 
   fft_HEIGHT1(lds, u, smallTrig61, 1, me);
+#if GOLD_PAIR
+  goldPairSquareLine(u, trig);
+#else
   reverse(lds, u + NH/2, !which);
   pairSq(NH/2, u,   u + NH/2, trig, !which);
   reverse(lds, u + NH/2, !which);
+#endif
 
   fft_HEIGHT2(lds, u, smallTrig61, 1, me);
   writeTailFusedLine(u, out61, transPos(line, MIDDLE, WIDTH), me);
@@ -1058,7 +1171,11 @@ KERNEL(G_H) tailSquareGF61(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
   // Read a hopefully cached line of data and one non-cached GF61 per line
   GF61 trig = TFLOAD(&smallTrig61[height_trigs + me]);                    // Trig values for line zero, should be cached
   GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + line1]);           // Line multiplier
+  #if GOLD_PAIR
+  trig = cmulTrig(trig, mult);
+  #else
   trig = cmul(trig, mult);
+  #endif
 
   // On consumer-grade GPUs, it is likely beneficial to read all trig values.
 #else
@@ -1133,7 +1250,19 @@ KERNEL(G_H * 2) tailSquareGF61(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
   GF61 u[NH];
 
   u32 line_u = get_line_number(base);
+#if GOOD_THOMAS3 || GOOD_THOMAS7 || GOOD_THOMAS9
+  u32 const gt_factor = GOOD_THOMAS9 ? 9 : GOOD_THOMAS7 ? 7 : 3;
+  u32 const gt_span = (MIDDLE / gt_factor) * WIDTH;
+  u32 const gt_pairs = gt_span / 2;
+  u32 const gt_channel = line_u / gt_pairs;
+  u32 const gt_line = line_u % gt_pairs;
+  u32 const gt_base = gt_channel * gt_span;
+  line_u = gt_base + gt_line;
+  u32 line_v = gt_base + (gt_line ? gt_span - gt_line : gt_pairs);
+#else
+  u32 const gt_line = line_u;
   u32 line_v = line_u ? H - line_u : (H / 2);
+#endif
   u32 me = get_local_id(0);
   u32 lowMe = me % G_H;  // lane-id in one of the two halves (half-workgroups).
 
@@ -1157,7 +1286,7 @@ KERNEL(G_H * 2) tailSquareGF61(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
   u32 height_trigs = SMALL_HEIGHT*1;
   // Read a hopefully cached line of data and one non-cached GF61 per line
   GF61 trig = TFLOAD(&smallTrig61[height_trigs + lowMe]);                                 // Trig values for line zero, should be cached
-  GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + line_u*2 + isSecondHalf]);         // Two multipliers.  One for line u, one for line v.
+  GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + gt_line*2 + isSecondHalf]);         // Two multipliers.  One for line u, one for line v.
   trig = cmul(trig, mult);
 
   // On consumer-grade GPUs, it is likely beneficial to read all trig values.
@@ -1166,12 +1295,16 @@ KERNEL(G_H * 2) tailSquareGF61(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
   // The trig values used here are pre-computed and stored after the fft_HEIGHT trig values.
   u32 height_trigs = SMALL_HEIGHT*1;
   // Read pre-computed trig values
-  GF61 trig = TOLOAD(&smallTrig61[height_trigs + line_u*G_H*2 + me]);
+  GF61 trig = TOLOAD(&smallTrig61[height_trigs + gt_line*G_H*2 + me]);
 #endif
 
+#if GOLD_PAIR
+  goldPairSquareLine(u, trig);
+  goldPairReverseSpectrum(lds, u, line, H);
+#else
 #if SINGLE_KERNEL
   // Line 0 and H/2 are special: they pair with themselves, line 0 is offseted by 1.
-  if (line_u == 0) {
+  if (gt_line == 0) {
     reverse2(lds, u);
     pairSq2_special(u, trig);
     reverse2(lds, u);
@@ -1184,6 +1317,7 @@ KERNEL(G_H * 2) tailSquareGF61(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
     pairSq(NH/2, u, u + NH/2, trig, false);
     revCrossLine(lds, u);
   }
+#endif
 
   dependentLaunch();       // Next kernel will be fftMiddleOutGF61 which must dependentLaunchWait before reading data
 

@@ -390,6 +390,30 @@ KERNEL(G_H) tailMulGF31(P(T2) out, CP(T2) in, CP(T2) a, u32 base, Trig smallTrig
 
 #if NTT_GF61
 
+#if GOLD_PAIR
+
+GF61 goldPairMultiplyOne(GF61 a, GF61 b, Z61 root) {
+  Z61 const even = add(mul(a.x, b.x), mul(root, mul(a.y, b.y)));
+  Z61 const odd = add(mul(a.x, b.y), mul(a.y, b.x));
+  return U2(even, odd);
+}
+
+void goldPairMultiplyLine(GF61 *u, GF61 *p, GF61 trig) {
+  Z61 root = trig.x;
+  for (u32 i = 0; i < NH / 4; ++i, root = mul(root, GOLD_T8)) {
+    u[i] = goldPairMultiplyOne(u[i], p[i], root);
+    u[i + NH / 4] = goldPairMultiplyOne(
+      u[i + NH / 4], p[i + NH / 4], mul(root, GOLD_I));
+    u[i + NH / 2] = goldPairMultiplyOne(
+      u[i + NH / 2], p[i + NH / 2], neg(root));
+    u[i + 3 * NH / 4] = goldPairMultiplyOne(
+      u[i + 3 * NH / 4], p[i + 3 * NH / 4],
+      neg(mul(root, GOLD_I)));
+  }
+}
+
+#endif
+
 void OVERLOAD onePairMul(GF61* pa, GF61* pb, GF61* pc, GF61* pd, GF61 t_squared) {
   GF61 a = *pa, b = *pb, c = *pc, d = *pd;
   X2conjb(a, b);
@@ -441,7 +465,21 @@ KERNEL(G_H) tailMulGF61(P(T2) out, CP(T2) in, CP(T2) a, u32 base, Trig smallTrig
   GF61 p[NH], q[NH];
 
   u32 line1 = get_line_number(base);
+#if GOOD_THOMAS3 || GOOD_THOMAS7 || GOOD_THOMAS9
+  // Each odd-radix frequency owns an independent power-of-two DGT.  Pair
+  // spectra only inside that channel, just as tailSquareGF61 does.
+  const u32 gt_factor = GOOD_THOMAS9 ? 9 : GOOD_THOMAS7 ? 7 : 3;
+  const u32 gt_span = (MIDDLE / gt_factor) * WIDTH;
+  const u32 gt_pairs = gt_span / 2;
+  const u32 gt_channel = line1 / gt_pairs;
+  const u32 gt_line = line1 % gt_pairs;
+  const u32 gt_base = gt_channel * gt_span;
+  line1 = gt_base + gt_line;
+  u32 line2 = gt_base + (gt_line ? gt_span - gt_line : gt_pairs);
+#else
+  const u32 gt_line = line1;
   u32 line2 = line1 ? H - line1 : (H / 2);
+#endif
   u32 memline1 = transPos(line1, MIDDLE, WIDTH);
   u32 memline2 = transPos(line2, MIDDLE, WIDTH);
 
@@ -471,20 +509,43 @@ KERNEL(G_H) tailMulGF61(P(T2) out, CP(T2) in, CP(T2) a, u32 base, Trig smallTrig
 #if TAIL_TRIGS61 >= 1
   GF61 trig = TFLOAD(&smallTrig61[height_trigs + me]);                    // Trig values for line zero, should be cached
 #if SINGLE_WIDE
-  GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + line1]);
+  GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + gt_line]);
 #else
-  GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + line1 * 2]);
+  GF61 mult = TSLOAD(&smallTrig61[height_trigs + G_H + gt_line * 2]);
 #endif
+  #if GOLD_PAIR
+  trig = cmulTrig(trig, mult);
+  #else
   trig = cmul(trig, mult);
+  #endif
 #else
 #if SINGLE_WIDE
-  GF61 trig = TOLOAD(&smallTrig61[height_trigs + line1*G_H + me]);
+  GF61 trig = TOLOAD(&smallTrig61[height_trigs + gt_line*G_H + me]);
 #else
-  GF61 trig = TOLOAD(&smallTrig61[height_trigs + line1*2*G_H + me]);
+  GF61 trig = TOLOAD(&smallTrig61[height_trigs + gt_line*2*G_H + me]);
 #endif
 #endif
 
-  if (line1 == 0) {
+#if GOLD_PAIR
+#if TAIL_TRIGS61 >= 1
+  GF61 mult2 = TSLOAD(&smallTrig61[height_trigs + G_H + gt_line * 2 + 1]);
+  GF61 trig2 = cmulTrig(TFLOAD(&smallTrig61[height_trigs + me]), mult2);
+#else
+  GF61 trig2 = TOLOAD(&smallTrig61[height_trigs + gt_line * 2 * G_H + G_H + me]);
+#endif
+  goldPairMultiplyLine(u, p, trig);
+  goldPairMultiplyLine(v, q, trig2);
+  goldReverseScalarLine(lds, u, gt_line == 0);
+  goldReverseScalarLine(lds, v, false);
+  if (gt_line != 0) {
+    for (u32 i = 0; i < NH; ++i) {
+      GF61 const swap = u[i];
+      u[i] = v[i];
+      v[i] = swap;
+    }
+  }
+#else
+  if (gt_line == 0) {
     reverse(lds, u + NH/2, true);
     reverse(lds, p + NH/2, true);
     pairMul(NH/2, u,  u + NH/2, p, p + NH/2, trig, true);
@@ -501,6 +562,7 @@ KERNEL(G_H) tailMulGF61(P(T2) out, CP(T2) in, CP(T2) a, u32 base, Trig smallTrig
     pairMul(NH, u, v, p, q, trig, false);
     reverseLine(lds, v);
   }
+#endif
 
   dependentLaunch();       // Next kernel will be fftMiddleOutGF61 which must dependentLaunchWait before reading data
 

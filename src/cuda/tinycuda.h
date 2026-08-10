@@ -61,6 +61,7 @@ struct _cl_kernel {
   CUmodule parentModule{};  // Keep reference so module isn't unloaded
   int numArgs{0};
   int reqWorkGroupSize{0};   // From __launch_bounds__(N) in source, matches OpenCL reqd_work_group_size
+  unsigned dynamicSharedBytes{0};
 
   // Argument accumulator for setArg/launch pattern
   static constexpr int MAX_ARGS = 32;

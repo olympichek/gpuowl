@@ -92,6 +92,8 @@ void OVERLOAD fft_MIDDLE(T2 *u) {
 #error UNRECOGNIZED MIDDLE
 #endif
 }
+void OVERLOAD fft_MIDDLE_IN(T2 *u) { fft_MIDDLE(u); }
+void OVERLOAD fft_MIDDLE_OUT(T2 *u) { fft_MIDDLE(u); }
 
 // Keep in sync with TrigBufCache.cpp, see comment there.
 #define SHARP_MIDDLE 5
@@ -379,16 +381,24 @@ void OVERLOAD fft_MIDDLE(F2 *u) {
   // Do nothing
 #elif MIDDLE == 2
   fft2(u);
+#elif MIDDLE == 3
+  fft3(u);
 #elif MIDDLE == 4
   fft4(u);
+#elif MIDDLE == 6
+  fft6(u);
 #elif MIDDLE == 8
   fft8(u);
+#elif MIDDLE == 9
+  fft9(u);
 #elif MIDDLE == 16
   fft16(u);
 #else
 #error UNRECOGNIZED MIDDLE
 #endif
 }
+void OVERLOAD fft_MIDDLE_IN(F2 *u) { fft_MIDDLE(u); }
+void OVERLOAD fft_MIDDLE_OUT(F2 *u) { fft_MIDDLE(u); }
 
 // Keep in sync with TrigBufCache.cpp, see comment there.
 #define SHARP_MIDDLE 5
@@ -648,6 +658,79 @@ void OVERLOAD middleShuffle(local F2 *lds, F2 *u) {
 
 void OVERLOAD fft2(GF31* u) { X2(u[0], u[1]); }
 
+#if GOOD_THOMAS3
+
+// Scalar radix 3 across the three packed B-word channels.  k is
+// (omega-omega^2)/2 in the active base field.  Riesel constants are already
+// in Montgomery form; the M31 constant is in its ordinary representation.
+#if M19_FIELD && RIESEL_FIELD == 2
+#define GT3_K31_FORWARD ((Z31)331636u)
+#define GT3_K31_INVERSE ((Z31)192651u)
+#elif RIESEL_FIELD == 1
+#define GT3_K31_FORWARD ((Z31)417237559u)
+#define GT3_K31_INVERSE ((Z31)1673622984u)
+#elif RIESEL_FIELD == 2
+#define GT3_K31_FORWARD ((Z31)1527716493u)
+#define GT3_K31_INVERSE ((Z31)613475698u)
+#else
+#define GT3_K31_FORWARD ((Z31)439735912u)
+#define GT3_K31_INVERSE ((Z31)1707747735u)
+#endif
+
+void gt3Radix(GF31 *a, GF31 *b, GF31 *c, Z31 k) {
+  GF31 const sum = add(*b, *c);
+  GF31 const base = sub(*a, shr(sum, 1));
+  GF31 const difference = sub(*b, *c);
+  GF31 const delta = U2(mul(difference.x, k), mul(difference.y, k));
+  *a = add(*a, sum);
+  *b = add(base, delta);
+  *c = sub(base, delta);
+}
+
+void OVERLOAD fft_MIDDLE_IN(GF31 *u) {
+#if MIDDLE == 3
+  gt3Radix(&u[0], &u[1], &u[2], GT3_K31_FORWARD);
+#else
+  fft2(u + 0);
+  fft2(u + 2);
+  fft2(u + 4);
+  gt3Radix(&u[0], &u[2], &u[4], GT3_K31_FORWARD);
+  gt3Radix(&u[1], &u[3], &u[5], GT3_K31_FORWARD);
+#endif
+}
+
+void OVERLOAD fft_MIDDLE_OUT(GF31 *u) {
+#if MIDDLE == 3
+  gt3Radix(&u[0], &u[1], &u[2], GT3_K31_INVERSE);
+  // Power-of-two inverse scales are removed by a cheap Mersenne shift in the
+  // carry.  Radix 3 cannot be represented by such a shift, so normalize it
+  // here and leave only the 2*WIDTH*HEIGHT per-channel scale.
+  for (u32 channel = 0; channel != 3; ++channel) {
+    u[channel].x = mul(u[channel].x, (Z31)1431655765u);
+    u[channel].y = mul(u[channel].y, (Z31)1431655765u);
+  }
+#else
+  gt3Radix(&u[0], &u[2], &u[4], GT3_K31_INVERSE);
+  gt3Radix(&u[1], &u[3], &u[5], GT3_K31_INVERSE);
+  fft2(u + 0);
+  fft2(u + 2);
+  fft2(u + 4);
+#endif
+}
+void OVERLOAD fft_MIDDLE(GF31 *u) { fft_MIDDLE_IN(u); }
+
+#elif GOOD_THOMAS7 || GOOD_THOMAS9
+
+// The exact radix-7 gate is kept as a separate Rader/Good--Thomas kernel for
+// this transform-core measurement.  These seven values are independent
+// power-of-two channels here; adding the measured radix-7 edge later gives the
+// dependency-complete core lower bound without benchmarking a fake radix.
+void OVERLOAD fft_MIDDLE_IN(GF31 *u) { (void)u; }
+void OVERLOAD fft_MIDDLE_OUT(GF31 *u) { (void)u; }
+void OVERLOAD fft_MIDDLE(GF31 *u) { (void)u; }
+
+#else
+
 void OVERLOAD fft_MIDDLE(GF31 *u) {
 #if MIDDLE == 1
   // Do nothing
@@ -663,10 +746,24 @@ void OVERLOAD fft_MIDDLE(GF31 *u) {
 #error UNRECOGNIZED MIDDLE
 #endif
 }
+void OVERLOAD fft_MIDDLE_IN(GF31 *u) { fft_MIDDLE(u); }
+void OVERLOAD fft_MIDDLE_OUT(GF31 *u) { fft_MIDDLE(u); }
+
+#endif
 
 void OVERLOAD middleMul(GF31 *u, u32 s, TrigGF31 trig) {
   assert(s < SMALL_HEIGHT);
   if (MIDDLE == 1) return;
+
+#if GOOD_THOMAS3 || GOOD_THOMAS7 || GOOD_THOMAS9
+#if MIDDLE == 6
+  GF31 const w = TFLOAD(&trig[s]);
+  WADD(1, w);
+  WADD(3, w);
+  WADD(5, w);
+#endif
+  return;
+#endif
 
 #if !MIDDLE_CHAIN           // Read all trig values from memory
 
@@ -703,7 +800,9 @@ void OVERLOAD middleMul2(GF31 *u, u32 x, u32 y, TrigGF31 trig) {
   assert(y < SMALL_HEIGHT);
 
   // First trig table comes after the MiddleMul trig table.  Second trig table comes after the first MiddleMul2 trig table.
-  TrigGF31 trig1 = trig + SMALL_HEIGHT * (MIDDLE - 1);
+  TrigGF31 trig1 = trig + SMALL_HEIGHT *
+    ((GOOD_THOMAS3 && MIDDLE == 3) || GOOD_THOMAS7 || GOOD_THOMAS9 ? 0 :
+     GOOD_THOMAS3 ? 1 : (MIDDLE - 1));
   TrigGF31 trig2 = trig1 + WIDTH;
   // The first trig table can be shared with MiddleMul trig table if WIDTH = HEIGHT.
   if (WIDTH == SMALL_HEIGHT) trig1 = trig;
@@ -711,6 +810,25 @@ void OVERLOAD middleMul2(GF31 *u, u32 x, u32 y, TrigGF31 trig) {
   GF31 w = TFLOAD(&trig1[x]);         // x / (MIDDLE * WIDTH)
   u32 desired_root = x * y;
   GF31 base = cmul(TFLOAD(&trig2[desired_root % SMALL_HEIGHT]), TFLOAD(&trig1[desired_root / SMALL_HEIGHT]));
+
+#if GOOD_THOMAS3
+#if MIDDLE == 3
+  for (u32 channel = 0; channel != 3; ++channel)
+    u[channel] = cmul(u[channel], base);
+#else
+  for (u32 channel = 0; channel != 3; ++channel) {
+    GF31 channelBase = base;
+    u[2 * channel] = cmul(u[2 * channel], channelBase);
+    channelBase = cmul(channelBase, w);
+    u[2 * channel + 1] = cmul(u[2 * channel + 1], channelBase);
+  }
+#endif
+  return;
+#elif GOOD_THOMAS7 || GOOD_THOMAS9
+  for (u32 channel = 0; channel != (GOOD_THOMAS9 ? 9 : 7); ++channel)
+    u[channel] = cmul(u[channel], base);
+  return;
+#endif
 
   WADD(0, base);
   for (u32 k = 1; k < MIDDLE; ++k) {
@@ -769,6 +887,119 @@ void OVERLOAD middleShuffle(local GF31 *lds, GF31 *u) {
 
 void OVERLOAD fft2(GF61* u) { X2(u[0], u[1]); }
 
+#if GOOD_THOMAS3
+
+#define GT3_K61_FORWARD ((Z61)516660885634501340ul)
+#define GT3_K61_INVERSE ((Z61)1789182123579192611ul)
+
+void gt3Radix(GF61 *a, GF61 *b, GF61 *c, Z61 k) {
+  GF61 const sum = add(*b, *c);
+  GF61 const base = sub(*a, shr(sum, 1));
+  GF61 const difference = sub(*b, *c);
+  GF61 const delta = U2(mul(difference.x, k), mul(difference.y, k));
+  *a = add(*a, sum);
+  *b = add(base, delta);
+  *c = sub(base, delta);
+}
+
+void OVERLOAD fft_MIDDLE_IN(GF61 *u) {
+#if MIDDLE == 3
+  gt3Radix(&u[0], &u[1], &u[2], GT3_K61_FORWARD);
+#else
+  fft2(u + 0);
+  fft2(u + 2);
+  fft2(u + 4);
+  gt3Radix(&u[0], &u[2], &u[4], GT3_K61_FORWARD);
+  gt3Radix(&u[1], &u[3], &u[5], GT3_K61_FORWARD);
+#endif
+}
+
+void OVERLOAD fft_MIDDLE_OUT(GF61 *u) {
+#if MIDDLE == 3
+  gt3Radix(&u[0], &u[1], &u[2], GT3_K61_INVERSE);
+  for (u32 channel = 0; channel != 3; ++channel) {
+    u[channel].x = mul(u[channel].x, (Z61)1537228672809129301ul);
+    u[channel].y = mul(u[channel].y, (Z61)1537228672809129301ul);
+  }
+#else
+  gt3Radix(&u[0], &u[2], &u[4], GT3_K61_INVERSE);
+  gt3Radix(&u[1], &u[3], &u[5], GT3_K61_INVERSE);
+  fft2(u + 0);
+  fft2(u + 2);
+  fft2(u + 4);
+#endif
+}
+void OVERLOAD fft_MIDDLE(GF61 *u) { fft_MIDDLE_IN(u); }
+
+#elif GOOD_THOMAS9
+
+// Primitive ninth roots in GF(M61).  The cube of each root is the order-three
+// root represented by the corresponding GT3_K constant.
+#define GT9_ROOT61_FORWARD  ((Z61)1102844585000305877ul)
+#define GT9_ROOT2_61_FORWARD ((Z61)594418010121383343ul)
+#define GT9_ROOT4_61_FORWARD ((Z61)569931187132395942ul)
+#define GT9_K61_FORWARD      ((Z61)516660885634501340ul)
+#define GT9_ROOT61_INVERSE   ((Z61)2252987116782656529ul)
+#define GT9_ROOT2_61_INVERSE ((Z61)633067237080992132ul)
+#define GT9_ROOT4_61_INVERSE ((Z61)1764280891523348030ul)
+#define GT9_K61_INVERSE      ((Z61)1789182123579192611ul)
+
+GF61 gt9MulScalar(GF61 a, Z61 k) {
+  return U2(mul(a.x, k), mul(a.y, k));
+}
+
+void gt9Radix3(GF61 *a, GF61 *b, GF61 *c, Z61 k) {
+  GF61 const sum = add(*b, *c);
+  GF61 const base = sub(*a, shr(sum, 1));
+  GF61 const difference = sub(*b, *c);
+  GF61 const delta = gt9MulScalar(difference, k);
+  *a = add(*a, sum);
+  *b = add(base, delta);
+  *c = sub(base, delta);
+}
+
+// Cooley--Tukey 9 = 3*3.  Each call performs six radix-three butterflies
+// and four scalar twiddles while all nine channel values are already live.
+void gt9Radix(GF61 *u, Z61 root, Z61 root2, Z61 root4, Z61 k3) {
+  for (u32 n1 = 0; n1 != 3; ++n1)
+    gt9Radix3(&u[n1], &u[n1 + 3], &u[n1 + 6], k3);
+
+  u[4] = gt9MulScalar(u[4], root);
+  u[5] = gt9MulScalar(u[5], root2);
+  u[7] = gt9MulScalar(u[7], root2);
+  u[8] = gt9MulScalar(u[8], root4);
+
+  for (u32 k2 = 0; k2 != 3; ++k2)
+    gt9Radix3(&u[3 * k2], &u[3 * k2 + 1], &u[3 * k2 + 2], k3);
+
+  // Transpose [k2][k1] into the natural k2 + 3*k1 output order.
+  GF61 t = u[1]; u[1] = u[3]; u[3] = t;
+  t = u[2]; u[2] = u[6]; u[6] = t;
+  t = u[5]; u[5] = u[7]; u[7] = t;
+}
+
+void OVERLOAD fft_MIDDLE_IN(GF61 *u) {
+  gt9Radix(u, GT9_ROOT61_FORWARD, GT9_ROOT2_61_FORWARD,
+           GT9_ROOT4_61_FORWARD, GT9_K61_FORWARD);
+}
+
+void OVERLOAD fft_MIDDLE_OUT(GF61 *u) {
+  gt9Radix(u, GT9_ROOT61_INVERSE, GT9_ROOT2_61_INVERSE,
+           GT9_ROOT4_61_INVERSE, GT9_K61_INVERSE);
+  // Keep the factor nine in the residue for this arithmetic timing gate.  An
+  // exact implementation can absorb its inverse into the CRT/carry constant
+  // instead of spending eighteen extra M61 products here.
+}
+void OVERLOAD fft_MIDDLE(GF61 *u) { fft_MIDDLE_IN(u); }
+
+#elif GOOD_THOMAS7
+
+void OVERLOAD fft_MIDDLE_IN(GF61 *u) { (void)u; }
+void OVERLOAD fft_MIDDLE_OUT(GF61 *u) { (void)u; }
+void OVERLOAD fft_MIDDLE(GF61 *u) { (void)u; }
+
+#else
+
 void OVERLOAD fft_MIDDLE(GF61 *u) {
 #if MIDDLE == 1
   // Do nothing
@@ -784,10 +1015,24 @@ void OVERLOAD fft_MIDDLE(GF61 *u) {
 #error UNRECOGNIZED MIDDLE
 #endif
 }
+void OVERLOAD fft_MIDDLE_IN(GF61 *u) { fft_MIDDLE(u); }
+void OVERLOAD fft_MIDDLE_OUT(GF61 *u) { fft_MIDDLE(u); }
+
+#endif
 
 void OVERLOAD middleMul(GF61 *u, u32 s, TrigGF61 trig) {
   assert(s < SMALL_HEIGHT);
   if (MIDDLE == 1) return;
+
+#if GOOD_THOMAS3 || GOOD_THOMAS7 || GOOD_THOMAS9
+#if MIDDLE == 6
+  GF61 const w = TFLOAD(&trig[s]);
+  WADD(1, w);
+  WADD(3, w);
+  WADD(5, w);
+#endif
+  return;
+#endif
 
 #if !MIDDLE_CHAIN           // Read all trig values from memory
 
@@ -812,7 +1057,11 @@ void OVERLOAD middleMul(GF61 *u, u32 s, TrigGF61 trig) {
   for (u32 k = 2; k < MIDDLE; ++k) {
 #endif
     WADD(k, base);
+    #if GOLD_PAIR
+    base = cmulTrig(base, w);
+    #else
     base = cmul(base, w);
+    #endif
   }
 
 #endif
@@ -824,18 +1073,47 @@ void OVERLOAD middleMul2(GF61 *u, u32 x, u32 y, TrigGF61 trig) {
   assert(y < SMALL_HEIGHT);
 
   // First trig table comes after the MiddleMul trig table.  Second trig table comes after the first MiddleMul2 trig table.
-  TrigGF61 trig1 = trig + SMALL_HEIGHT * (MIDDLE - 1);
+  TrigGF61 trig1 = trig + SMALL_HEIGHT *
+    ((GOOD_THOMAS3 && MIDDLE == 3) || GOOD_THOMAS7 || GOOD_THOMAS9 ? 0 :
+     GOOD_THOMAS3 ? 1 : (MIDDLE - 1));
   TrigGF61 trig2 = trig1 + WIDTH;
   // The first trig table can be shared with MiddleMul trig table if WIDTH = HEIGHT.
   if (WIDTH == SMALL_HEIGHT) trig1 = trig;
 
   GF61 w = TFLOAD(&trig1[x]);                      // x / (MIDDLE * WIDTH)
   u32 desired_root = x * y;
+  #if GOLD_PAIR
+  GF61 base = cmulTrig(TFLOAD(&trig2[desired_root % SMALL_HEIGHT]), TFLOAD(&trig1[desired_root / SMALL_HEIGHT]));
+  #else
   GF61 base = cmul(TFLOAD(&trig2[desired_root % SMALL_HEIGHT]), TFLOAD(&trig1[desired_root / SMALL_HEIGHT]));
+  #endif
+
+#if GOOD_THOMAS3
+#if MIDDLE == 3
+  for (u32 channel = 0; channel != 3; ++channel)
+    u[channel] = cmul(u[channel], base);
+#else
+  for (u32 channel = 0; channel != 3; ++channel) {
+    GF61 channelBase = base;
+    u[2 * channel] = cmul(u[2 * channel], channelBase);
+    channelBase = cmul(channelBase, w);
+    u[2 * channel + 1] = cmul(u[2 * channel + 1], channelBase);
+  }
+#endif
+  return;
+#elif GOOD_THOMAS7 || GOOD_THOMAS9
+  for (u32 channel = 0; channel != (GOOD_THOMAS9 ? 9 : 7); ++channel)
+    u[channel] = cmul(u[channel], base);
+  return;
+#endif
 
   WADD(0, base);
   for (u32 k = 1; k < MIDDLE; ++k) {
+    #if GOLD_PAIR
+    base = cmulTrig(base, w);
+    #else
     base = cmul(base, w);
+    #endif
     WADD(k, base);
   }
 }

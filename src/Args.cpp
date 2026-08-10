@@ -154,6 +154,7 @@ named "config.txt" in the prpll run directory.
 -block <value>     : PRP block size, one of: 1000, 500, 200. Default 1000.
 -carry long|short  : force carry type. Short carry may be faster, but requires high bits/word.
 -prp <exponent>    : run a single PRP test and exit, ignoring worktodo.txt
+-prps <e1,e2,...>  : run independent PRP tests from a comma-separated list; use -workers N for concurrency
 -ll <exponent>     : run a single LL test and exit, ignoring worktodo.txt
 -verify <file>     : verify PRP-proof contained in <file>
 -smallest          : work on smallest exponent in worktodo.txt rather than the first exponent in worktodo.txt    
@@ -330,8 +331,8 @@ void Args::parse(const string& line) {
         throw "-workers <N>";
       }
       workers = stoi(s);
-      if (workers < 1 || workers > 4) {
-        throw "Number of workers must be between 1 and 4";
+      if (workers < 1 || workers > 8) {
+        throw "Number of workers must be between 1 and 8";
       }
     } else if (key == "-cache") {
       useCache = true;
@@ -372,6 +373,20 @@ void Args::parse(const string& line) {
     }
     else if (key == "-iters") { iters = stoi(s); assert(iters && (iters % 10000 == 0)); }
     else if (key == "-prp" || key == "-PRP") { prpExp = stoll(s); }
+    else if (key == "-prps" || key == "-PRPS") {
+      if (s.empty()) {
+        log("-prps expects a comma-separated exponent list\n");
+        throw "-prps <e1,e2,...>";
+      }
+      for (const string& exponent : split(s, ',')) {
+        u64 const value = stoull(exponent);
+        if (value <= 1000 || value > UINT32_MAX) {
+          log("invalid -prps exponent '%s'\n", exponent.c_str());
+          throw "invalid -prps exponent";
+        }
+        prpExps.push_back(value);
+      }
+    }
     else if (key == "-ll" || key == "-LL") { llExp = stoll(s); }
     else if (key == "-smallest") { smallest = true; }
     else if (key == "-fft") { fftSpec = s; }

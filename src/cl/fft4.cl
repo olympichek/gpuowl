@@ -194,6 +194,30 @@ void OVERLOAD fft4(GF31 *u) { fft4by(u, 0, 1, 4); }
 
 #if NTT_GF61
 
+#if RIESEL_PAIR || GOLD_PAIR
+
+void OVERLOAD fft4Core(GF61 *u) {
+  X2(u[0], u[2]);
+  X2_mul_t4(u[1], u[3]);
+  X2(u[0], u[1]);
+  X2(u[2], u[3]);
+}
+
+void OVERLOAD fft4by(GF61 *u, u32 base, u32 step, u32 M) {
+#define A(k) u[(base + step * k) % M]
+  GF61 a0 = add(A(0), A(2));
+  GF61 a2 = sub(A(0), A(2));
+  GF61 a1 = add(A(1), A(3));
+  GF61 a3 = mul_t4(sub(A(1), A(3)));
+  A(0) = add(a0, a1);
+  A(1) = add(a2, a3);
+  A(2) = sub(a0, a1);
+  A(3) = sub(a2, a3);
+#undef A
+}
+
+#else
+
 // 16 ADD
 void OVERLOAD fft4by(GF61 *u, u32 base, u32 step, u32 M) {
 
@@ -229,6 +253,8 @@ void OVERLOAD fft4by(GF61 *u, u32 base, u32 step, u32 M) {
 #undef A
 
 }
+
+#endif
 
 void OVERLOAD fft4(GF61 *u) { fft4by(u, 0, 1, 4); }
 

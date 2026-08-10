@@ -12,8 +12,11 @@
 #include <string>
 #include <optional>
 #include <charconv>
+#include <mutex>
 
 namespace {
+
+std::mutex batchMutex;
 
 bool isHex(const string& s) {
   u32 dummy{};
@@ -180,6 +183,14 @@ std::optional<Task> Worktodo::getTask(Args &args, i32 instance) {
       auto path = args.verifyPath;
       args.verifyPath.clear();
       return Task{.kind=Task::VERIFY, .verifyPath=path};
+    }
+  }
+  {
+    std::lock_guard const lock(batchMutex);
+    if (!args.prpExps.empty()) {
+      u64 const exp = args.prpExps.front();
+      args.prpExps.erase(args.prpExps.begin());
+      return Task{.kind=Task::PRP, .exponent=exp};
     }
   }
   return getWork(args, instance);

@@ -176,6 +176,37 @@ void updateStats(local u32 *lds, u32 num_threads, u32 num_blocks, global uint *b
     }
   }
 }
+
+#if ROE && ROE_COUNT
+// Diagnostic counterpart to updateStats.  Each workgroup contributes the
+// number of coefficient pairs whose reconstruction error crossed the selected
+// ROE_COUNT/1000 threshold.  The output slots deliberately reuse bufROE; the
+// host converts their raw uint representation before computing statistics.
+void updateCountStats(local u32 *lds, u32 num_threads, u32 num_blocks, global uint *bufROE, u32 posROE, u32 count) {
+  u32 me = get_local_id(0);
+
+  while (num_threads > 1) {
+    if (num_threads > WAVEFRONT) bar();
+    if (me >= num_threads / 2 && me < num_threads) lds[me - num_threads / 2] = count;
+    if (num_threads > WAVEFRONT) {
+      bar();
+      bar();
+    }
+    if (me < num_threads / 2) count += lds[me];
+    num_threads /= 2;
+  }
+
+  if (me == 0) {
+    posROE = bufROE[0];
+    atomic_add(bufROE + posROE + 2, count);
+    u32 old_value = atomic_add(bufROE + 1, 1);
+    if (old_value == num_blocks - 1) {
+      bufROE[0] = posROE + 1;
+      bufROE[1] = 0;
+    }
+  }
+}
+#endif
 #endif
 
 #if 0
@@ -397,11 +428,56 @@ i64 weightAndCarryOne(float uF2, Z31 u31, float F2_invWeight, u32 m31_invWeight,
 
 #elif FFT_TYPE == FFT3261
 
+#if PARITY_SQUARE
+// For a weighted cyclic square, all off-diagonal products occur twice and
+// vanish modulo two.  For output word 2*k, exactly one of the two possible
+// diagonal inputs has an odd Crandall--Fagin multiplier.  Output word 2*k+1
+// has no diagonal and is therefore even.  NWORDS is a power of two and EXP is
+// odd, so the fractional comparison needs only the low log2(NWORDS) product
+// bits rather than a division.
+u32 squareCoefficientParity(CP(u32) parity, u32 outputPair) {
+#if PARITY_PACKED
+  return (parity[outputPair >> 5] >> (outputPair & 31u)) & 1u;
+#elif PARITY_PHYSICAL
+  u32 sourceWord = outputPair;
+  u32 frac = ((u32) EXP * sourceWord) & (NWORDS - 1);
+  if (frac != 0 && frac <= NWORDS / 2) sourceWord += NWORDS / 2;
+  u32 const sourcePair = sourceWord >> 1;
+  u32 const sourceX = sourcePair / BIG_HEIGHT;
+  u32 const sourceLine = sourcePair - sourceX * BIG_HEIGHT;
+  u32 const packed = parity[sourceLine * WIDTH + sourceX];
+  return (packed >> (sourceWord & 1)) & 1u;
+#elif PARITY_PREPARED
+  return parity[outputPair] & 1u;
+#else
+  u32 sourceWord = outputPair;
+  u32 frac = ((u32) EXP * sourceWord) & (NWORDS - 1);
+  if (frac != 0 && frac <= NWORDS / 2) sourceWord += NWORDS / 2;
+  u32 packed = parity[sourceWord >> 1];
+  return (packed >> (sourceWord & 1)) & 1u;
+#endif
+}
+#endif
+
 // Apply inverse weight, add in optional carry, calculate roundoff error, convert to integer. Handle MUL3.
-i96 weightAndCarryOne(float uF2, Z61 u61, float F2_invWeight, u32 m61_invWeight, bool hasInCarry, i64 inCarry, float* maxROE) {
+i96 weightAndCarryOne(float uF2, Z61 u61, float F2_invWeight, u32 m61_invWeight,
+#if PARITY_SQUARE
+#if PARITY_LAZY
+                      CP(u32) parity, u32 parityIndex, bool parityCanBeOdd,
+#else
+                      u32 expectedParity,
+#endif
+#endif
+                      bool hasInCarry, i64 inCarry, float* maxROE) {
 
   // Apply inverse weight and get the Z61 data
   u61 = shr(u61, m61_invWeight);
+#if GOOD_THOMAS9
+  // The inverse base-field DFT is deliberately left unnormalized in the
+  // middle kernel.  Remove its factor nine once per scalar at the exact
+  // reconstruction boundary.
+  u61 = mul(u61, (Z61)2049638230412172401ul);
+#endif
   u64 n61 = get_Z61(u61);
 
   // The final result mod M61 must be n61.  Use FP32 data to calculate how many multiples of M61 need to be added to n61.
@@ -411,8 +487,27 @@ i96 weightAndCarryOne(float uF2, Z61 u61, float F2_invWeight, u32 m61_invWeight,
   i32 nF2 = RNDVALfloatToInt(uF2int);
 
   // Optionally calculate roundoff error
-  float roundoff = fabs(fma(uF2, 4.3368086899420177360298112034798e-19f, RNDVAL - uF2int));
+  float signedRoundoff = fma(uF2, 4.3368086899420177360298112034798e-19f, RNDVAL - uF2int);
+  float roundoff = fabs(signedRoundoff);
   *maxROE = max(*maxROE, roundoff);
+
+#if PARITY_SQUARE
+  // Adjacent quotient candidates differ by the odd modulus M61.  Parity tells
+  // whether the rounded candidate is wrong; the signed residual tells which
+  // adjacent integer lies on the other side of the rounding boundary.
+  if (roundoff >= 0.49f) {
+#if PARITY_LAZY
+    u32 const expectedParity = parityCanBeOdd ?
+      squareCoefficientParity(parity, parityIndex) : 0u;
+#endif
+    if ((((u32) nF2 ^ (u32) n61) & 1u) != expectedParity) {
+      nF2 += signedRoundoff < 0 ? -1 : 1;
+#if ROE_COUNT
+      *maxROE = max(*maxROE, 0.75f);
+#endif
+    }
+  }
+#endif
 
   // Compute the value using i96 math
   i32 vhi = nF2 >> 3;
@@ -433,6 +528,52 @@ i96 weightAndCarryOne(float uF2, Z61 u61, float F2_invWeight, u32 m61_invWeight,
 /**************************************************************************/
 
 #elif FFT_TYPE == FFT3161
+
+#if GOLD_PAIR
+
+i96 goldTimesM31Multiplier(Z31 multiplier) {
+  // Gold*k = k*2^64 - k*2^32 + k.
+  i96 value = make_i96((i32)multiplier, (u64)0);
+  value = sub(value, make_i96((i32)0, (u64)multiplier << 32));
+  return add(value, make_i96((i32)0, (u64)multiplier));
+}
+
+// Apply inverse weights and reconstruct the balanced M31*Gold coefficient.
+i96 weightAndCarryOne(Z31 u31, Z61 uGold, u32 m31_invWeight,
+                      Z61 gold_invWeight, bool hasInCarry, i64 inCarry,
+                      u32* maxROE) {
+  u31 = shr(u31, m31_invWeight);
+  uGold = mul(uGold, gold_invWeight);
+
+  Z31 const n31 = get_Z31(u31);
+  Z61 const nGold = get_Z61(uGold);
+  Z31 const delta = sub(n31, modM31(nGold));
+  Z31 const multiplier = mul(delta, (Z31)0x55555555u);  // inverse of 3 mod M31
+
+  i96 value = add(goldTimesM31Multiplier(multiplier),
+                  make_i96((i32)0, (u64)nGold));
+  bool const aboveHalf = i96_hi32(value) > 0x3fffffffu ||
+    (i96_hi32(value) == 0x3fffffffu &&
+     i96_lo64(value) > 0x40000000bfffffffull);
+  if (aboveHalf) {
+    value = sub(value, make_i96((i32)0x7ffffffe,
+                                0x800000017fffffffull));
+  }
+
+  // Preserve the incumbent integer ROE diagnostic scale.  This is a range
+  // indicator for an exact NTT, not a floating roundoff estimate.
+  u32 const balancedMultiplier = multiplier > M31 / 2 ?
+                                 M31 - multiplier : multiplier;
+  *maxROE = max(*maxROE, balancedMultiplier);
+
+#if MUL3
+  value = add(value, add(value, value));
+#endif
+  if (hasInCarry) value = add(value, inCarry);
+  return value;
+}
+
+#else
 
 // Apply inverse weight, add in optional carry, calculate roundoff error, convert to integer. Handle MUL3.
 i96 weightAndCarryOne(Z31 u31, Z61 u61, u32 m31_invWeight, u32 m61_invWeight, bool hasInCarry, i64 inCarry, u32* maxROE) {
@@ -469,18 +610,128 @@ i96 weightAndCarryOne(Z31 u31, Z61 u61, u32 m31_invWeight, u32 m61_invWeight, bo
   return value;
 }
 
+#endif
+
+/**************************************************************************/
+/* Exact CRT for three independent 31-bit residue planes (93 bits total) */
+/**************************************************************************/
+
+#elif FFT_TYPE == FFT31R2
+
+i96 weightAndCarryOne(Z31 u31, Z31 u0, Z31 u1, u32 m31_invWeight,
+                      Z31 riesel0_invWeight, Z31 riesel1_invWeight,
+                      bool hasInCarry, i64 inCarry, u32* maxROE) {
+  u31 = shr(u31, m31_invWeight);
+
+  u32 const n31 = get_Z31(u31);
+  u32 const n0 = riesel0Decode(riesel0Mul(u0, riesel0_invWeight));
+  u32 const n1 = riesel1Decode(riesel1Mul(u1, riesel1_invWeight));
+
+  // Garner reconstruction.  q0 < q1 and the constant is q0^-1 (mod q1)
+  // in Montgomery form, so a Montgomery multiply of two normal operands
+  // deliberately returns a normal residue here.
+  u32 const delta = rieselSubExplicit(n1, n0, RIESEL_Q1);
+#if RIESEL_LAZY
+  u32 const t1 = riesel1Mul(delta, 346029397u);
+#else
+  u32 const t1 = riesel1Mul(delta, 713730645u);
+#endif
+  u64 const x01 = (u64)n0 + (u64)RIESEL_Q0 * t1;
+
+  // q0*q1 inverse modulo M31.
+#if RIESEL_LAZY
+  u32 const t2 = mul(sub(n31, modM31(x01)), 1972039331u);
+#else
+  u32 const t2 = mul(sub(n31, modM31(x01)), 1564229429u);
+#endif
+
+  // q0*q1 * t2 as an unsigned 96-bit integer, then add x01.
+#if RIESEL_LAZY
+  u64 const q01 = 1071100245244379137ULL;
+#else
+  u64 const q01 = 4476934267141619713ULL;
+#endif
+  u64 const p0 = (u64)lo32(q01) * t2;
+  u64 const p1 = (u64)hi32(q01) * t2;
+  u64 const productLo = p0 + (p1 << 32);
+  u32 const productHi = (u32)(p1 >> 32) + (productLo < p0);
+  i96 value = add(make_i96((i32)productHi, productLo), make_i96((i64)x01));
+
+  // Select the balanced representative modulo P=M31*q0*q1.
+#if RIESEL_LAZY
+  u32 const halfHi = 62346239u;
+  u64 const halfLo = 15688667536053764095ULL;
+#else
+  u32 const halfHi = 260591871u;
+  u64 const halfLo = 11664144917195653119ULL;
+#endif
+  bool const aboveHalf = i96_hi32(value) > halfHi ||
+                         (i96_hi32(value) == halfHi && i96_lo64(value) > halfLo);
+#if RIESEL_LAZY
+  if (aboveHalf) value = sub(value, make_i96((i32)124692479, 12930590998397976575ULL));
+#else
+  if (aboveHalf) value = sub(value, make_i96((i32)521183743, 4881545760681754623ULL));
+#endif
+
+  // This is exact arithmetic.  The modulus product, rather than floating
+  // roundoff, is the sole coefficient-range limit.
+  *maxROE = max(*maxROE, 0u);
+
+#if MUL3
+  value = add(value, add(value, value));
+#endif
+  if (hasInCarry) value = add(value, inCarry);
+  return value;
+}
+
 /******************************************************************************/
 /*  Similar to above, but for a hybrid FFT based on FP32*GF(M31^2)*GF(M61^2)  */
 /******************************************************************************/
 
 #elif FFT_TYPE == FFT323161
 
+#if PARITY_SQUARE
+u32 squareCoefficientParity(CP(u32) parity, u32 outputPair) {
+#if PARITY_PACKED
+  return (parity[outputPair >> 5] >> (outputPair & 31u)) & 1u;
+#elif PARITY_PHYSICAL
+  u32 sourceWord = outputPair;
+  u32 frac = ((u32) EXP * sourceWord) & (NWORDS - 1);
+  if (frac != 0 && frac <= NWORDS / 2) sourceWord += NWORDS / 2;
+  u32 const sourcePair = sourceWord >> 1;
+  u32 const sourceX = sourcePair / BIG_HEIGHT;
+  u32 const sourceLine = sourcePair - sourceX * BIG_HEIGHT;
+  u32 const packed = parity[sourceLine * WIDTH + sourceX];
+  return (packed >> (sourceWord & 1)) & 1u;
+#elif PARITY_PREPARED
+  return parity[outputPair] & 1u;
+#else
+  u32 sourceWord = outputPair;
+  u32 frac = ((u32) EXP * sourceWord) & (NWORDS - 1);
+  if (frac != 0 && frac <= NWORDS / 2) sourceWord += NWORDS / 2;
+  u32 packed = parity[sourceWord >> 1];
+  return (packed >> (sourceWord & 1)) & 1u;
+#endif
+}
+#endif
+
 // Apply inverse weight, add in optional carry, calculate roundoff error, convert to integer. Handle MUL3.
-i128 weightAndCarryOne(float uF2, Z31 u31, Z61 u61, float F2_invWeight, u32 m31_invWeight, u32 m61_invWeight, bool hasInCarry, i64 inCarry, float* maxROE) {
+i128 weightAndCarryOne(float uF2, Z31 u31, Z61 u61, float F2_invWeight, u32 m31_invWeight, u32 m61_invWeight,
+#if PARITY_SQUARE
+                       u32 expectedParity,
+#endif
+                       bool hasInCarry, i64 inCarry, float* maxROE) {
 
   // Apply inverse weights
   u31 = shr(u31, m31_invWeight);
   u61 = shr(u61, m61_invWeight);
+#if QUOTIENT_STATS || (PARITY_SQUARE && ROE_COUNT)
+  u64 originalN61 = get_Z61(u61);
+  float m61Estimate = (float)hi32(originalN61) * -4294967296.0f;
+  float m61Work = fma(uF2, F2_invWeight, m61Estimate);
+  float m61Int = fma(m61Work, 4.3368086899420177360298112034798e-19f, RNDVAL);
+  i32 estimatedM61Quotient = RNDVALfloatToInt(m61Int);
+#endif
   // Use chinese remainder theorem to create a 92-bit result.  Loosely copied from Yves Gallot's mersenne2 program.
   u32 n31 = get_Z31(u31);
   u61 += make_u64(hi32(M61), lo32(M61) - n31);       // u61 - u31
@@ -517,6 +768,82 @@ i128 weightAndCarryOne(float uF2, Z31 u31, Z61 u61, float F2_invWeight, u32 m31_
 
   // Optionally calculate roundoff error
   float roundoff = fabs(fma(uF2, 2.0194839183061857038255724444152e-28f, RNDVAL - uF2int));
+#if COEFF_RANGE_STATS
+  i64 coeffHi = i128_hi64(v);
+  u64 coeffLo = i128_lo64(v);
+#if COEFF_RANGE_STATS == 23
+  // Balanced range of (2^23-1)*(2^61-1):
+  // floor(P/2) = 0x7ffffefffffffffc00000.
+  bool coeffTooPositive = coeffHi > 0x7ffffLL ||
+                          (coeffHi == 0x7ffffLL && coeffLo > 0xefffffffffc00000ULL);
+  bool coeffTooNegative = coeffHi < -0x80000LL ||
+                          (coeffHi == -0x80000LL && coeffLo < 0x1000000000400000ULL);
+  if (coeffTooPositive || coeffTooNegative) roundoff = max(roundoff, 4.0f);
+#elif COEFF_RANGE_STATS == 24
+  // Exact balanced range of qC*(2^61-1), qC=7*2^21-1=14680063.
+  // floor(P/2) = 0xdffffefffffffff900000.
+  bool coeffTooPositive = coeffHi > 0xdffffLL ||
+                          (coeffHi == 0xdffffLL && coeffLo > 0xefffffffff900000ULL);
+  bool coeffTooNegative = coeffHi < -0xe0000LL ||
+                          (coeffHi == -0xe0000LL && coeffLo < 0x1000000000700000ULL);
+  if (coeffTooPositive || coeffTooNegative) roundoff = max(roundoff, 4.0f);
+#elif COEFF_RANGE_STATS >= 65 && COEFF_RANGE_STATS <= 126
+  i64 coeffLimitHi = (i64)1 << (COEFF_RANGE_STATS - 64);
+  bool coeffOutsidePower = coeffHi >= coeffLimitHi || coeffHi < -coeffLimitHi ||
+                           (coeffHi == -coeffLimitHi && coeffLo == 0);
+  if (coeffOutsidePower) roundoff = max(roundoff, 4.0f);
+#endif
+#endif
+#if PARITY_SQUARE && ROE_COUNT
+  u32 exactParity = ((u32) nF2 ^ (u32) n61 ^ n31) & 1u;
+  u32 estimatedParity = ((u32) estimatedM61Quotient ^ (u32) originalN61) & 1u;
+  // Recover the FP32+M61 quotient error with the otherwise redundant M31
+  // channel.  ROE_COUNT=700 counts odd errors; 701 counts cases where the
+  // FP residual would choose the wrong adjacent quotient.
+  Z31 diagOriginalM61Mod31 = modM31(originalN61);
+  Z31 diagEstimatedMod31 = add(modM31((i64) estimatedM61Quotient * ((1LL << 30) - 1)), diagOriginalM61Mod31);
+  Z31 diagErrorMod31 = mul(sub(diagEstimatedMod31, n31), M31 - 2);
+  i32 diagError = diagErrorMod31 > M31 / 2 ? (i32) (diagErrorMod31 - M31) : (i32) diagErrorMod31;
+  float diagSignedRoundoff = fma(m61Work, 4.3368086899420177360298112034798e-19f, RNDVAL - m61Int);
+  bool oddMismatch = estimatedParity != expectedParity;
+  i32 proposedDelta = diagSignedRoundoff < 0 ? -1 : 1;
+  bool wrongDirection = oddMismatch && proposedDelta != -diagError;
+#if ROE_COUNT == 701
+  if (wrongDirection) roundoff = max(roundoff, 4.0f);
+#elif ROE_COUNT == 702
+  // Parity-free folded-decoder gate: raw quotient errors must be ternary.
+  if (abs(diagError) > 1) roundoff = max(roundoff, 4.0f);
+#elif ROE_COUNT == 703
+  // Every nonzero raw quotient error must lie in the candidate window.
+  if (diagError != 0 && fabs(diagSignedRoundoff) < 0.49f)
+    roundoff = max(roundoff, 4.0f);
+#elif ROE_COUNT == 704
+  // Count the parity-free decoder's complete residual candidate population.
+  if (fabs(diagSignedRoundoff) >= 0.49f) roundoff = max(roundoff, 4.0f);
+#elif ROE_COUNT == 705
+  if (abs(diagError) > 2) roundoff = max(roundoff, 4.0f);
+#elif ROE_COUNT == 706
+  if (abs(diagError) > 3) roundoff = max(roundoff, 4.0f);
+#elif ROE_COUNT >= 710 && ROE_COUNT < 800
+  if (wrongDirection && fabs(diagSignedRoundoff) >= (float) (ROE_COUNT - 700) * .001f) roundoff = max(roundoff, 4.0f);
+#elif ROE_COUNT >= 810 && ROE_COUNT < 900
+  if (oddMismatch && fabs(diagSignedRoundoff) < (float) (ROE_COUNT - 800) * .001f) roundoff = max(roundoff, 4.0f);
+#else
+  // expectedParity was separately validated against exactParity.  Count how
+  // often the cheaper FP32+M61 reconstruction needs an odd correction.
+  if (estimatedParity != expectedParity) roundoff = max(roundoff, 4.0f);
+#endif
+#endif
+#if QUOTIENT_STATS
+  // Determine q_est-q_exact without dividing a 96-bit coefficient.  Mod M31,
+  // M61 is 2^30-1 and its inverse is -2.  The exact M31 residue therefore
+  // recovers the small quotient error directly.
+  Z31 originalM61Mod31 = modM31(originalN61);
+  Z31 estimatedMod31 = add(modM31((i64) estimatedM61Quotient * ((1LL << 30) - 1)), originalM61Mod31);
+  Z31 quotientErrorMod31 = mul(sub(estimatedMod31, n31), M31 - 2);
+  i32 quotientError = quotientErrorMod31 > M31 / 2 ? (i32) (quotientErrorMod31 - M31) : (i32) quotientErrorMod31;
+  roundoff = max(roundoff, (float) abs(quotientError));
+#endif
   *maxROE = max(*maxROE, roundoff);
 
   // Mul by 3 and add carry

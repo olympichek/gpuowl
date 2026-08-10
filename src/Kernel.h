@@ -27,6 +27,7 @@ class Kernel {
   size_t workSizeX;
   size_t workSizeY;
   u32 groupSize = 0;
+  u32 dynamicSharedBytes = 0;
   
   KernelHolder kernel;
   std::future<KernelHolder> pendingKernel;
@@ -37,7 +38,8 @@ public:
   Kernel(string_view name, KernelCompiler* compiler,
          TimeInfo* timeInfo, Queue* queue,
          string_view fileName, string_view nameInFile,
-         size_t workSize, string_view defines = "");
+         size_t workSize, string_view defines = "",
+         u32 dynamicSharedBytes = 0);
 
   ~Kernel();
 

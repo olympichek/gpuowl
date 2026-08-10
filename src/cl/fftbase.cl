@@ -1764,7 +1764,11 @@ void OVERLOAD chainMul4(GF61 *u, GF61 w) {
   GF61 base = csq(w);
   u[2] = cmul(u[2], base);
 
+  #if GOLD_PAIR
+  base = cmulTrig(base, w);
+  #else
   base = cmul(base, w);                 //GWBUG - see FP64 version for possible optimization
+  #endif
   u[3] = cmul(u[3], base);
 }
 
@@ -1774,10 +1778,18 @@ void OVERLOAD chainMul8(GF61 *u, GF61 w) {
   GF61 w2 = csq(w);
   u[2] = cmul(u[2], w2);
 
+  #if GOLD_PAIR
+  GF61 base = cmulTrig(w2, w);
+  #else
   GF61 base = cmul(w2, w);              //GWBUG - see FP64 version for many possible optimizations
+  #endif
   for (int i = 3; i < 8; ++i) {
     u[i] = cmul(u[i], base);
+    #if GOLD_PAIR
+    base = cmulTrig(base, w);
+    #else
     base = cmul(base, w);
+    #endif
   }
 }
 

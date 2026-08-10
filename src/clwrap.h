@@ -103,6 +103,13 @@ void finish(cl_queue q);
 EventHolder run(cl_queue queue, cl_kernel kernel, size_t groupSizeX, size_t workSizeX, size_t workSizeY,
                 vector<cl_event>&& waits, const string &name, bool genEvent);
 
+#ifdef CUDA_BACKEND
+void cudaSetKernelDynamicShared(cl_kernel kernel, unsigned bytes);
+// Recreate a newly constructed command queue at CUDA's highest (positive) or
+// lowest (negative) stream priority.  No work may have been submitted yet.
+void cudaSetQueuePriority(cl_queue queue, int priority);
+#endif
+
 EventHolder read(cl_queue queue, vector<cl_event>&& waits,
                  bool blocking, cl_mem buf, size_t size, void *data, bool genEvent);
 
@@ -141,5 +148,3 @@ void cudaSetL1Config(int x);
 // Buffers that are nullptr or zero-size are skipped.
 void cudaSetL2Persistent(cl_command_queue q, const std::vector<cl_mem>& buffers);
 #endif
-
-

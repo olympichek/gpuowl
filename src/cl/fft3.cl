@@ -32,3 +32,21 @@ void fft3by(T2 *u, u32 base, u32 step, u32 M) {
 void fft3(T2 *u) { fft3by(u, 0, 1, 3); }
 
 #endif
+
+#if FFT_FP32
+
+void fft3by(F2 *u, u32 base, u32 step, u32 M) {
+#define A(k) u[(base + k * step) % M]
+  float const SIN1 = 0.8660254037844386f;
+  X2(A(1), A(2));
+  A(2) = mul_t4(A(2));
+  F2 const t = fmaT2(-0.5f, A(1), A(0));
+  A(0) = A(0) + A(1);
+  A(1) = fmaT2( SIN1, A(2), t);
+  A(2) = fmaT2(-SIN1, A(2), t);
+#undef A
+}
+
+void fft3(F2 *u) { fft3by(u, 0, 1, 3); }
+
+#endif

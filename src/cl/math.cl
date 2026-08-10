@@ -102,6 +102,7 @@ typedef struct { unsigned __int128 x; } u128;
 i128 OVERLOAD make_i128(i64 hi, u64 lo) { i128 val; val.x = ((__int128)hi << 64) | lo; return val; }
 i128 OVERLOAD make_i128(u64 hi, u64 lo) { i128 val; val.x = ((__int128)hi << 64) | lo; return val; }
 u64 i128_lo64(i128 val) { return val.x; }
+i64 i128_hi64(i128 val) { return val.x >> 64; }
 u64 i128_shrlo64(i128 val, u32 bits) { return val.x >> bits; }
 i128 OVERLOAD i128_masklo64(i128 a, u64 m) { i128 val; val.x = a.x & (((__int128)0xFFFFFFFFFFFFFFFFULL << 64) | m); return val; }
 i128 OVERLOAD add(i128 a, i128 b) { i128 val; val.x = a.x + b.x; return val; }
@@ -119,6 +120,7 @@ typedef struct { u64 hi64; u64 lo64; } u128;
 i128 OVERLOAD make_i128(i64 hi, u64 lo) { i128 val; val.hi64 = hi; val.lo64 = lo; return val; }
 i128 OVERLOAD make_i128(u64 hi, u64 lo) { i128 val; val.hi64 = hi; val.lo64 = lo; return val; }
 u64 i128_lo64(i128 val) { return val.lo64; }
+i64 i128_hi64(i128 val) { return val.hi64; }
 u64 i128_shrlo64(i128 val, u32 bits) { return (val.hi64 << (64 - bits)) | (val.lo64 >> bits); }
 i128 OVERLOAD i128_masklo64(i128 a, u64 m) { i128 val; val.lo64 = a.lo64 & m; val.hi64 = a.hi64; return val; }
 i128 OVERLOAD add(i128 a, i128 b) { i128 val; val.lo64 = a.lo64 + b.lo64; val.hi64 = a.hi64 + b.hi64 + (val.lo64 < a.lo64); return val; }
@@ -525,9 +527,23 @@ F2 OVERLOAD csqa(F2 a, F2 c) { return U2(fma(a.x, a.x, fma(a.y, -a.y, c.x)), fma
 F2 OVERLOAD csq_neg(F2 a) { return U2(fma(-a.x, a.x, a.y * a.y), mulminus2(a.x) * a.y); }                               // NOT USED
 
 // Complex multiply
-F2 OVERLOAD cmul(F2 a, F2 b) { return U2(fma(a.x, b.x, -a.y * b.y), fma(a.x, b.y, a.y * b.x)); }
+F2 OVERLOAD cmul(F2 a, F2 b) {
+#if FP32_CMUL64
+  return U2((F) fma((double) a.x, (double) b.x, -(double) a.y * (double) b.y),
+            (F) fma((double) a.x, (double) b.y,  (double) a.y * (double) b.x));
+#else
+  return U2(fma(a.x, b.x, -a.y * b.y), fma(a.x, b.y, a.y * b.x));
+#endif
+}
 
-F2 OVERLOAD cfma(F2 a, F2 b, F2 c) { return U2(fma(a.x, b.x, fma(a.y, -b.y, c.x)), fma(a.y, b.x, fma(a.x, b.y, c.y))); }
+F2 OVERLOAD cfma(F2 a, F2 b, F2 c) {
+#if FP32_CFMA64
+  return U2((F) fma((double) a.x, (double) b.x, fma(-(double) a.y, (double) b.y, (double) c.x)),
+            (F) fma((double) a.y, (double) b.x, fma( (double) a.x, (double) b.y, (double) c.y)));
+#else
+  return U2(fma(a.x, b.x, fma(a.y, -b.y, c.x)), fma(a.y, b.x, fma(a.x, b.y, c.y)));
+#endif
+}
 
 F2 OVERLOAD cmul_by_conjugate(F2 a, F2 b) { return cmul(a, conjugate(b)); }
 
@@ -615,7 +631,210 @@ F2 OVERLOAD foo(F2 a) { return foo2(a, a); }
 /*          Similar to above, but for an NTT based on GF(M31^2)           */
 /**************************************************************************/
 
-#if NTT_GF31
+#if NTT_GF31 || FOLD_SYNDROME
+
+#if RIESEL_FIELD
+
+#if M19_FIELD && RIESEL_FIELD == 2
+#define RF_Q       524287u
+#define RF_NEG_INV 0u
+#define RF_R2      1u
+#define RF_T8_RE   523775u
+#define RF_T8_IM   523775u
+#define RF_C1      481674u
+#define RF_S1      162504u
+#elif RIESEL_LAZY && RIESEL_FIELD == 1
+#define RF_Q       1031798783u
+#define RF_NEG_INV 1031798785u
+#define RF_R2      354435755u
+#define RF_T8_RE   1000355245u
+#define RF_T8_IM   1000355245u
+#define RF_C1      720984735u
+#define RF_S1      800995659u
+#elif RIESEL_LAZY && RIESEL_FIELD == 2
+#define RF_Q       1038090239u
+#define RF_NEG_INV 1038090241u
+#define RF_R2      485158126u
+#define RF_T8_RE   1010876486u
+#define RF_T8_IM   1010876486u
+#define RF_C1      621667375u
+#define RF_S1      298980690u
+#elif RIESEL_FIELD == 1
+#define RF_Q       2090860543u
+#define RF_NEG_INV 2090860545u
+#define RF_R2      1130207172u
+#define RF_T8_RE   1657223104u
+#define RF_T8_IM   1657223104u
+#define RF_C1      1890734217u
+#define RF_S1      1553601931u
+#else
+#define RF_Q       2141192191u
+#define RF_NEG_INV 2141192193u
+#define RF_R2      1409360092u
+#define RF_T8_RE   240631641u
+#define RF_T8_IM   240631641u
+#define RF_C1      584773844u
+#define RF_S1      624003637u
+#endif
+
+#define M31 RF_Q
+
+Z31 rfMontMul(Z31 a, Z31 b) {
+#if M19_FIELD && RIESEL_FIELD == 2
+  u64 const value = (u64)a * b;
+  u32 result = (u32)(value & RF_Q) + (u32)(value >> 19);
+  result = (result & RF_Q) + (result >> 19);
+  return result >= RF_Q ? result - RF_Q : result;
+#elif RIESEL_PTX_MONT && HAS_PTX >= 200
+  // Spell out the two-limb Montgomery reduction so we can compare PTXAS's
+  // scheduling with the idiom generated from portable C.  Since RF_Q is
+  // below 2^31, a*b + multiplier*RF_Q cannot overflow 64 bits.
+  u32 lo, hi, multiplier, ignored, result;
+  __asm("mul.lo.u32     %0, %5, %6;\n\t"
+        "mul.hi.u32     %1, %5, %6;\n\t"
+        "mul.lo.u32     %2, %0, %7;\n\t"
+        "mad.lo.cc.u32  %3, %2, %8, %0;\n\t"
+        "madc.hi.u32    %4, %2, %8, %1;"
+        : "=&r"(lo), "=&r"(hi), "=&r"(multiplier), "=&r"(ignored), "=&r"(result)
+        : "r"(a), "r"(b), "n"(RF_NEG_INV), "n"(RF_Q));
+#else
+  u64 value = (u64)a * b;
+  u32 multiplier = (u32)value * RF_NEG_INV;
+  u64 sum = value + (u64)multiplier * RF_Q;
+  u32 result = hi32(sum);
+#endif
+#if RIESEL_LAZY
+  return result;
+#else
+  return result >= RF_Q ? result - RF_Q : result;
+#endif
+}
+Z31 OVERLOAD add(Z31 a, Z31 b) {
+  u32 const bound = RIESEL_LAZY ? 2u * RF_Q : RF_Q;
+  u32 r = a + b;
+  return r >= bound ? r - bound : r;
+}
+GF31 OVERLOAD add(GF31 a, GF31 b) { return U2(add(a.x, b.x), add(a.y, b.y)); }
+Z31 OVERLOAD sub(Z31 a, Z31 b) {
+  u32 const bound = RIESEL_LAZY ? 2u * RF_Q : RF_Q;
+  return a >= b ? a - b : bound - (b - a);
+}
+GF31 OVERLOAD sub(GF31 a, GF31 b) { return U2(sub(a.x, b.x), sub(a.y, b.y)); }
+Z31 OVERLOAD neg(Z31 a) {
+  u32 const bound = RIESEL_LAZY ? 2u * RF_Q : RF_Q;
+  return a == 0 ? 0 : bound - a;
+}
+GF31 OVERLOAD neg(GF31 a) { return U2(neg(a.x), neg(a.y)); }
+Z31 OVERLOAD mul(Z31 a, Z31 b) { return rfMontMul(a, b); }
+Z31 OVERLOAD mul2(Z31 a) { return add(a, a); }
+GF31 OVERLOAD mul2(GF31 a) { return U2(mul2(a.x), mul2(a.y)); }
+
+Z31 make_Z31_normal(i64 a) {
+  u64 magnitude = a < 0 ? (u64)(-(a + 1)) + 1 : (u64)a;
+  Z31 value = (Z31)(magnitude % RF_Q);
+  return a < 0 ? neg(value) : value;
+}
+Z31 OVERLOAD make_Z31(i32 a) { return rfMontMul(make_Z31_normal(a), RF_R2); }
+Z31 OVERLOAD make_Z31(u32 a) { return rfMontMul(make_Z31_normal((i64)a), RF_R2); }
+Z31 OVERLOAD make_Z31(i64 a) { return rfMontMul(make_Z31_normal(a), RF_R2); }
+// PRPLL data words are non-negative and contain ceil(EXP/NWORDS) bits.  For
+// the 4M transform under test that is at most 33 bits, so four conditional
+// subtractions replace a general 64-bit remainder in premultiplication.
+Z31 make_Z31_word(i64 a) {
+#if EXP / NWORDS <= 32
+  bool const negative = a < 0;
+  u64 value = negative ? (u64)(-(a + 1)) + 1 : (u64)a;
+  if (value >= RF_Q) value -= RF_Q;
+  if (value >= RF_Q) value -= RF_Q;
+  if (value >= RF_Q) value -= RF_Q;
+  if (value >= RF_Q) value -= RF_Q;
+#if RIESEL_LAZY
+  if (value >= RF_Q) value -= RF_Q;
+  if (value >= RF_Q) value -= RF_Q;
+  if (value >= RF_Q) value -= RF_Q;
+  if (value >= RF_Q) value -= RF_Q;
+#endif
+  Z31 normal = (Z31)value;
+  if (negative && normal != 0) normal = RF_Q - normal;
+  return rfMontMul(normal, RF_R2);
+#else
+  return make_Z31(a);
+#endif
+}
+u32 get_Z31(Z31 a) {
+  u32 value = rfMontMul(a, 1);
+#if RIESEL_LAZY
+  if (value >= RF_Q) value -= RF_Q;
+#endif
+  return value;
+}
+i32 get_balanced_Z31(Z31 a) { u32 n = get_Z31(a); return n > RF_Q / 2 ? (i32)(n - RF_Q) : (i32)n; }
+
+Z31 OVERLOAD shl(Z31 a, u32 k) {
+#if M19_FIELD && RIESEL_FIELD == 2
+  k %= 19;
+  return k == 0 ? a : (((a << k) & RF_Q) + (a >> (19 - k)));
+#else
+  while (k--) a = add(a, a);
+  return a;
+#endif
+}
+GF31 OVERLOAD shl(GF31 a, u32 k) { return U2(shl(a.x, k), shl(a.y, k)); }
+Z31 OVERLOAD shr(Z31 a, u32 k) {
+#if M19_FIELD && RIESEL_FIELD == 2
+  k %= 19;
+  return k == 0 ? a : ((a >> k) + ((a << (19 - k)) & RF_Q));
+#else
+  Z31 const inv2 = make_Z31((RF_Q + 1u) / 2u);
+  while (k--) a = mul(a, inv2);
+  return a;
+#endif
+}
+GF31 OVERLOAD shr(GF31 a, u32 k) { return U2(shr(a.x, k), shr(a.y, k)); }
+
+GF31 OVERLOAD conjugate(GF31 a) { return U2(a.x, neg(a.y)); }
+GF31 OVERLOAD csq(GF31 a) { return U2(mul(add(a.x, a.y), sub(a.x, a.y)), mul2(mul(a.x, a.y))); }
+GF31 OVERLOAD csq_add(GF31 a, GF31 c) { return add(csq(a), c); }
+GF31 OVERLOAD csq_sub(GF31 a, GF31 c) { return sub(csq(a), c); }
+GF31 OVERLOAD csq_addi(GF31 a, GF31 c) { GF31 s = csq(a); return U2(sub(s.x, c.y), add(s.y, c.x)); }
+GF31 OVERLOAD csq_subi(GF31 a, GF31 c) { GF31 s = csq(a); return U2(add(s.x, c.y), sub(s.y, c.x)); }
+GF31 OVERLOAD csqa(GF31 a, GF31 c) { return csq_add(a, c); }
+GF31 OVERLOAD cmul(GF31 a, GF31 b) {
+  Z31 k1 = mul(b.x, add(a.x, a.y));
+  Z31 k2 = mul(a.x, sub(b.y, b.x));
+  Z31 k3 = mul(a.y, add(b.y, b.x));
+  return U2(sub(k1, k3), add(k1, k2));
+}
+GF31 OVERLOAD csqTrig(GF31 a) { return csq(a); }
+GF31 OVERLOAD ccubeTrig(GF31 sq, GF31 w) { return cmul(sq, w); }
+GF31 OVERLOAD mul_t4(GF31 a) { return U2(neg(a.y), a.x); }
+GF31 OVERLOAD mul_t8(GF31 a) {
+#if M19_FIELD && RIESEL_FIELD == 2
+  return U2(shl(sub(a.y, a.x), 9), shl(neg(add(a.x, a.y)), 9));
+#else
+  return cmul(a, U2((Z31)RF_T8_RE, (Z31)RF_T8_IM));
+#endif
+}
+GF31 OVERLOAD mul_3t8(GF31 a) {
+#if M19_FIELD && RIESEL_FIELD == 2
+  return U2(shl(add(a.x, a.y), 9), shl(sub(a.y, a.x), 9));
+#else
+  return cmul(a, U2(neg((Z31)RF_T8_RE), (Z31)RF_T8_IM));
+#endif
+}
+
+void OVERLOAD X2_internal(GF31 *a, GF31 *b) { GF31 t = *a; *a = add(t, *b); *b = sub(t, *b); }
+void OVERLOAD X2conjb_internal(GF31 *a, GF31 *b) { GF31 t = *a; a->x = add(a->x, b->x); a->y = sub(a->y, b->y); b->x = sub(t.x, b->x); b->y = add(t.y, b->y); }
+void OVERLOAD X2_mul_t4_internal(GF31 *a, GF31 *b) { GF31 t = *a; *a = add(*a, *b); t.x = sub(t.x, b->x); b->x = sub(b->y, t.y); b->y = t.x; }
+void OVERLOAD X2_mul_t8_internal(GF31 *a, GF31 *b) { X2(*a, *b); *b = mul_t8(*b); }
+void OVERLOAD X2_mul_3t8_internal(GF31 *a, GF31 *b) { X2(*a, *b); *b = mul_3t8(*b); }
+void OVERLOAD X2_conjb_internal(GF31 *a, GF31 *b) { GF31 t = *a; *a = add(t, *b); b->x = sub(t.x, b->x); b->y = sub(b->y, t.y); }
+void OVERLOAD SWAP_internal(GF31 *a, GF31 *b) { GF31 t = *a; *a = *b; *b = t; }
+GF31 OVERLOAD addsub(GF31 a) { return U2(add(a.x, a.y), sub(a.x, a.y)); }
+GF31 OVERLOAD foo2(GF31 a, GF31 b) { a = addsub(a); b = addsub(b); return addsub(U2(mul(RE(a), RE(b)), mul(IM(a), IM(b)))); }
+GF31 OVERLOAD foo(GF31 a) { return foo2(a, a); }
+
+#else
 
 // bits in reduced mod M.
 #define M31 ((((Z31) 1) << 31) - 1)
@@ -719,6 +938,8 @@ Z31 OVERLOAD modM31(i32 a) { i32 alt = a - 0x80000001; return select32(a, a, alt
 #else
 Z31 OVERLOAD modM31(Z31 a) { return optional_add((i32)a, 0x80000001); }               // Assumes a is not 0xFFFFFFFF (which would return 0x80000000)
 Z31 OVERLOAD modM31(i32 a) { return optional_sub(a, 0x80000001); }                    // Assumes a is not 0x80000000 (which would return 0xFFFFFFFF)
+#endif // RIESEL_FIELD
+
 #endif
 
 Z31 OVERLOAD modM31(u64 a) {                                          // a must be less than 0xFFFFFFFF7FFFFFFF
@@ -874,6 +1095,311 @@ GF31 OVERLOAD foo(GF31 a) { return foo2(a, a); }
 /**************************************************************************/
 
 #if NTT_GF61
+
+#if GOLD_PAIR
+
+// Two independent scalar Goldilocks transforms are carried in x/y.  Trig
+// records store a forward root in x and its inverse in y; cmul consumes x,
+// while conjugating a trig record swaps the two.  This deliberately is not a
+// quadratic extension field.
+#define GOLD_Q ((Z61)0xffffffff00000001ULL)
+#define GOLD_EPSILON ((Z61)0xffffffffULL)
+#define M61 GOLD_Q
+#define GOLD_I ((Z61)281474976710656ULL)
+#define GOLD_T8 ((Z61)18446744069397807105ULL)
+#define GOLD_3T8 ((Z61)18446742969902956801ULL)
+#define GOLD_INV_T8 ((Z61)1099511627520ULL)
+
+Z61 goldAdd(Z61 a, Z61 b) {
+  Z61 r = a + b;
+  if (r < a) r += GOLD_EPSILON;
+  else if (r >= GOLD_Q) r -= GOLD_Q;
+  return r;
+}
+Z61 goldSub(Z61 a, Z61 b) {
+  Z61 r = a - b;
+  if (a < b) r -= GOLD_EPSILON;
+  return r;
+}
+Z61 goldMul(Z61 a, Z61 b) {
+  u128 product = mul64(a, b);
+  Z61 lo = u128_lo64(product), hi = u128_hi64(product);
+  Z61 hiTop = hi >> 32;
+  Z61 r = lo - hiTop;
+  if (lo < hiTop) r -= GOLD_EPSILON;
+  Z61 folded = (Z61)lo32(hi) * GOLD_EPSILON;
+  Z61 before = r;
+  r += folded;
+  if (r < before) r += GOLD_EPSILON;
+  if (r >= GOLD_Q) r -= GOLD_Q;
+  return r;
+}
+
+Z61 OVERLOAD add(Z61 a, Z61 b) { return goldAdd(a, b); }
+GF61 OVERLOAD add(GF61 a, GF61 b) { return U2(add(a.x, b.x), add(a.y, b.y)); }
+Z61 OVERLOAD sub(Z61 a, Z61 b) { return goldSub(a, b); }
+GF61 OVERLOAD sub(GF61 a, GF61 b) { return U2(sub(a.x, b.x), sub(a.y, b.y)); }
+Z61 OVERLOAD neg(Z61 a) { return a == 0 ? 0 : GOLD_Q - a; }
+GF61 OVERLOAD neg(GF61 a) { return U2(neg(a.x), neg(a.y)); }
+Z61 OVERLOAD mul(Z61 a, Z61 b) { return goldMul(a, b); }
+Z61 OVERLOAD mul2(Z61 a) { return add(a, a); }
+GF61 OVERLOAD mul2(GF61 a) { return U2(mul2(a.x), mul2(a.y)); }
+
+Z61 OVERLOAD make_Z61(i32 a) {
+  return a < 0 ? GOLD_Q - (Z61)(-(i64)a) : (Z61)a;
+}
+Z61 OVERLOAD make_Z61(i64 a) {
+  u64 magnitude = a < 0 ? (u64)(-(a + 1)) + 1 : (u64)a;
+  Z61 value = magnitude >= GOLD_Q ? magnitude % GOLD_Q : magnitude;
+  return a < 0 && value != 0 ? GOLD_Q - value : value;
+}
+Z61 OVERLOAD make_Z61(u32 a) { return (Z61)a; }
+Z61 OVERLOAD make_Z61(u64 a) { return a >= GOLD_Q ? a - GOLD_Q : a; }
+Z61 make_Z61_word(i64 a) { return make_Z61(a); }
+u64 OVERLOAD get_Z61(Z61 a) { return a; }
+i64 OVERLOAD get_balanced_Z61(Z61 a) {
+  return a > GOLD_Q / 2 ? (i64)(a - GOLD_Q) : (i64)a;
+}
+
+Z61 OVERLOAD shl(Z61 a, u32 k) {
+  while (k--) a = add(a, a);
+  return a;
+}
+GF61 OVERLOAD shl(GF61 a, u32 k) { return U2(shl(a.x, k), shl(a.y, k)); }
+Z61 OVERLOAD shr(Z61 a, u32 k) {
+  const Z61 inv2 = (GOLD_Q + 1) / 2;
+  while (k--) a = mul(a, inv2);
+  return a;
+}
+GF61 OVERLOAD shr(GF61 a, u32 k) { return U2(shr(a.x, k), shr(a.y, k)); }
+
+// For trig records this selects the inverse root.  Data conjugation is not
+// used by the GOLD_PAIR tail path.
+GF61 OVERLOAD conjugate(GF61 a) { return U2(a.y, a.x); }
+GF61 OVERLOAD cmul(GF61 a, GF61 root) {
+  return U2(mul(a.x, root.x), mul(a.y, root.x));
+}
+// Trig records are {forward, inverse}, unlike transform data's {even, odd}.
+// Chaining roots must therefore multiply both lanes independently.
+GF61 OVERLOAD cmulTrig(GF61 a, GF61 b) {
+  return U2(mul(a.x, b.x), mul(a.y, b.y));
+}
+GF61 OVERLOAD csq(GF61 a) { return U2(mul(a.x, a.x), mul(a.y, a.y)); }
+GF61 OVERLOAD csq(GF61 a, const u32 count) { return csq(a); }
+GF61 OVERLOAD csq(GF61 a, const u32 xcount, const u32 ycount) { return csq(a); }
+GF61 OVERLOAD csqq(GF61 a, const u32 count) { return csq(a); }
+GF61 OVERLOAD csqq(GF61 a, const u32 xcount, const u32 ycount) { return csq(a); }
+GF61 OVERLOAD csqa(GF61 a, GF61 c) { return add(csq(a), c); }
+GF61 OVERLOAD csqa(GF61 a, GF61 c, const u32 count) { return csqa(a, c); }
+GF61 OVERLOAD csqa(GF61 a, GF61 c, const u32 xcount, const u32 ycount) { return csqa(a, c); }
+GF61 OVERLOAD csqaq(GF61 a, GF61 c, const u32 count) { return csqa(a, c); }
+GF61 OVERLOAD csqaq(GF61 a, GF61 c, const u32 xcount, const u32 ycount) { return csqa(a, c); }
+GF61 OVERLOAD csq_add(GF61 a, GF61 c) { return add(csq(a), c); }
+GF61 OVERLOAD csq_sub(GF61 a, GF61 c) { return sub(csq(a), c); }
+GF61 OVERLOAD csq_addi(GF61 a, GF61 c) {
+  return add(csq(a), U2(mul(c.x, GOLD_I), mul(c.y, GOLD_I)));
+}
+GF61 OVERLOAD csq_subi(GF61 a, GF61 c) {
+  return sub(csq(a), U2(mul(c.x, GOLD_I), mul(c.y, GOLD_I)));
+}
+GF61 OVERLOAD csqTrig(GF61 a) { return csq(a); }
+GF61 OVERLOAD ccubeTrig(GF61 sq, GF61 root) { return cmulTrig(sq, root); }
+GF61 OVERLOAD mul_t4(GF61 a) {
+  return U2(mul(a.x, GOLD_I), mul(a.y, GOLD_I));
+}
+GF61 OVERLOAD mul_t8(GF61 a) {
+  return U2(mul(a.x, GOLD_T8), mul(a.y, GOLD_T8));
+}
+GF61 OVERLOAD mul_t8(GF61 a, const u32 count) { return mul_t8(a); }
+GF61 OVERLOAD mul_3t8(GF61 a) {
+  return U2(mul(a.x, GOLD_3T8), mul(a.y, GOLD_3T8));
+}
+GF61 OVERLOAD mul_3t8(GF61 a, const u32 count) { return mul_3t8(a); }
+GF61 OVERLOAD addi(GF61 a, GF61 b) { return add(a, mul_t4(b)); }
+GF61 OVERLOAD subi(GF61 a, GF61 b) { return sub(a, mul_t4(b)); }
+
+void OVERLOAD X2_internal(GF61 *a, GF61 *b) { GF61 t = *a; *a = add(t, *b); *b = sub(t, *b); }
+void OVERLOAD X2conjb_internal(GF61 *a, GF61 *b) { X2_internal(a, b); }
+void OVERLOAD X2_mul_t4_internal(GF61 *a, GF61 *b) { X2_internal(a, b); *b = mul_t4(*b); }
+void OVERLOAD X2_mul_t8_internal(GF61 *a, GF61 *b) { X2_internal(a, b); *b = mul_t8(*b); }
+void OVERLOAD X2_mul_3t8_internal(GF61 *a, GF61 *b) { X2_internal(a, b); *b = mul_3t8(*b); }
+void OVERLOAD X2_conjb_internal(GF61 *a, GF61 *b) { X2_internal(a, b); }
+void OVERLOAD SWAP_internal(GF61 *a, GF61 *b) { GF61 t = *a; *a = *b; *b = t; }
+GF61 OVERLOAD addsub(GF61 a) { return U2(add(a.x, a.y), sub(a.x, a.y)); }
+GF61 OVERLOAD foo2(GF61 a, GF61 b) { return U2(mul(a.x, b.x), mul(a.y, b.y)); }
+GF61 OVERLOAD foo(GF61 a) { return csq(a); }
+
+GF61 OVERLOAD addq(GF61 a, GF61 b) { return add(a, b); }
+GF61 OVERLOAD subq(GF61 a, GF61 b) { return sub(a, b); }
+GF61 OVERLOAD addiq(GF61 a, GF61 b) { return addi(a, b); }
+GF61 OVERLOAD subiq(GF61 a, GF61 b) { return subi(a, b); }
+void OVERLOAD X2q(GF61 *a, GF61 *b) { X2(*a, *b); }
+void OVERLOAD X2q_mul_t4(GF61 *a, GF61 *b) { X2_mul_t4(*a, *b); }
+void OVERLOAD X2qconjb(GF61 *a, GF61 *b) { X2(*a, *b); }
+void OVERLOAD X2q_conjb(GF61 *a, GF61 *b) { X2(*a, *b); }
+GF61 OVERLOAD mul_t8q(GF61 a, const u32 count) { return mul_t8(a); }
+GF61 OVERLOAD optsubqu(GF61 a, const u32 limit, const u32 count) { return a; }
+GF61 OVERLOAD optsubqs(GF61 a, const u32 limit, const u32 count) { return a; }
+GF61 OVERLOAD modM61q(GF61 a, const u32 count) { return a; }
+GF61 OVERLOAD modM61q(GF61 a, const u32 xcount, const u32 ycount) { return a; }
+Z61 OVERLOAD modM61(Z61 a) { return a; }
+GF61 OVERLOAD modM61(GF61 a) { return a; }
+
+#elif RIESEL_PAIR
+
+// FFT54 stores two independent 31-bit Montgomery residues in each Z61 word:
+// q0 in the low half and q1 in the high half.  A GF61 value therefore carries
+// both quadratic fields without changing the production M31+M61 memory layout.
+#define RQ0 2090860543u
+#define RQ1 2141192191u
+#define RQ0_NEG_INV 2090860545u
+#define RQ1_NEG_INV 2141192193u
+#define RQ0_R2 1130207172u
+#define RQ1_R2 1409360092u
+
+Z61 packRQ(u32 q0, u32 q1) { return make_u64(q1, q0); }
+u32 rq0(Z61 a) { return lo32(a); }
+u32 rq1(Z61 a) { return hi32(a); }
+
+u32 rqAdd(u32 a, u32 b, const u32 q) { u32 r = a + b; return r >= q ? r - q : r; }
+u32 rqSub(u32 a, u32 b, const u32 q) { return a >= b ? a - b : q - (b - a); }
+u32 rqNeg(u32 a, const u32 q) { return a == 0 ? 0 : q - a; }
+u32 rqMontMul(u32 a, u32 b, const u32 q, const u32 negInv) {
+  u64 value = a * (u64)b;
+  u32 multiplier = (u32)value * negInv;
+  u64 sum = value + multiplier * (u64)q;
+  u32 result = hi32(sum);
+  return result >= q ? result - q : result;
+}
+
+Z61 OVERLOAD add(Z61 a, Z61 b) { return packRQ(rqAdd(rq0(a), rq0(b), RQ0), rqAdd(rq1(a), rq1(b), RQ1)); }
+GF61 OVERLOAD add(GF61 a, GF61 b) { return U2(add(a.x, b.x), add(a.y, b.y)); }
+Z61 OVERLOAD sub(Z61 a, Z61 b) { return packRQ(rqSub(rq0(a), rq0(b), RQ0), rqSub(rq1(a), rq1(b), RQ1)); }
+GF61 OVERLOAD sub(GF61 a, GF61 b) { return U2(sub(a.x, b.x), sub(a.y, b.y)); }
+Z61 OVERLOAD neg(Z61 a) { return packRQ(rqNeg(rq0(a), RQ0), rqNeg(rq1(a), RQ1)); }
+GF61 OVERLOAD neg(GF61 a) { return U2(neg(a.x), neg(a.y)); }
+
+Z61 OVERLOAD mul(Z61 a, Z61 b) {
+  return packRQ(rqMontMul(rq0(a), rq0(b), RQ0, RQ0_NEG_INV),
+                rqMontMul(rq1(a), rq1(b), RQ1, RQ1_NEG_INV));
+}
+Z61 OVERLOAD mul2(Z61 a) { return add(a, a); }
+GF61 OVERLOAD mul2(GF61 a) { return U2(mul2(a.x), mul2(a.y)); }
+
+Z61 make_Z61_normal(i64 a) {
+  u64 magnitude = a < 0 ? (u64)(-(a + 1)) + 1 : (u64)a;
+  u32 a0 = (u32)(magnitude % RQ0), a1 = (u32)(magnitude % RQ1);
+  if (a < 0) a0 = rqNeg(a0, RQ0), a1 = rqNeg(a1, RQ1);
+  return packRQ(a0, a1);
+}
+Z61 OVERLOAD make_Z61(i32 a) { Z61 n = make_Z61_normal(a); return packRQ(rqMontMul(rq0(n), RQ0_R2, RQ0, RQ0_NEG_INV), rqMontMul(rq1(n), RQ1_R2, RQ1, RQ1_NEG_INV)); }
+Z61 OVERLOAD make_Z61(i64 a) { Z61 n = make_Z61_normal(a); return packRQ(rqMontMul(rq0(n), RQ0_R2, RQ0, RQ0_NEG_INV), rqMontMul(rq1(n), RQ1_R2, RQ1, RQ1_NEG_INV)); }
+Z61 OVERLOAD make_Z61(u32 a) { return make_Z61((i64)a); }
+Z61 OVERLOAD make_Z61(u64 a) { return make_Z61((i64)a); }
+
+// PRPLL words for this 4M path have at most 33 magnitude bits.  Four
+// conditional subtractions reduce them modulo either Riesel prime and avoid
+// two general 64-bit remainder operations in every premultiplication value.
+Z61 make_Z61_word(i64 a) {
+#if EXP / NWORDS <= 32
+  bool const negative = a < 0;
+  u64 const magnitude = negative ? (u64)(-(a + 1)) + 1 : (u64)a;
+  u64 value0 = magnitude, value1 = magnitude;
+  if (value0 >= RQ0) value0 -= RQ0;
+  if (value0 >= RQ0) value0 -= RQ0;
+  if (value0 >= RQ0) value0 -= RQ0;
+  if (value0 >= RQ0) value0 -= RQ0;
+  if (value1 >= RQ1) value1 -= RQ1;
+  if (value1 >= RQ1) value1 -= RQ1;
+  if (value1 >= RQ1) value1 -= RQ1;
+  if (value1 >= RQ1) value1 -= RQ1;
+  u32 normal0 = (u32)value0, normal1 = (u32)value1;
+  if (negative && normal0 != 0) normal0 = RQ0 - normal0;
+  if (negative && normal1 != 0) normal1 = RQ1 - normal1;
+  return packRQ(rqMontMul(normal0, RQ0_R2, RQ0, RQ0_NEG_INV),
+                rqMontMul(normal1, RQ1_R2, RQ1, RQ1_NEG_INV));
+#else
+  return make_Z61(a);
+#endif
+}
+
+Z61 decodeRQ(Z61 a) {
+  return packRQ(rqMontMul(rq0(a), 1, RQ0, RQ0_NEG_INV),
+                rqMontMul(rq1(a), 1, RQ1, RQ1_NEG_INV));
+}
+
+Z61 OVERLOAD shl(Z61 a, u32 k) { while (k--) a = add(a, a); return a; }
+GF61 OVERLOAD shl(GF61 a, u32 k) { return U2(shl(a.x, k), shl(a.y, k)); }
+Z61 OVERLOAD shr(Z61 a, u32 k) {
+  const Z61 inv2 = 27021602115813377ULL;
+  while (k--) a = mul(a, inv2);
+  return a;
+}
+GF61 OVERLOAD shr(GF61 a, u32 k) { return U2(shr(a.x, k), shr(a.y, k)); }
+
+GF61 OVERLOAD conjugate(GF61 a) { return U2(a.x, neg(a.y)); }
+GF61 OVERLOAD csq(GF61 a) { return U2(mul(add(a.x, a.y), sub(a.x, a.y)), mul2(mul(a.x, a.y))); }
+GF61 OVERLOAD csq(GF61 a, const u32 count) { return csq(a); }
+GF61 OVERLOAD csq(GF61 a, const u32 xcount, const u32 ycount) { return csq(a); }
+GF61 OVERLOAD csqq(GF61 a, const u32 count) { return csq(a); }
+GF61 OVERLOAD csqq(GF61 a, const u32 xcount, const u32 ycount) { return csq(a); }
+GF61 OVERLOAD csqa(GF61 a, GF61 c) { return add(csq(a), c); }
+GF61 OVERLOAD csqa(GF61 a, GF61 c, const u32 count) { return csqa(a, c); }
+GF61 OVERLOAD csqa(GF61 a, GF61 c, const u32 xcount, const u32 ycount) { return csqa(a, c); }
+GF61 OVERLOAD csqaq(GF61 a, GF61 c, const u32 count) { return csqa(a, c); }
+GF61 OVERLOAD csqaq(GF61 a, GF61 c, const u32 xcount, const u32 ycount) { return csqa(a, c); }
+GF61 OVERLOAD csq_add(GF61 a, GF61 c) { return add(csq(a), c); }
+GF61 OVERLOAD csq_sub(GF61 a, GF61 c) { return sub(csq(a), c); }
+GF61 OVERLOAD csq_addi(GF61 a, GF61 c) { GF61 s = csq(a); return U2(sub(s.x, c.y), add(s.y, c.x)); }
+GF61 OVERLOAD csq_subi(GF61 a, GF61 c) { GF61 s = csq(a); return U2(add(s.x, c.y), sub(s.y, c.x)); }
+
+GF61 OVERLOAD cmul(GF61 a, GF61 b) {
+  Z61 k1 = mul(b.x, add(a.x, a.y));
+  Z61 k2 = mul(a.x, sub(b.y, b.x));
+  Z61 k3 = mul(a.y, add(b.y, b.x));
+  return U2(sub(k1, k3), add(k1, k2));
+}
+GF61 OVERLOAD csqTrig(GF61 a) { return csq(a); }
+GF61 OVERLOAD ccubeTrig(GF61 sq, GF61 w) { return cmul(sq, w); }
+GF61 OVERLOAD addi(GF61 a, GF61 b) { return U2(sub(a.x, b.y), add(a.y, b.x)); }
+GF61 OVERLOAD subi(GF61 a, GF61 b) { return U2(add(a.x, b.y), sub(a.y, b.x)); }
+GF61 OVERLOAD mul_t4(GF61 a) { return U2(neg(a.y), a.x); }
+GF61 OVERLOAD mul_t8(GF61 a) { return cmul(a, U2(1033505030135035840ULL, 1033505030135035840ULL)); }
+GF61 OVERLOAD mul_t8(GF61 a, const u32 count) { return mul_t8(a); }
+GF61 OVERLOAD mul_3t8(GF61 a) { GF61 r = U2(neg(1033505030135035840ULL), 1033505030135035840ULL); return cmul(a, r); }
+GF61 OVERLOAD mul_3t8(GF61 a, const u32 count) { return mul_3t8(a); }
+
+void OVERLOAD X2_internal(GF61 *a, GF61 *b) { GF61 t = *a; *a = add(t, *b); *b = sub(t, *b); }
+void OVERLOAD X2conjb_internal(GF61 *a, GF61 *b) { GF61 t = *a; a->x = add(a->x, b->x); a->y = sub(a->y, b->y); b->x = sub(t.x, b->x); b->y = add(t.y, b->y); }
+void OVERLOAD X2_mul_t4_internal(GF61 *a, GF61 *b) { GF61 t = *a; *a = add(*a, *b); t.x = sub(t.x, b->x); b->x = sub(b->y, t.y); b->y = t.x; }
+void OVERLOAD X2_mul_t8_internal(GF61 *a, GF61 *b) { X2(*a, *b); *b = mul_t8(*b); }
+void OVERLOAD X2_mul_3t8_internal(GF61 *a, GF61 *b) { X2(*a, *b); *b = mul_3t8(*b); }
+void OVERLOAD X2_conjb_internal(GF61 *a, GF61 *b) { GF61 t = *a; *a = add(t, *b); b->x = sub(t.x, b->x); b->y = sub(b->y, t.y); }
+void OVERLOAD SWAP_internal(GF61 *a, GF61 *b) { GF61 t = *a; *a = *b; *b = t; }
+GF61 OVERLOAD addsub(GF61 a) { return U2(add(a.x, a.y), sub(a.x, a.y)); }
+GF61 OVERLOAD foo2(GF61 a, GF61 b) { a = addsub(a); b = addsub(b); return addsub(U2(mul(RE(a), RE(b)), mul(IM(a), IM(b)))); }
+GF61 OVERLOAD foo(GF61 a) { return foo2(a, a); }
+
+// Compatibility names used by the aggressively range-optimized M61 kernels.
+// FFT54 selects simpler modular radix kernels below, but these keep shared tail
+// source parseable and make accidental use exact rather than lane-crossing.
+GF61 OVERLOAD addq(GF61 a, GF61 b) { return add(a, b); }
+GF61 OVERLOAD subq(GF61 a, GF61 b) { return sub(a, b); }
+GF61 OVERLOAD addiq(GF61 a, GF61 b) { return addi(a, b); }
+GF61 OVERLOAD subiq(GF61 a, GF61 b) { return subi(a, b); }
+void OVERLOAD X2q(GF61 *a, GF61 *b) { X2(*a, *b); }
+void OVERLOAD X2q_mul_t4(GF61 *a, GF61 *b) { X2_mul_t4(*a, *b); }
+void OVERLOAD X2qconjb(GF61 *a, GF61 *b) { X2conjb(*a, *b); }
+void OVERLOAD X2q_conjb(GF61 *a, GF61 *b) { X2_conjb(*a, *b); }
+GF61 OVERLOAD mul_t8q(GF61 a, const u32 count) { return mul_t8(a); }
+GF61 OVERLOAD optsubqu(GF61 a, const u32 limit, const u32 count) { return a; }
+GF61 OVERLOAD optsubqs(GF61 a, const u32 limit, const u32 count) { return a; }
+GF61 OVERLOAD modM61q(GF61 a, const u32 count) { return a; }
+GF61 OVERLOAD modM61q(GF61 a, const u32 xcount, const u32 ycount) { return a; }
+Z61 OVERLOAD modM61(Z61 a) { return a; }
+GF61 OVERLOAD modM61(GF61 a) { return a; }
+
+#else
 
 #define M61 ((((Z61) 1) << 61) - 1)
 
@@ -1074,5 +1600,54 @@ Z61 OVERLOAD optsubqs(Z61 a, const u32 m61_limit, const u32 m61_count) { return 
 GF61 OVERLOAD optsubqs(GF61 a, const u32 m61_limit, const u32 m61_count) { return U2(optsubqs(a.x, m61_limit, m61_count), optsubqs(a.y, m61_limit, m61_count)); }
 GF61 OVERLOAD modM61q(GF61 a, const u32 m61_count) { if (m61_count) { a.x += m61_count * M61; a.y += m61_count * M61; } return modM61(a); }
 GF61 OVERLOAD modM61q(GF61 a, const u32 m61_count_x, const u32 m61_count_y) { if (m61_count_x) a.x += m61_count_x * M61; if (m61_count_y) a.y += m61_count_y * M61; return modM61(a); }
+
+#endif // RIESEL_PAIR
+#endif
+
+
+/**************************************************************************/
+/* Scalar helpers used by the three-plane CRT/carry kernel.  These names */
+/* are deliberately separate from the field-selected transform overloads.*/
+/**************************************************************************/
+
+#if FFT_TYPE == FFT31R2
+
+#if RIESEL_LAZY
+#define RIESEL_Q0 1031798783u
+#define RIESEL_Q1 1038090239u
+#define RIESEL_Q0_NEG_INV 1031798785u
+#define RIESEL_Q1_NEG_INV 1038090241u
+#else
+#define RIESEL_Q0 2090860543u
+#define RIESEL_Q1 2141192191u
+#define RIESEL_Q0_NEG_INV 2090860545u
+#define RIESEL_Q1_NEG_INV 2141192193u
+#endif
+
+u32 rieselMontMulExplicit(u32 a, u32 b, u32 q, u32 negInv) {
+  u64 const value = (u64)a * b;
+  u32 const multiplier = (u32)value * negInv;
+  u64 const sum = value + (u64)multiplier * q;
+  u32 const result = hi32(sum);
+  return result >= q ? result - q : result;
+}
+
+u32 rieselAddExplicit(u32 a, u32 b, u32 q) {
+  u32 const result = a + b;
+  return result >= q ? result - q : result;
+}
+
+u32 rieselSubExplicit(u32 a, u32 b, u32 q) {
+  return a >= b ? a - b : q - (b - a);
+}
+
+u32 riesel0Mul(u32 a, u32 b) {
+  return rieselMontMulExplicit(a, b, RIESEL_Q0, RIESEL_Q0_NEG_INV);
+}
+u32 riesel1Mul(u32 a, u32 b) {
+  return rieselMontMulExplicit(a, b, RIESEL_Q1, RIESEL_Q1_NEG_INV);
+}
+u32 riesel0Decode(u32 a) { return riesel0Mul(a, 1u); }
+u32 riesel1Decode(u32 a) { return riesel1Mul(a, 1u); }
 
 #endif

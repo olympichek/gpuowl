@@ -17,6 +17,7 @@
 #include "tune.h"
 
 #include <filesystem>
+#include <cstdio>
 #include <thread>
 #include <utility>
 // #include <format> from GCC-13 onwards
@@ -46,6 +47,8 @@ extern int putenv(char *);
 #endif
 
 int main(int argc, char **argv) {
+  setvbuf(stdout, nullptr, _IONBF, 0);
+
 //!MSVC version support
 #ifdef _MSC_VER
   _set_printf_count_output(1);    // I'm not sure what this does (it's from CrazeTheDragon)

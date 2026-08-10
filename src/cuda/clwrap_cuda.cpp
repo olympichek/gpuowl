@@ -15,6 +15,7 @@
 #include <map>
 #include <algorithm>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_set>
 #ifdef __linux__
 #include <unistd.h>
@@ -736,7 +737,7 @@ int clEnqueueNDRangeKernel(cl_command_queue q, cl_kernel k, unsigned workDim,
     ev->hasTimings = true;
     ev->commandType = CL_COMMAND_NDRANGE_KERNEL;
     cuEventRecord(ev->start, q->stream);
-    CUresult const r = cuLaunchKernel(k->func, numBlocksX, numBlocksY, 1, lsX, lsY, 1, 0, q->stream, argPtrs, nullptr);
+    CUresult const r = cuLaunchKernel(k->func, numBlocksX, numBlocksY, 1, lsX, lsY, 1, k->dynamicSharedBytes, q->stream, argPtrs, nullptr);
     cuEventRecord(ev->end, q->stream);
     *event = ev;
     return r == CUDA_SUCCESS ? CL_SUCCESS : CL_OUT_OF_RESOURCES;
@@ -751,7 +752,7 @@ int clEnqueueNDRangeKernel(cl_command_queue q, cl_kernel k, unsigned workDim,
     if (!pStart) { cuEventCreate(&pStart, CU_EVENT_DEFAULT); cuEventCreate(&pEnd, CU_EVENT_DEFAULT); }
 
     cuEventRecord(pStart, q->stream);
-    CUresult const r = cuLaunchKernel(k->func, numBlocksX, numBlocksY, 1, lsX, lsY, 1, 0, q->stream, argPtrs, nullptr);
+    CUresult const r = cuLaunchKernel(k->func, numBlocksX, numBlocksY, 1, lsX, lsY, 1, k->dynamicSharedBytes, q->stream, argPtrs, nullptr);
     cuEventRecord(pEnd, q->stream);
     cuEventSynchronize(pEnd);
     float ms = 0;
@@ -783,7 +784,7 @@ int clEnqueueNDRangeKernel(cl_command_queue q, cl_kernel k, unsigned workDim,
     return r == CUDA_SUCCESS ? CL_SUCCESS : CL_OUT_OF_RESOURCES;
   }
 
-  CUresult const r = cuLaunchKernel(k->func, numBlocksX, numBlocksY, 1, lsX, lsY, 1, 0, q->stream, argPtrs, nullptr);
+  CUresult const r = cuLaunchKernel(k->func, numBlocksX, numBlocksY, 1, lsX, lsY, 1, k->dynamicSharedBytes, q->stream, argPtrs, nullptr);
   if (r != CUDA_SUCCESS) {
     const char* errName = nullptr;
     cuGetErrorName(r, &errName);
@@ -1123,7 +1124,32 @@ int clSetKernelArgSVMPointer(cl_kernel k, unsigned pos, const void* ptr) {
 
 // C++ linkage — must be outside the extern "C" block above.
 
+void cudaSetQueuePriority(cl_queue q, int priority) {
+  assert(q && q->stream);
+  ensureContextCurrent();
+  int leastPriority = 0;
+  int greatestPriority = 0;
+  if (cuCtxGetStreamPriorityRange(&leastPriority, &greatestPriority) != CUDA_SUCCESS) {
+    throw runtime_error("cuCtxGetStreamPriorityRange failed");
+  }
+  if (cuStreamDestroy(q->stream) != CUDA_SUCCESS) {
+    throw runtime_error("cuStreamDestroy failed while setting queue priority");
+  }
+  int const requested = priority > 0 ? greatestPriority : leastPriority;
+  if (cuStreamCreateWithPriority(&q->stream, CU_STREAM_NON_BLOCKING, requested) != CUDA_SUCCESS) {
+    throw runtime_error("cuStreamCreateWithPriority failed");
+  }
+}
+
 // Set L1 cache configuration
+void cudaSetKernelDynamicShared(cl_kernel kernel, unsigned bytes) {
+  ensureContextCurrent();
+  CU_CHECK(cuFuncSetAttribute(
+    kernel->func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+    static_cast<int>(bytes)));
+  kernel->dynamicSharedBytes = bytes;
+}
+
 void cudaSetL1Config(int x) {
   ensureContextCurrent();
   cuCtxSetCacheConfig (x == 0 ? CU_FUNC_CACHE_PREFER_NONE :            // no preference for shared memory or L1 (default)
@@ -1132,51 +1158,51 @@ void cudaSetL1Config(int x) {
                        CU_FUNC_CACHE_PREFER_EQUAL);                    // prefer equal sized L1 cache and shared memory
 }
 
-// Set L2 cache persistence for multiple read-only buffers on the given stream.
-// Computes the minimum address span covering all buffers, then sets one access policy
-// window with hitRatio sized so that only the actual buffer bytes get persisting treatment,
-// not the gaps between non-contiguous allocations.
+// Set L2 cache persistence for the largest read-only buffer on the given stream.
+// CUDA permits one access-policy window per stream.  Selecting one real allocation
+// avoids covering allocator gaps or silently truncating a multi-allocation span.
 #if CUDA_VERSION >= 11000
-[[maybe_unused]] static void cudaSetL2Persistent(cl_command_queue q, const std::vector<cl_mem>& buffers) {
+void cudaSetL2Persistent(cl_command_queue q, const std::vector<cl_mem>& buffers) {
   if (!q) return;
+  ensureContextCurrent();
 
-  // Find address span and total data size
-  CUdeviceptr minAddr = ~(CUdeviceptr)0;
-  CUdeviceptr maxAddr = 0;
-  size_t totalDataBytes = 0;
-
+  cl_mem selected = nullptr;
   for (auto buf : buffers) {
     if (!buf || buf->size == 0) continue;
-    CUdeviceptr const lo = buf->ptr;
-    CUdeviceptr const hi = buf->ptr + buf->size;
-    minAddr = std::min(lo, minAddr);
-    maxAddr = std::max(hi, maxAddr);
-    totalDataBytes += buf->size;
+    if (!selected || buf->size > selected->size) selected = buf;
   }
+  if (!selected) return;
 
-  if (totalDataBytes == 0 || maxAddr <= minAddr) return;
-
-  auto spanBytes = (size_t)(maxAddr - minAddr);
-
-  // Query the device's max access policy window size
+  CUdevice device{};
+  CU_CHECK(cuCtxGetDevice(&device));
   int maxWindowSize = 0;
-  cuDeviceGetAttribute(&maxWindowSize, CU_DEVICE_ATTRIBUTE_MAX_ACCESS_POLICY_WINDOW_SIZE, 0);
-  if (maxWindowSize > 0 && std::cmp_greater(spanBytes, maxWindowSize)) {
-    fprintf(stderr, "L2 persist: span %zuMB exceeds max window %dMB, clamping\n",
-            spanBytes / (1024*1024), maxWindowSize / (1024*1024));
-    spanBytes = maxWindowSize;
+  int maxPersistingSize = 0;
+  CU_CHECK(cuDeviceGetAttribute(&maxWindowSize,
+                                CU_DEVICE_ATTRIBUTE_MAX_ACCESS_POLICY_WINDOW_SIZE,
+                                device));
+  CU_CHECK(cuDeviceGetAttribute(&maxPersistingSize,
+                                CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE,
+                                device));
+  if (maxWindowSize <= 0 || maxPersistingSize <= 0) {
+    fprintf(stderr, "L2 persist: device exposes no persisting access-policy window\n");
+    return;
   }
 
-  // hitRatio = actual data / window span. This way only the real buffer data gets
-  // persisting treatment, and any gaps between allocations get streaming treatment.
-  float hitRatio = (float)totalDataBytes / (float)spanBytes;
-  hitRatio = std::min(hitRatio, 1.0f);
+  size_t const windowBytes = std::min(selected->size, size_t(maxWindowSize));
+  size_t const setAsideBytes = std::min(windowBytes, size_t(maxPersistingSize));
+  CUresult const limitResult =
+    cuCtxSetLimit(CU_LIMIT_PERSISTING_L2_CACHE_SIZE, setAsideBytes);
+  if (limitResult != CUDA_SUCCESS) {
+    fprintf(stderr, "L2 persist: cuCtxSetLimit failed (%d)\n", (int)limitResult);
+    return;
+  }
 
   CUstreamAttrValue attr;
   memset(&attr, 0, sizeof(attr));
-  attr.accessPolicyWindow.base_ptr = (void*)(uintptr_t)minAddr;
-  attr.accessPolicyWindow.num_bytes = spanBytes;
-  attr.accessPolicyWindow.hitRatio = hitRatio;
+  attr.accessPolicyWindow.base_ptr = (void*)(uintptr_t)selected->ptr;
+  attr.accessPolicyWindow.num_bytes = windowBytes;
+  attr.accessPolicyWindow.hitRatio =
+    std::min(1.0f, float(setAsideBytes) / float(windowBytes));
   attr.accessPolicyWindow.hitProp = CU_ACCESS_PROPERTY_PERSISTING;
   attr.accessPolicyWindow.missProp = CU_ACCESS_PROPERTY_STREAMING;
 
@@ -1184,9 +1210,11 @@ void cudaSetL1Config(int x) {
   if (r != CUDA_SUCCESS) {
     fprintf(stderr, "L2 persist: cuStreamSetAttribute failed (%d)\n", (int)r);
   } else {
-    fprintf(stderr, "L2 persist: window %zuMB (%.1f%% hit ratio), %zuMB actual data, %zu buffers\n",
-            spanBytes / (1024*1024), hitRatio * 100.0f, totalDataBytes / (1024*1024),
-            buffers.size());
+    fprintf(stderr,
+            "L2 persist: %zuMB window of %zuMB read-only buffer, %zuMB set-aside (%.1f%% hit ratio)\n",
+            windowBytes / (1024*1024), selected->size / (1024*1024),
+            setAsideBytes / (1024*1024),
+            attr.accessPolicyWindow.hitRatio * 100.0f);
   }
 }
 #endif

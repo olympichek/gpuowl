@@ -205,8 +205,13 @@ void OVERLOAD fft16(F2 *u) {
 #include "fft8.cl"
 
 void OVERLOAD fft16(GF31 *u) {
+#if RIESEL_FIELD
+  const Z31 C1 = RF_C1;
+  const Z31 S1 = RF_S1;
+#else
   const Z31 C1 = 1556715293;
   const Z31 S1 = 978592373;
+#endif
 
   X2(u[0], u[8]);
   X2(u[1], u[9]);
@@ -247,8 +252,18 @@ void OVERLOAD fft16(GF31 *u) {
 #include "fft8.cl"
 
 void OVERLOAD fft16(GF61 *u) {
+#if GOLD_PAIR
+  const GF61 R1 = U2(17293822564807737345ULL, 68719476736ULL);
+  const GF61 R3 = U2(4503599626321920ULL, 18446744069414580225ULL);
+  const GF61 R5 = U2(4096ULL, 18442240469788262401ULL);
+  const GF61 R7 = U2(18446744000695107585ULL, 1152921504606846976ULL);
+#elif RIESEL_PAIR
+  const Z61 C1 = 2511584537426940041ULL;
+  const Z61 S1 = 2680075215053657483ULL;
+#else
   const Z61 C1 = 22027337052962166ULL;
   const Z61 S1 = 1693317751237720973ULL;
+#endif
 
   X2(u[0], u[8]);
   X2(u[1], u[9]);
@@ -259,10 +274,17 @@ void OVERLOAD fft16(GF61 *u) {
   X2_mul_3t8(u[6], u[14]);
   X2(u[7], u[15]);
 
+#if GOLD_PAIR
+  u[ 9] = cmul(u[ 9], R1);
+  u[11] = cmul(u[11], R3);
+  u[13] = cmul(u[13], R5);
+  u[15] = cmul(u[15], R7);
+#else
   u[ 9] = cmul(u[ 9], U2( C1, S1)); // 1t16
   u[11] = cmul(u[11], U2( S1, C1)); // 3t16
-  u[13] = cmul(u[13], U2(neg(S1), C1)); // 5t16		//GWBUG - check if optimizer is eliminating the neg (or better yet perhaps tweak follow up code to expect a negative)
+  u[13] = cmul(u[13], U2(neg(S1), C1)); // 5t16
   u[15] = cmul(u[15], U2(neg(C1), S1)); // 7t16
+#endif
 
   fft8Core(u);
   fft8Core(u + 8);

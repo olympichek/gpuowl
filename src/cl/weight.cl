@@ -168,6 +168,169 @@ u32 adjust_m31_weight_shift (u32 weight_shift) {
 
 #endif
 
+#if GOLD_PAIR
+
+// Factored exact Crandall--Fagin weights for the full scalar Goldilocks plane.
+// Table entries alternate inverse/forward weights.  theta^NWORDS == 2, so a
+// wrapped exponent is corrected by doubling an inverse weight or halving a
+// forward weight.
+Z61 goldStartingWeight(BigTab table, u32 x, u32 line, bool inverse,
+                       u32 *exponent) {
+  CP(Z61) weights = (CP(Z61))table;
+  u32 const which = inverse ? 0 : 1;
+  Z61 result = mul(weights[2 * x + which],
+                   weights[2 * (WIDTH + line) + which]);
+  u32 const stepExponent = NWORDS - EXP % NWORDS;
+  u32 ex = (u32)((u64)stepExponent * (2u * x * BIG_HEIGHT) % NWORDS) +
+           (u32)((u64)stepExponent * (2u * line) % NWORDS);
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  if (wrapped) result = inverse ? mul2(result) : shr(result, 1);
+  *exponent = ex;
+  return result;
+}
+
+Z61 advanceGoldForward(Z61 weight, u32 delta, Z61 factor,
+                       u32 *exponent) {
+  u32 ex = *exponent + delta;
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  weight = mul(weight, factor);
+  if (wrapped) weight = shr(weight, 1);
+  *exponent = ex;
+  return weight;
+}
+
+Z61 advanceGoldInverse(Z61 weight, u32 delta, Z61 factor,
+                       u32 *exponent) {
+  u32 ex = *exponent + delta;
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  weight = mul(weight, factor);
+  if (wrapped) weight = mul2(weight);
+  *exponent = ex;
+  return weight;
+}
+
+#endif
+
+#if RIESEL_FIELD
+
+// Factored Crandall--Fagin weights for one independent 32-bit Riesel field.
+// RIESEL_FIELD selects one contiguous uint table; no packed-u64 arithmetic is
+// used by any transform kernel.
+Z31 rieselFieldStartingWeight(BigTab table, u32 x, u32 line, bool inverse,
+                              u32 *exponent) {
+  CP(Z31) weights = (CP(Z31))table + (RIESEL_FIELD - 1) * RIESEL_WEIGHT_STRIDE;
+  u32 const which = inverse ? 0 : 1;
+  Z31 result = mul(weights[2 * x + which],
+                   weights[2 * (WIDTH + line) + which]);
+  u32 const stepExponent = NWORDS - EXP % NWORDS;
+  u32 ex = (u32)((u64)stepExponent * (2u * x * BIG_HEIGHT) % NWORDS) +
+           (u32)((u64)stepExponent * (2u * line) % NWORDS);
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  if (wrapped) result = inverse ? mul2(result) : shr(result, 1);
+  *exponent = ex;
+  return result;
+}
+
+Z31 advanceRieselFieldForward(Z31 weight, u32 delta, Z31 factor,
+                              u32 *exponent) {
+  u32 ex = *exponent + delta;
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  weight = mul(weight, factor);
+  if (wrapped) weight = shr(weight, 1);
+  *exponent = ex;
+  return weight;
+}
+
+Z31 advanceRieselFieldInverse(Z31 weight, u32 delta, Z31 factor,
+                              u32 *exponent) {
+  u32 ex = *exponent + delta;
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  weight = mul(weight, factor);
+  if (wrapped) weight = mul2(weight);
+  *exponent = ex;
+  return weight;
+}
+
+#endif
+
+#if FFT_TYPE == FFT31R2 && !RIESEL_FIELD
+
+// Carry consumes the two uint weight planes explicitly.  The lane argument
+// chooses constants only; residues remain separate scalar variables.
+u32 rieselCarryMul(u32 value, u32 factor, u32 lane) {
+  return lane == 0 ? riesel0Mul(value, factor) : riesel1Mul(value, factor);
+}
+
+u32 rieselCarryDouble(u32 value, u32 lane) {
+  return rieselAddExplicit(value, value,
+                           lane == 0 ? RIESEL_Q0 : RIESEL_Q1);
+}
+
+u32 rieselCarryHalf(u32 value, u32 lane) {
+  u32 const q = lane == 0 ? RIESEL_Q0 : RIESEL_Q1;
+  return (u32)(((u64)value + ((value & 1u) ? q : 0u)) >> 1);
+}
+
+u32 rieselCarryStartingInverse(BigTab table, u32 lane, u32 x, u32 line,
+                               u32 *exponent) {
+  CP(u32) weights = (CP(u32))table + lane * RIESEL_WEIGHT_STRIDE;
+  u32 result = rieselCarryMul(weights[2 * x],
+                              weights[2 * (WIDTH + line)], lane);
+  u32 const stepExponent = NWORDS - EXP % NWORDS;
+  u32 ex = (u32)((u64)stepExponent * (2u * x * BIG_HEIGHT) % NWORDS) +
+           (u32)((u64)stepExponent * (2u * line) % NWORDS);
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  if (wrapped) result = rieselCarryDouble(result, lane);
+  *exponent = ex;
+  return result;
+}
+
+u32 advanceRieselCarryInverse(u32 weight, u32 lane, u32 delta,
+                              u32 factor, u32 *exponent) {
+  u32 ex = *exponent + delta;
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  weight = rieselCarryMul(weight, factor, lane);
+  if (wrapped) weight = rieselCarryDouble(weight, lane);
+  *exponent = ex;
+  return weight;
+}
+
+u32 rieselCarryStartingForward(BigTab table, u32 lane, u32 x, u32 line,
+                               u32 *exponent) {
+  CP(u32) weights = (CP(u32))table + lane * RIESEL_WEIGHT_STRIDE;
+  u32 result = rieselCarryMul(weights[2 * x + 1],
+                              weights[2 * (WIDTH + line) + 1], lane);
+  u32 const stepExponent = NWORDS - EXP % NWORDS;
+  u32 ex = (u32)((u64)stepExponent * (2u * x * BIG_HEIGHT) % NWORDS) +
+           (u32)((u64)stepExponent * (2u * line) % NWORDS);
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  if (wrapped) result = rieselCarryHalf(result, lane);
+  *exponent = ex;
+  return result;
+}
+
+u32 advanceRieselCarryForward(u32 weight, u32 lane, u32 delta,
+                              u32 factor, u32 *exponent) {
+  u32 ex = *exponent + delta;
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  weight = rieselCarryMul(weight, factor, lane);
+  if (wrapped) weight = rieselCarryHalf(weight, lane);
+  *exponent = ex;
+  return weight;
+}
+
+#endif
+
 
 #if NTT_GF61
 
@@ -179,3 +342,43 @@ u32 adjust_m61_weight_shift (u32 weight_shift) {
 
 #endif
 
+#if RIESEL_PAIR
+
+// Load and combine the factored Crandall--Fagin weights generated on the host.
+// The table contains [inverse, forward] packed Montgomery values for WIDTH x
+// coordinates followed by BIG_HEIGHT line coordinates.
+Z61 rieselStartingWeight(BigTab table, u32 x, u32 line, bool inverse, u32 *exponent) {
+  CP(Z61) weights = (CP(Z61))table;
+  u32 const which = inverse ? 0 : 1;
+  Z61 result = mul(weights[2 * x + which], weights[2 * (WIDTH + line) + which]);
+  u32 const stepExponent = NWORDS - EXP % NWORDS;
+  u32 ex = (u32)((u64)stepExponent * (2u * x * BIG_HEIGHT) % NWORDS) +
+           (u32)((u64)stepExponent * (2u * line) % NWORDS);
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  if (wrapped) result = inverse ? mul2(result) : shr(result, 1);
+  *exponent = ex;
+  return result;
+}
+
+Z61 advanceRieselForward(Z61 weight, u32 delta, Z61 factor, u32 *exponent) {
+  u32 ex = *exponent + delta;
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  weight = mul(weight, factor);
+  if (wrapped) weight = shr(weight, 1);
+  *exponent = ex;
+  return weight;
+}
+
+Z61 advanceRieselInverse(Z61 weight, u32 delta, Z61 factor, u32 *exponent) {
+  u32 ex = *exponent + delta;
+  bool const wrapped = ex >= NWORDS;
+  if (wrapped) ex -= NWORDS;
+  weight = mul(weight, factor);
+  if (wrapped) weight = mul2(weight);
+  *exponent = ex;
+  return weight;
+}
+
+#endif

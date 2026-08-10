@@ -133,6 +133,32 @@ FFTShape::FFTShape(enum FFT_TYPES t, u32 w, u32 m, u32 h) :
   // Un-initialized shape, don't set BPW
   if (w == 1 && m == 1 && h == 1) { return; }
 
+  // The experimental packed-Riesel backend has the same 93-bit coefficient
+  // width and transform geometry as M31+M61.  Reuse that backend's measured
+  // admissible BPW table while correctness/performance are being evaluated.
+  if (t == FFT31R2) {
+    bpw = FFTShape{FFT3161, w, m, h}.bpw;
+    return;
+  }
+
+  // Experimental 3M FP32+M31+M61: the floating-point error bound is no
+  // worse than the measured 4M shape.  The NTT fields use three independent
+  // power-of-two Good-Thomas channels while FP32 retains its native radix 6.
+  if (t == FFT323161 && (m == 3 || m == 6) &&
+      u64(w) * m * h == u64(512) * 6 * 512) {
+    bpw = FFTShape{FFT323161, w, u32(m == 3 ? 4 : 8), h}.bpw;
+    return;
+  }
+
+  // Exact 4.5M FP32+M61 Good--Thomas radix-9 prototype.  The 202 variant has
+  // been checkpoint-matched through exponent 150,000,001.  Keep the entry
+  // local to its admitted 512x9x512 geometry rather than teaching the normal
+  // power-of-two shape enumerator about this opt-in transform.
+  if (t == FFT3261 && w == 512 && m == 9 && h == 512) {
+    bpw.fill(31.79f);
+    return;
+  }
+
   string const s = spec();
   if (auto it = BPW.find(s); it != BPW.end()) {
     bpw = it->second;
@@ -232,7 +258,12 @@ FFTConfig::FFTConfig(const string& spec) {
       log("Height must be 256, 512, 1024.\n");
       throw "Invalid FFT spec";
     }
-    if (fft_type != FFT64 && fft_type != FFT32 && (m & (m - 1))) {
+    if (fft_type != FFT64 && fft_type != FFT32 &&
+        !((fft_type == FFT31R2 || fft_type == FFT323161) &&
+          (m == 3 || m == 6)) &&
+        !(fft_type == FFT31R2 && m == 7) &&
+        !(fft_type == FFT3261 && m == 9) &&
+        (m & (m - 1))) {
       log("NTT middle must be a power of two.\n");
       throw "Invalid FFT spec";
     }
@@ -271,6 +302,7 @@ FFTConfig::FFTConfig(FFTShape shape, u32 variant, enum CARRY_KIND carry) :
   else if (shape.fft_type == FFT6431)   FFT_FP64 = true, FFT_FP32 = false, NTT_GF31 = true, NTT_GF61 = false, WordSize = 8;
   else if (shape.fft_type == FFT31)     FFT_FP64 = false, FFT_FP32 = false, NTT_GF31 = true, NTT_GF61 = false, WordSize = 4;
   else if (shape.fft_type == FFT32)     FFT_FP64 = false, FFT_FP32 = true, NTT_GF31 = false, NTT_GF61 = false, WordSize = 4;
+  else if (shape.fft_type == FFT31R2)   FFT_FP64 = false, FFT_FP32 = false, NTT_GF31 = true, NTT_GF61 = false, NTT_RIESEL = true, WordSize = 8;
   else throw "FFT type";
 }
 

@@ -524,6 +524,36 @@ void OVERLOAD reverseLine(local GF61 *lds, GF61 *u) {
   reverseLine((local T2 *) lds, (T2 *) u);
 }
 
+#if GOLD_PAIR
+// Reverse one complete scalar spectrum line.  bump selects the unique line-zero
+// convention k -> -k; all nonzero factored lines incur a borrow and map the
+// height coordinate j to SMALL_HEIGHT-1-j.
+void goldReverseScalarLine(local GF61 *lds61, GF61 *u, bool bump) {
+  u32 const me = get_local_id(0);
+  local Z61 *lds = (local Z61 *)lds61;
+
+  bar();
+  for (u32 i = 0; i < NH; ++i) {
+    u32 const source = i * G_H + me;
+    u32 const destination = bump && source == 0 ? 0 :
+                            SMALL_HEIGHT - source - (bump ? 0 : 1);
+    lds[destination] = u[i].x;
+  }
+  bar();
+  for (u32 i = 0; i < NH; ++i) u[i].x = lds[i * G_H + me];
+
+  bar();
+  for (u32 i = 0; i < NH; ++i) {
+    u32 const source = i * G_H + me;
+    u32 const destination = bump && source == 0 ? 0 :
+                            SMALL_HEIGHT - source - (bump ? 0 : 1);
+    lds[destination] = u[i].y;
+  }
+  bar();
+  for (u32 i = 0; i < NH; ++i) u[i].y = lds[i * G_H + me];
+}
+#endif
+
 void OVERLOAD reverse2(local GF61 *lds, GF61 *u) {
   reverse2((local T2 *) lds, (T2 *) u);
 }

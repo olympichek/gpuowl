@@ -26,6 +26,7 @@ class Task;
 
 class Signal;
 class ProofSet;
+class FoldTransform;
 
 using TrigBuf = Buffer<double2>;
 using TrigPtr = shared_ptr<TrigBuf>;
@@ -101,14 +102,37 @@ private:
   u32 SMALL_H;
   u32 BIG_H;
 
-  u32 hN, nW, nH;
+  u32 hN, nW, nH, carryLen;
   bool useLongCarry;
+  bool useMiddleCarry;
+  bool useSplitCarry;
+  bool parityCorrect;
+  bool parityPrepared;
+  bool parityDirect;
+  bool parityPhysical;
+  bool parityPacked;
+  bool parityExpectedPending{};
+  bool foldSyndrome;
+  bool foldValidate;
+  bool foldTransformEnabled;
+  bool foldValidated{};
   u32 wantROE{};
+
+  // clDefines initializes these options while constructing compiler.  Keep
+  // their lifetime ahead of compiler (and all Kernel objects) so passing them
+  // by reference during compiler initialization is well-defined.
+  bool tail_single_wide;                // TailSquare processes one line at a time
+  bool tail_single_kernel;              // TailSquare does not use a separate kernel for line zero
+  u32 in_place;                         // Should GPU perform transform in-place. 1 = nVidia friendly memory layout, 2 = AMD friendly.
+  u32 wmul;                             // Number of workgroups carryFused kernel should process ("width multiplier").
+  u32 pad_size;                         // Pad size in bytes as specified on the command line or config.txt.  Maximum value is 512.
 
   Profile profile{};
 
   Queue queue;
   vector<Queue> auxQueues;
+  std::unique_ptr<Queue> parityQueue;
+  std::unique_ptr<FoldTransform> foldTransform;
   KernelCompiler compiler;
 
   /* Kernels for FFT_FP64 or FFT_FP32 */
@@ -131,6 +155,28 @@ private:
   Kernel kfftMidOutGF31;
   Kernel kfftWGF31;
 
+  /* Independent 32-bit Riesel-prime planes (FFT31R2) */
+  Kernel kfftMidInR0;
+  Kernel kfftHinR0;
+  Kernel ktailSquareZeroR0;
+  Kernel ktailSquareR0;
+  Kernel ktailMulR0;
+  Kernel ktailMulLowR0;
+  Kernel kfftMidOutR0;
+  Kernel kfftWR0;
+  Kernel kfftPR0;
+  Kernel kfftMidInR1;
+  Kernel kfftHinR1;
+  Kernel ktailSquareZeroR1;
+  Kernel ktailSquareR1;
+  Kernel ktailMulR1;
+  Kernel ktailMulLowR1;
+  Kernel kfftMidOutR1;
+  Kernel kfftWR1;
+  Kernel kfftPR1;
+  Kernel kfftP31R2;
+  Kernel kfftPRPair;
+
   /* Kernels for NTT_GF61 */
   Kernel kfftMidInGF61;
   Kernel kfftHinGF61;
@@ -145,6 +191,8 @@ private:
   Kernel kfftP;
   Kernel kCarryA;
   Kernel kCarryAROE;
+  Kernel kCarryAParity;
+  Kernel kCarryAROEParity;
   Kernel kCarryM;
   Kernel kCarryMROE;
   Kernel kCarryLL;
@@ -153,10 +201,19 @@ private:
   Kernel kCarryFusedMul;
   Kernel kCarryFusedMulROE;
   Kernel kCarryFusedLL;
+  Kernel kCarryMiddleOut;
+  Kernel kCarryMiddleOutROE;
+  Kernel kCarryMiddleIn;
+  Kernel kCarrySplitOut;
+  Kernel kCarrySplitOutROE;
+  Kernel kCarrySplitIn;
 
   Kernel carryB;
   Kernel transpIn, transpOut;
   Kernel readResidue;
+  Kernel parityInit;
+  Kernel parityPrepare;
+  Kernel kFoldValidate;
   Kernel kernIsEqual;
   Kernel sum64;
 
@@ -169,13 +226,6 @@ private:
   Kernel testTime;
 
   // Kernel testKernel;
-
-  // Copy of some -use options needed for Kernel, Trig, and Weights initialization
-  bool tail_single_wide;                // TailSquare processes one line at a time
-  bool tail_single_kernel;              // TailSquare does not use a separate kernel for line zero
-  u32 in_place;                         // Should GPU perform transform in-place. 1 = nVidia friendly memory layout, 2 = AMD friendly.
-  u32 wmul;                             // Number of workgroups carryFused kernel should process ("width multiplier").
-  u32 pad_size;                         // Pad size in bytes as specified on the command line or config.txt.  Maximum value is 512.
 
   // Twiddles: trigonometry constant buffers, used in FFTs.
   // The twiddles depend only on FFT config and do not depend on the exponent.
@@ -197,6 +247,14 @@ private:
   // Carry buffers, used in carry and fusedCarry.
   Buffer<i64> bufCarry;  // Carry shuttle.
   Buffer<int> bufReady;  // Per-group ready flag for stairway carry propagation.
+  Buffer<u32> bufParityA;
+  Buffer<u32> bufParityB;
+  Buffer<u32> bufParityExpected;
+  Buffer<u32>* parityIn;
+  Buffer<u32>* parityOut;
+  Buffer<u32> bufFolded;
+  Buffer<Word> bufFoldWords;
+  Buffer<u32> bufFoldMismatches;
 
   // Small aux buffers.
   Buffer<Word> bufSmallOut;
@@ -227,10 +285,12 @@ private:
   bool use_graphs;
   Graph graph_square[4];
 
-  const int NUM_CACHE_GROUPS = 3;
+  const int NUM_CACHE_GROUPS = 5;
   void splitQueue();
   void mergeQueue();
   void endBottomHalf();
+  void prepareParity();
+  void waitParity();
   void replay();
   void replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Queue *q = nullptr, int base = 0, int kernelsToExecuteX = 0, int kernelsToExecuteY = 1);
   int replay_next_arg(enum BOTTOM_HALF_KERNELS kern, int arg);
@@ -246,11 +306,14 @@ private:
   void fftW(Buffer<double>& out, Buffer<double>& in);
   void carryA(Buffer<double>& out, Buffer<double>& in) { carryA(reinterpret_cast<Buffer<Word>&>(out), in); }
   void carryA(Buffer<Word>& out, Buffer<double>& in);
+  void carryAParity(Buffer<Word>& out, Buffer<double>& in);
   void carryM(Buffer<Word>& out, Buffer<double>& in);
   void carryLL(Buffer<Word>& out, Buffer<double>& in);
   void carryFused(Buffer<double>& buf);
   void carryFusedMul(Buffer<double>& buf);
   void carryFusedLL(Buffer<double>& buf);
+  void carryMiddle(Buffer<Word>& packed, Buffer<double>& buf);
+  void carrySplit(Buffer<Word>& packed, Buffer<double>& buf);
 
   vector<Word> readWords(Buffer<Word> &buf);
   void writeWords(Buffer<Word>& buf, vector<Word> &words);
@@ -368,4 +431,5 @@ private:
 #define GF31_DATA_SIZE(W,M,H,inplace,pad)       PAD_ADJUST((W)*(M)*(H)*2, M, inplace, pad) * sizeof(uint) / sizeof(double)
 #define GF61_DATA_SIZE(W,M,H,inplace,pad)       PAD_ADJUST((W)*(M)*(H)*2, M, inplace, pad) * sizeof(ulong) / sizeof(double)
 #define TOTAL_DATA_SIZE(fft,W,M,H,inplace,pad)  ((int)(fft).FFT_FP64 * FP64_DATA_SIZE(W,M,H,inplace,pad) + (int)(fft).FFT_FP32 * FP32_DATA_SIZE(W,M,H,inplace,pad) + \
-                                                (int)(fft).NTT_GF31 * GF31_DATA_SIZE(W,M,H,inplace,pad) + (int)(fft).NTT_GF61 * GF61_DATA_SIZE(W,M,H,inplace,pad))
+                                                (int)(fft).NTT_GF31 * GF31_DATA_SIZE(W,M,H,inplace,pad) + (int)(fft).NTT_GF61 * GF61_DATA_SIZE(W,M,H,inplace,pad) + \
+                                                2 * (int)(fft).NTT_RIESEL * GF31_DATA_SIZE(W,M,H,inplace,pad))

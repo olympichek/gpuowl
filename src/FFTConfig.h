@@ -23,7 +23,7 @@ string numberK(u64 n);
 
 using KeyVal = std::pair<std::string, std::string>;
 
-enum FFT_TYPES {FFT64=0, FFT3161=1, FFT3261=2, FFT61=3, FFT323161=4, FFT3231=50, FFT6431=51, FFT31=52, FFT32=53};
+enum FFT_TYPES {FFT64=0, FFT3161=1, FFT3261=2, FFT61=3, FFT323161=4, FFT3231=50, FFT6431=51, FFT31=52, FFT32=53, FFT31R2=54};
 
 class FFTShape {
 public:
@@ -42,7 +42,9 @@ public:
   explicit FFTShape(const string& spec);
 
   [[nodiscard]] u32 size() const { return width * height * middle * 2; }
-  [[nodiscard]] u32 nW() const { return (width == 1024 || width == 256 /*|| width == 4096*/) ? 4 : 8; }
+  [[nodiscard]] u32 nW() const {
+    return (width == 1024 || width == 256 /*|| width == 4096*/) ? 4 : 8;
+  }
   [[nodiscard]] u32 nH() const { return (height == 1024 || height == 256 /*|| height == 4096*/) ? 4 : 8; }
 
   [[nodiscard]] float minBpw() const { return fft_type != FFT32 ? 3.0f : 1.0f; }
@@ -79,6 +81,7 @@ public:
   bool FFT_FP32;
   bool NTT_GF31;
   bool NTT_GF61;
+  bool NTT_RIESEL{};
   // bool NTT_NCW;	// Nick Craig-Wood prime not supported (yet?)
 
   // Size (in bytes) of integer data passed to FFTs/NTTs on the GPU

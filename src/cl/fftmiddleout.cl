@@ -39,7 +39,7 @@ KERNEL(OUT_WG) fftMiddleOut(P(T2) out, CP(T2) in, u32 base, Trig trig) {
 
   middleMul(u, x, trig);
 
-  fft_MIDDLE(u);
+  fft_MIDDLE_OUT(u);
 
   // FFT results come out multiplied by the FFT length (NWORDS).  Also, for performance reasons
   // weights and invweights are doubled meaning we need to divide by another 2^2 and 2^2.
@@ -108,7 +108,7 @@ KERNEL(OUT_WG) fftMiddleOut(P(T2) out, CP(T2) in, u32 base, Trig trig) {
 
   middleMul(u, x, trigF2);
 
-  fft_MIDDLE(u);
+  fft_MIDDLE_OUT(u);
 
   // FFT results come out multiplied by the FFT length (NWORDS * 2).
   const float factor = 1.0f / (NWORDS * 2);
@@ -174,7 +174,7 @@ KERNEL(OUT_WG) fftMiddleOutGF31(P(T2) out, CP(T2) in, u32 base, Trig trig) {
 
   middleMul(u, x, trig31);
 
-  fft_MIDDLE(u);
+  fft_MIDDLE_OUT(u);
 
   middleMul2(u, y, x, trig31);
 
@@ -237,7 +237,7 @@ KERNEL(OUT_WG) fftMiddleOutGF61(P(T2) out, CP(T2) in, u32 base, Trig trig) {
 
   middleMul(u, x, trig61);
 
-  fft_MIDDLE(u);
+  fft_MIDDLE_OUT(u);
 
   middleMul2(u, y, x, trig61);
 
@@ -331,7 +331,7 @@ KERNEL(256) fftMiddleOut(P(T2) out, P(T2) in, u32 base, Trig trig) {
 
   middleMul(u, x, trig);
 
-  fft_MIDDLE(u);
+  fft_MIDDLE_OUT(u);
 
   // FFT results come out multiplied by the FFT length (NWORDS).  Also, for performance reasons
   // weights and invweights are doubled meaning we need to divide by another 2^2 and 2^2.
@@ -391,7 +391,7 @@ KERNEL(256) fftMiddleOut(P(T2) out, P(T2) in, u32 base, Trig trig) {
 
   middleMul(u, x, trigF2);
 
-  fft_MIDDLE(u);
+  fft_MIDDLE_OUT(u);
 
   // FFT results come out multiplied by the FFT length (NWORDS * 2).
   const float factor = 1.0f / (NWORDS * 2);
@@ -448,7 +448,7 @@ KERNEL(256) fftMiddleOutGF31(P(T2) out, P(T2) in, u32 base, Trig trig) {
 
   middleMul(u, x, trig31);
 
-  fft_MIDDLE(u);
+  fft_MIDDLE_OUT(u);
 
   middleMul2(u, y, x, trig31);
 
@@ -502,7 +502,7 @@ KERNEL(256) fftMiddleOutGF61(P(T2) out, P(T2) in, u32 base, Trig trig) {
 
   middleMul(u, x, trig61);
 
-  fft_MIDDLE(u);
+  fft_MIDDLE_OUT(u);
 
   middleMul2(u, y, x, trig61);
 

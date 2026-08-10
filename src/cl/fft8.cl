@@ -108,6 +108,19 @@ void OVERLOAD fft8(GF31 *u) {
 
 #if NTT_GF61
 
+#if RIESEL_PAIR || GOLD_PAIR
+
+void OVERLOAD fft8Core(GF61 *u) {
+  X2(u[0], u[4]);
+  X2_mul_t8(u[1], u[5]);
+  X2_mul_t4(u[2], u[6]);
+  X2_mul_3t8(u[3], u[7]);
+  fft4Core(u);
+  fft4Core(u + 4);
+}
+
+#else
+
 void OVERLOAD fft4CoreSpecial1(GF61 *u) {         // Starts with u[0,1,2,3] in range of 0..2*M61+epsilon.
   X2q(&u[0], &u[2]);                              // X2(u[0], u[2]);  No reductions mod M61.  u[0,2] range is 0..4+, -2-..2+
   X2q_mul_t4(&u[1], &u[3]);                       // X2(u[1], u[3]);  u[3] = mul_t4(u[3]);    u[1,3] range is 0..4+, -2-..2+
@@ -142,6 +155,8 @@ void OVERLOAD fft8Core(GF61 *u) {                 // Starts with all u[i] values
   fft4CoreSpecial1(u);
   fft4CoreSpecial2(u + 4);
 }
+
+#endif
 
 void OVERLOAD fft8(GF61 *u) {
   fft8Core(u);

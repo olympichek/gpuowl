@@ -202,11 +202,34 @@ Word2 OVERLOAD weightAndCarryPairSloppy(F2 uF2, GF31 u31, F invWeight1, F invWei
 // Apply inverse weights, add in optional carry, calculate roundoff error, convert to integer. Handle MUL3.
 // Then propagate carries through two words.  Generate the output carry.
 Word2 OVERLOAD weightAndCarryPair(F2 uF2, GF61 u61, F invWeight1, F invWeight2, u32 m61_invWeight1, u32 m61_invWeight2,
+#if PARITY_SQUARE
+#if PARITY_LAZY
+                                  CP(u32) parity, u32 parityIndex,
+#else
+                                  u32 expectedParity1, u32 expectedParity2,
+#endif
+#endif
                                   bool hasInCarry, i64 inCarry, bool b1, bool b2, iCARRY *outCarry, float* maxROE, float* carryMax) {
   i64 midCarry;
-  i96 tmp1 = weightAndCarryOne(uF2.x, u61.x, invWeight1, m61_invWeight1, hasInCarry, inCarry, maxROE);
+  i96 tmp1 = weightAndCarryOne(uF2.x, u61.x, invWeight1, m61_invWeight1,
+#if PARITY_SQUARE
+#if PARITY_LAZY
+                               parity, parityIndex, true,
+#else
+                               expectedParity1,
+#endif
+#endif
+                               hasInCarry, inCarry, maxROE);
   Word a = carryStep(tmp1, &midCarry, b1);
-  i96 tmp2 = weightAndCarryOne(uF2.y, u61.y, invWeight2, m61_invWeight2, true, midCarry, maxROE);
+  i96 tmp2 = weightAndCarryOne(uF2.y, u61.y, invWeight2, m61_invWeight2,
+#if PARITY_SQUARE
+#if PARITY_LAZY
+                               parity, parityIndex, false,
+#else
+                               expectedParity2,
+#endif
+#endif
+                               true, midCarry, maxROE);
   Word b = carryStep(tmp2, outCarry, b2);
   *carryMax = max(*carryMax, max(boundCarry(midCarry), boundCarry(*outCarry)));
   return (Word2) (a, b);
@@ -214,11 +237,34 @@ Word2 OVERLOAD weightAndCarryPair(F2 uF2, GF61 u61, F invWeight1, F invWeight2, 
 
 // Like weightAndCarryPair except that a strictly accurate calculation of the first Word and carry is not required.  Second word may also be sloppy.
 Word2 OVERLOAD weightAndCarryPairSloppy(F2 uF2, GF61 u61, F invWeight1, F invWeight2, u32 m61_invWeight1, u32 m61_invWeight2,
+#if PARITY_SQUARE
+#if PARITY_LAZY
+                                        CP(u32) parity, u32 parityIndex,
+#else
+                                        u32 expectedParity1, u32 expectedParity2,
+#endif
+#endif
                                         bool hasInCarry, i64 inCarry, bool b1, bool b2, iCARRY *outCarry, float* maxROE, float* carryMax) {
   i64 midCarry;
-  i96 tmp1 = weightAndCarryOne(uF2.x, u61.x, invWeight1, m61_invWeight1, hasInCarry, inCarry, maxROE);
+  i96 tmp1 = weightAndCarryOne(uF2.x, u61.x, invWeight1, m61_invWeight1,
+#if PARITY_SQUARE
+#if PARITY_LAZY
+                               parity, parityIndex, true,
+#else
+                               expectedParity1,
+#endif
+#endif
+                               hasInCarry, inCarry, maxROE);
   Word a = carryStepUnsignedSloppy(tmp1, &midCarry, b1);
-  i96 tmp2 = weightAndCarryOne(uF2.y, u61.y, invWeight2, m61_invWeight2, true, midCarry, maxROE);
+  i96 tmp2 = weightAndCarryOne(uF2.y, u61.y, invWeight2, m61_invWeight2,
+#if PARITY_SQUARE
+#if PARITY_LAZY
+                               parity, parityIndex, false,
+#else
+                               expectedParity2,
+#endif
+#endif
+                               true, midCarry, maxROE);
   Word b = carryStepSignedSloppy(tmp2, outCarry, b2);
   *carryMax = max(*carryMax, max(boundCarry(midCarry), boundCarry(*outCarry)));
   return (Word2) (a, b);
@@ -231,9 +277,15 @@ Word2 OVERLOAD weightAndCarryPairSloppy(F2 uF2, GF61 u61, F invWeight1, F invWei
 
 #elif FFT_TYPE == FFT3161
 
+#if GOLD_PAIR
+#define SECOND_INV_WEIGHT Z61
+#else
+#define SECOND_INV_WEIGHT u32
+#endif
+
 // Apply inverse weights, add in optional carry, calculate roundoff error, convert to integer. Handle MUL3.
 // Then propagate carries through two words.  Generate the output carry.
-Word2 OVERLOAD weightAndCarryPair(GF31 u31, GF61 u61, u32 m31_invWeight1, u32 m31_invWeight2, u32 m61_invWeight1, u32 m61_invWeight2,
+Word2 OVERLOAD weightAndCarryPair(GF31 u31, GF61 u61, u32 m31_invWeight1, u32 m31_invWeight2, SECOND_INV_WEIGHT m61_invWeight1, SECOND_INV_WEIGHT m61_invWeight2,
                                   bool hasInCarry, i64 inCarry, bool b1, bool b2, iCARRY *outCarry, u32* maxROE, float* carryMax) {
   iCARRY midCarry;
   i96 tmp1 = weightAndCarryOne(u31.x, u61.x, m31_invWeight1, m61_invWeight1, hasInCarry, inCarry, maxROE);
@@ -245,12 +297,58 @@ Word2 OVERLOAD weightAndCarryPair(GF31 u31, GF61 u61, u32 m31_invWeight1, u32 m3
 }
 
 // Like weightAndCarryPair except that a strictly accurate calculation of the first Word and carry is not required.  Second word may also be sloppy.
-Word2 OVERLOAD weightAndCarryPairSloppy(GF31 u31, GF61 u61, u32 m31_invWeight1, u32 m31_invWeight2, u32 m61_invWeight1, u32 m61_invWeight2,
+Word2 OVERLOAD weightAndCarryPairSloppy(GF31 u31, GF61 u61, u32 m31_invWeight1, u32 m31_invWeight2, SECOND_INV_WEIGHT m61_invWeight1, SECOND_INV_WEIGHT m61_invWeight2,
                                         bool hasInCarry, i64 inCarry, bool b1, bool b2, iCARRY *outCarry, u32* maxROE, float* carryMax) {
   iCARRY midCarry;
   i96 tmp1 = weightAndCarryOne(u31.x, u61.x, m31_invWeight1, m61_invWeight1, hasInCarry, inCarry, maxROE);
   Word a = carryStepUnsignedSloppy(tmp1, &midCarry, b1);
   i96 tmp2 = weightAndCarryOne(u31.y, u61.y, m31_invWeight2, m61_invWeight2, true, midCarry, maxROE);
+  Word b = carryStepSignedSloppy(tmp2, outCarry, b2);
+  *carryMax = max(*carryMax, max(boundCarry(midCarry), boundCarry(*outCarry)));
+  return (Word2) (a, b);
+}
+
+#undef SECOND_INV_WEIGHT
+
+/**************************************************************************/
+/*        Three independent 31-bit residue planes (FFT31R2 / FFT54)      */
+/**************************************************************************/
+
+#elif FFT_TYPE == FFT31R2
+
+Word2 OVERLOAD weightAndCarryPair(GF31 u31, GF31 u0, GF31 u1,
+                                  u32 m31_invWeight1, u32 m31_invWeight2,
+                                  Z31 riesel0_invWeight1, Z31 riesel0_invWeight2,
+                                  Z31 riesel1_invWeight1, Z31 riesel1_invWeight2,
+                                  bool hasInCarry, i64 inCarry, bool b1, bool b2,
+                                  iCARRY *outCarry, u32* maxROE, float* carryMax) {
+  iCARRY midCarry;
+  i96 tmp1 = weightAndCarryOne(u31.x, u0.x, u1.x, m31_invWeight1,
+                               riesel0_invWeight1, riesel1_invWeight1,
+                               hasInCarry, inCarry, maxROE);
+  Word a = carryStep(tmp1, &midCarry, b1);
+  i96 tmp2 = weightAndCarryOne(u31.y, u0.y, u1.y, m31_invWeight2,
+                               riesel0_invWeight2, riesel1_invWeight2,
+                               true, midCarry, maxROE);
+  Word b = carryStep(tmp2, outCarry, b2);
+  *carryMax = max(*carryMax, max(boundCarry(midCarry), boundCarry(*outCarry)));
+  return (Word2) (a, b);
+}
+
+Word2 OVERLOAD weightAndCarryPairSloppy(GF31 u31, GF31 u0, GF31 u1,
+                                        u32 m31_invWeight1, u32 m31_invWeight2,
+                                        Z31 riesel0_invWeight1, Z31 riesel0_invWeight2,
+                                        Z31 riesel1_invWeight1, Z31 riesel1_invWeight2,
+                                        bool hasInCarry, i64 inCarry, bool b1, bool b2,
+                                        iCARRY *outCarry, u32* maxROE, float* carryMax) {
+  iCARRY midCarry;
+  i96 tmp1 = weightAndCarryOne(u31.x, u0.x, u1.x, m31_invWeight1,
+                               riesel0_invWeight1, riesel1_invWeight1,
+                               hasInCarry, inCarry, maxROE);
+  Word a = carryStepUnsignedSloppy(tmp1, &midCarry, b1);
+  i96 tmp2 = weightAndCarryOne(u31.y, u0.y, u1.y, m31_invWeight2,
+                               riesel0_invWeight2, riesel1_invWeight2,
+                               true, midCarry, maxROE);
   Word b = carryStepSignedSloppy(tmp2, outCarry, b2);
   *carryMax = max(*carryMax, max(boundCarry(midCarry), boundCarry(*outCarry)));
   return (Word2) (a, b);
@@ -265,11 +363,23 @@ Word2 OVERLOAD weightAndCarryPairSloppy(GF31 u31, GF61 u61, u32 m31_invWeight1, 
 // Apply inverse weights, add in optional carry, calculate roundoff error, convert to integer. Handle MUL3.
 // Then propagate carries through two words.  Generate the output carry.
 Word2 OVERLOAD weightAndCarryPair(F2 uF2, GF31 u31, GF61 u61, F invWeight1, F invWeight2, u32 m31_invWeight1, u32 m31_invWeight2,
-                                  u32 m61_invWeight1, u32 m61_invWeight2, bool hasInCarry, i64 inCarry, bool b1, bool b2, iCARRY *outCarry, float* maxROE, float* carryMax) {
+                                  u32 m61_invWeight1, u32 m61_invWeight2,
+#if PARITY_SQUARE
+                                  u32 expectedParity1, u32 expectedParity2,
+#endif
+                                  bool hasInCarry, i64 inCarry, bool b1, bool b2, iCARRY *outCarry, float* maxROE, float* carryMax) {
   iCARRY midCarry;
-  i128 tmp1 = weightAndCarryOne(uF2.x, u31.x, u61.x, invWeight1, m31_invWeight1, m61_invWeight1, hasInCarry, inCarry, maxROE);
+  i128 tmp1 = weightAndCarryOne(uF2.x, u31.x, u61.x, invWeight1, m31_invWeight1, m61_invWeight1,
+#if PARITY_SQUARE
+                                expectedParity1,
+#endif
+                                hasInCarry, inCarry, maxROE);
   Word a = carryStep(tmp1, &midCarry, b1);
-  i128 tmp2 = weightAndCarryOne(uF2.y, u31.y, u61.y, invWeight2, m31_invWeight2, m61_invWeight2, true, midCarry, maxROE);
+  i128 tmp2 = weightAndCarryOne(uF2.y, u31.y, u61.y, invWeight2, m31_invWeight2, m61_invWeight2,
+#if PARITY_SQUARE
+                                expectedParity2,
+#endif
+                                true, midCarry, maxROE);
   Word b = carryStep(tmp2, outCarry, b2);
   *carryMax = max(*carryMax, max(boundCarry(midCarry), boundCarry(*outCarry)));
   return (Word2) (a, b);
@@ -277,11 +387,23 @@ Word2 OVERLOAD weightAndCarryPair(F2 uF2, GF31 u31, GF61 u61, F invWeight1, F in
 
 // Like weightAndCarryPair except that a strictly accurate calculation of the first Word and carry is not required.  Second word may also be sloppy.
 Word2 OVERLOAD weightAndCarryPairSloppy(F2 uF2, GF31 u31, GF61 u61, F invWeight1, F invWeight2, u32 m31_invWeight1, u32 m31_invWeight2,
-                                        u32 m61_invWeight1, u32 m61_invWeight2, bool hasInCarry, i64 inCarry, bool b1, bool b2, iCARRY *outCarry, float* maxROE, float* carryMax) {
+                                        u32 m61_invWeight1, u32 m61_invWeight2,
+#if PARITY_SQUARE
+                                        u32 expectedParity1, u32 expectedParity2,
+#endif
+                                        bool hasInCarry, i64 inCarry, bool b1, bool b2, iCARRY *outCarry, float* maxROE, float* carryMax) {
   iCARRY midCarry;
-  i128 tmp1 = weightAndCarryOne(uF2.x, u31.x, u61.x, invWeight1, m31_invWeight1, m61_invWeight1, hasInCarry, inCarry, maxROE);
+  i128 tmp1 = weightAndCarryOne(uF2.x, u31.x, u61.x, invWeight1, m31_invWeight1, m61_invWeight1,
+#if PARITY_SQUARE
+                                expectedParity1,
+#endif
+                                hasInCarry, inCarry, maxROE);
   Word a = carryStepUnsignedSloppy(tmp1, &midCarry, b1);
-  i128 tmp2 = weightAndCarryOne(uF2.y, u31.y, u61.y, invWeight2, m31_invWeight2, m61_invWeight2, true, midCarry, maxROE);
+  i128 tmp2 = weightAndCarryOne(uF2.y, u31.y, u61.y, invWeight2, m31_invWeight2, m61_invWeight2,
+#if PARITY_SQUARE
+                                expectedParity2,
+#endif
+                                true, midCarry, maxROE);
   Word b = carryStepSignedSloppy(tmp2, outCarry, b2);
   *carryMax = max(*carryMax, max(boundCarry(midCarry), boundCarry(*outCarry)));
   return (Word2) (a, b);

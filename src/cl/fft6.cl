@@ -37,6 +37,21 @@ void fft6(T2 *u) {
   fma_addsub(u[1], u[5], -SIN1, tmp26a, u[4]);
   fma_addsub(u[2], u[4], -SIN1, tmp35a, u[2]);
 #endif
+
+}
+
+#endif
+
+#if FFT_FP32
+
+void fft6(F2 *u) {
+  X2(u[0], u[3]);
+  X2(u[2], u[5]);
+  X2(u[4], u[1]);
+  fft3by(u, 0, 2, 6);
+  fft3by(u, 3, 2, 6);
+  SWAP(u[1], u[5]);
+  SWAP(u[2], u[4]);
 }
 
 #endif

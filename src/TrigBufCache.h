@@ -57,6 +57,9 @@ float2 root1FP32(u32 N, u32 k);
 
 uint2 root1GF31(u32 N, u32 k);
 ulong2 root1GF61(u32 N, u32 k);
+ulong2 root1GoldPair(u32 N, u32 k);
+ulong2 root1Riesel(u32 N, u32 k, bool lazy = false);
+uint2 root1M19(u32 N, u32 k);
 
 // Compute the size of the largest possible trig buffer given width, middle, height (in number of double2 values)
 #define SMALLTRIG_FP64_SIZE(W,M,H,nH)           ((W) != (H) || (H) == 0 ? (W) * 5 : SMALLTRIGCOMBO_FP64_SIZE(W,M,H,nH)) // See genSmallTrigFP64

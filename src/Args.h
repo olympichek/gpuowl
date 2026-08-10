@@ -78,6 +78,7 @@ public:
   string fftSpec;
 
   u64 prpExp = 0;
+  vector<u64> prpExps;
   u64 llExp = 0;
   
   size_t maxAlloc = 0;

@@ -46,10 +46,16 @@
 #endif
 
 enum {
-CARRY_LEN = 8
+DEFAULT_CARRY_LEN = 8
 };
 
 namespace {
+
+u32 carryLength(Args const& args, FFTConfig const& fft) {
+  return fft.shape.fft_type == FFT31R2 ?
+         args.value("RIESEL_CARRY_LEN", DEFAULT_CARRY_LEN) :
+         DEFAULT_CARRY_LEN;
+}
 
 u32 kAt(u32 H, u32 line, u32 col) { return (line + col * H) * 2; }
 
@@ -70,6 +76,101 @@ double invWeightM1(u32 N, u64 E, u32 H, u32 line, u32 col, u32 rep) {
   return expm1l(M_LN2l * - (long double)(extra(N, E, kAt(H, line, col) + rep)) / N);
 }
 
+constexpr array<u32, 2> RIESEL_Q_CANONICAL {2090860543u, 2141192191u};
+constexpr array<u32, 2> RIESEL_THETA_CANONICAL {872791198u, 898129257u};
+// Sub-2^30 fields permit Harvey's redundant [0,2q) Montgomery arithmetic.
+// Lane order remains ascending for the simple two-prime Garner reconstruction.
+constexpr array<u32, 2> RIESEL_Q_LAZY {1031798783u, 1038090239u};
+constexpr array<u32, 2> RIESEL_THETA_LAZY {286716770u, 571191171u};
+constexpr u32 M19_Q = (u32(1) << 19) - 1;
+constexpr u32 M19_THETA = 256;
+
+auto const& rieselQ(bool lazy) {
+  return lazy ? RIESEL_Q_LAZY : RIESEL_Q_CANONICAL;
+}
+
+auto const& rieselTheta(bool lazy) {
+  return lazy ? RIESEL_THETA_LAZY : RIESEL_THETA_CANONICAL;
+}
+
+u32 powMod32(u32 value, u64 exponent, u32 modulus) {
+  u32 result = 1;
+  while (exponent != 0) {
+    if (exponent & 1) result = u32(u64(result) * value % modulus);
+    exponent >>= 1;
+    if (exponent != 0) value = u32(u64(value) * value % modulus);
+  }
+  return result;
+}
+
+u64 rieselMontPower(u32 exponent, bool inverse, bool lazy) {
+  auto const& qValues = rieselQ(lazy);
+  auto const& thetaValues = rieselTheta(lazy);
+  u64 packed = 0;
+  for (u32 lane = 0; lane != 2; ++lane) {
+    u32 const q = qValues[lane];
+    u32 theta = thetaValues[lane];
+    if (inverse) theta = powMod32(theta, q - 2, q);
+    u32 value = powMod32(theta, exponent, q);
+    value = u32(u64(value) * ((u64(1) << 32) % q) % q);
+    packed |= u64(value) << (lane * 32);
+  }
+  return packed;
+}
+
+u64 rieselMontScalar(u64 value, bool lazy) {
+  auto const& qValues = rieselQ(lazy);
+  u64 packed = 0;
+  for (u32 lane = 0; lane != 2; ++lane) {
+    u32 const q = qValues[lane];
+    u32 normal = u32(value % q);
+    normal = u32(u64(normal) * ((u64(1) << 32) % q) % q);
+    packed |= u64(normal) << (lane * 32);
+  }
+  return packed;
+}
+
+// The Good--Thomas M19 experiment reuses the q1 storage/scheduling lane but
+// stores that lane in the ordinary Mersenne representation.  Keep q0 packed
+// exactly as before so all existing layouts and offsets remain unchanged.
+u64 rieselFieldPower(u32 exponent, bool inverse, bool lazy, bool m19Field) {
+  u64 packed = rieselMontPower(exponent, inverse, lazy);
+  if (!m19Field) return packed;
+  u32 theta = M19_THETA;
+  if (inverse) theta = powMod32(theta, M19_Q - 2, M19_Q);
+  u32 const value = powMod32(theta, exponent, M19_Q);
+  return (packed & 0xffffffffULL) | (u64(value) << 32);
+}
+
+u64 rieselFieldScalar(u64 value, bool lazy, bool m19Field) {
+  u64 packed = rieselMontScalar(value, lazy);
+  if (!m19Field) return packed;
+  return (packed & 0xffffffffULL) | (u64(value % M19_Q) << 32);
+}
+
+constexpr u64 GOLD_HOST_Q = 0xffffffff00000001ull;
+constexpr u64 GOLD_HOST_THETA = 0x983d4271ce1d45bbull;
+
+u64 goldHostMul(u64 a, u64 b) {
+  return u64((unsigned __int128)a * b % GOLD_HOST_Q);
+}
+
+u64 goldHostPower(u64 value, u64 exponent) {
+  u64 result = 1;
+  while (exponent != 0) {
+    if (exponent & 1) result = goldHostMul(result, value);
+    exponent >>= 1;
+    if (exponent != 0) value = goldHostMul(value, value);
+  }
+  return result;
+}
+
+u64 goldWeightPower(u32 exponent, bool inverse) {
+  u64 theta = GOLD_HOST_THETA;
+  if (inverse) theta = goldHostPower(theta, GOLD_HOST_Q - 2);
+  return goldHostPower(theta, exponent);
+}
+
 double boundUnderOne(double x) { return std::min(x, nexttoward(1, 0)); }
 
 float weight32(u32 N, u64 E, u32 H, u32 line, u32 col, u32 rep) {
@@ -88,7 +189,9 @@ float invWeightM132(u32 N, u64 E, u32 H, u32 line, u32 col, u32 rep) {
   return float(expm1(M_LN2 * - (double)(extra(N, E, kAt(H, line, col) + rep)) / N));
 }
 
-Weights genWeights(FFTConfig fft, u64 E, u32 W, u32 H, u32 nW, bool nvidiaGpu) {
+Weights genWeights(FFTConfig fft, u64 E, u32 W, u32 H, u32 nW,
+                   bool nvidiaGpu, bool lazyRiesel, bool goldPair,
+                   bool m19Field) {
   u32 const N = 2u * W * H;
   u32 const groupWidth = W / nW;
 
@@ -162,6 +265,56 @@ Weights genWeights(FFTConfig fft, u64 E, u32 W, u32 H, u32 nW, bool nvidiaGpu) {
     memcpy((double *) weightsIF.data(), weightsIF32.data(), weightsIF32.size() * sizeof(float));
     weightsConstIF.resize(weightsConstIF32.size() / 2);
     memcpy((double *) weightsConstIF.data(), weightsConstIF32.data(), weightsConstIF32.size() * sizeof(float));
+  }
+
+  else if (fft.shape.fft_type == FFT3161 && goldPair) {
+    vector<u64> goldWeights;
+    goldWeights.reserve(2 * (W + H));
+    auto append = [&](u32 exponent) {
+      goldWeights.push_back(goldWeightPower(exponent, true));
+      goldWeights.push_back(goldWeightPower(exponent, false));
+    };
+    for (u32 x = 0; x != W; ++x) append(extra(N, E, 2 * x * H));
+    for (u32 line = 0; line != H; ++line) append(extra(N, E, 2 * line));
+    weightsIF.resize(goldWeights.size());
+    memcpy(weightsIF.data(), goldWeights.data(),
+           goldWeights.size() * sizeof(u64));
+  }
+
+  else if (fft.shape.fft_type == FFT31R2) {
+    if (fft.NTT_GF61) {
+      // q0/q1 are vectorized into the low/high halves of each u64.  They are
+      // still reduced independently; packing only changes scheduling and the
+      // in-register/global-memory representation.
+      vector<u64> packedWeights;
+      packedWeights.reserve(2 * (W + H));
+      auto append = [&](u32 exponent) {
+        packedWeights.push_back(rieselFieldPower(exponent, true, lazyRiesel,
+                                                 m19Field));
+        packedWeights.push_back(rieselFieldPower(exponent, false, lazyRiesel,
+                                                 m19Field));
+      };
+      for (u32 x = 0; x != W; ++x) append(extra(N, E, 2 * x * H));
+      for (u32 line = 0; line != H; ++line) append(extra(N, E, 2 * line));
+      weightsIF.resize(packedWeights.size());
+      memcpy(weightsIF.data(), packedWeights.data(), packedWeights.size() * sizeof(u64));
+    } else {
+      // Independent representation: one uint plane per Riesel field.
+      vector<u32> fieldWeights;
+      fieldWeights.reserve(4 * (W + H));
+      for (u32 lane = 0; lane != 2; ++lane) {
+        auto append = [&](u32 exponent) {
+          fieldWeights.push_back(u32(rieselFieldPower(exponent, true, lazyRiesel,
+                                                      m19Field) >> (32 * lane)));
+          fieldWeights.push_back(u32(rieselFieldPower(exponent, false, lazyRiesel,
+                                                      m19Field) >> (32 * lane)));
+        };
+        for (u32 x = 0; x != W; ++x) append(extra(N, E, 2 * x * H));
+        for (u32 line = 0; line != H; ++line) append(extra(N, E, 2 * line));
+      }
+      weightsIF.resize((fieldWeights.size() + 1) / 2);
+      memcpy(weightsIF.data(), fieldWeights.data(), fieldWeights.size() * sizeof(u32));
+    }
   }
 
   return Weights{.weightsConstIF=weightsConstIF, .weightsIF=weightsIF};
@@ -260,6 +413,20 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
     bool const isValid = isInList(k, {
                               "FAST_BARRIER",
                               "STATS",
+                              "SPIN_STATS",
+                              "ROE_COUNT",
+                              "PARITY_CORRECT",
+                              "PARITY_PREPARED",        // 1: overlap; 2: direct scatter; 3: physical natural parity
+                              "PARITY_PACKED",          // Ballot-packed natural/prepared parity planes (CUDA only)
+                              "PARITY_LAZY",            // Load expected parity only for residual-risk candidates
+                              "FOLD_SYNDROME",          // Sparse-error folded M31 sidecar; 2 enables diagnostic validation
+                              "FOLD_TRANSFORM",         // Run the 512K cyclic M31 square on the folded sidecar
+                              "FOLD_FACTOR",            // 8: parity-free 512K fold; 16: parity-assisted 256K fold
+                              "FOLD_SHAPE",             // 0: 256:4:256, 1: 256:2:512, 2: 512:2:256
+                              "QUOTIENT_STATS",
+                              "FP32_CMUL64",
+                              "FP32_CFMA64",
+                              "COEFF_RANGE_STATS",
                               "IN_SIZEX",
                               "IN_WG",
                               "OUT_SIZEX",
@@ -286,13 +453,27 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
                               "TABMUL_CHAIN31",
                               "TABMUL_CHAIN32",
                               "TABMUL_CHAIN61",
+                              "ENABLE_BETTER_ONEPAIRSQ", // Alternate M61 pair-square identity in tailsquare.cl
                               "MODM31",
                               "LOADS","STORES",
                               "NOREG",                  // CUDA - experimental
                               "WMUL",
                               "MULTI_Q",
+                              "RIESEL_FUSED",           // Experimental fused carry for the three-prime M31R2 path
+                              "RIESEL_PACKED",          // Vectorize the two Riesel fields into one transform stream
+                              "RIESEL_FOUR",            // Add M61 to M31R2 for an experimental 154-bit, 2M path
+                              "GOOD_THOMAS3",           // 3M NTT fields as three packed 1M Good-Thomas channels
+                              "GOOD_THOMAS7",           // 3.5M fields as seven packed 512K Good-Thomas channels
+                              "GOOD_THOMAS9",           // 4.5M FP32+M61 as nine packed 512K channels
+                              "RIESEL_CARRY_LEN",       // Experimental long-carry block length for M31R2
+                              "RIESEL_PTX_MONT",        // Experimental inline-PTX Montgomery multiply for Riesel fields
+                              "RIESEL_LAZY",            // Use sub-2^30 Riesel fields and Harvey redundant ranges
+                              "M19_FIELD",              // Replace q1 with M19 in the 3M Good-Thomas experiment
+                              "GOLD_PAIR",              // Experimental full scalar Goldilocks plane in even/odd pairs
+                              "MIDCARRY_FUSED",         // Two-phase middle/width/carry fusion for CUDA FFT3161
                               "GRAPHS",
-                              "L1CUDA"
+                              "L1CUDA",
+                              "L2_PERSIST"              // CUDA persisting-L2 window for the largest trig table
                             });
     if (!isValid) {
       log("Warning: unrecognized -use key '%s'\n", k.c_str());
@@ -359,7 +540,7 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
                     {"WIDTH", fft.shape.width},
                     {"SMALL_HEIGHT", fft.shape.height},
                     {"MIDDLE", fft.shape.middle},
-                    {"CARRY_LEN", CARRY_LEN},
+                    {"CARRY_LEN", carryLength(args, fft)},
                     {"NW", fft.shape.nW()},
                     {"NH", fft.shape.nH()}
                   });
@@ -375,6 +556,32 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
 
   u32 const N = fft.shape.size();
   defines += toDefine("FFT_VARIANT", fft.variant);
+  bool const rieselPair = fft.shape.fft_type == FFT31R2 && fft.NTT_GF61 &&
+                          !fft.NTT_RIESEL;
+  bool const rieselFour = fft.shape.fft_type == FFT31R2 && fft.NTT_GF61 &&
+                          fft.NTT_RIESEL;
+  bool const rieselLazy = fft.shape.fft_type == FFT31R2 &&
+                          args.value("RIESEL_LAZY", 0);
+  bool const goldPair = fft.shape.fft_type == FFT3161 &&
+                        args.value("GOLD_PAIR", 0);
+  bool const goodThomas3 =
+    (fft.shape.fft_type == FFT31R2 || fft.shape.fft_type == FFT323161) &&
+    args.value("GOOD_THOMAS3", 0);
+  bool const goodThomas7 = fft.shape.fft_type == FFT31R2 &&
+                           args.value("GOOD_THOMAS7", 0);
+  bool const goodThomas9 = fft.shape.fft_type == FFT3261 &&
+                           args.value("GOOD_THOMAS9", 0);
+  bool const m19Field = fft.shape.fft_type == FFT31R2 &&
+                        (goodThomas3 || goodThomas7) &&
+                        args.value("M19_FIELD", 0);
+  defines += toDefine("RIESEL_PAIR", (int)rieselPair);
+  defines += toDefine("RIESEL_FOUR", (int)rieselFour);
+  defines += toDefine("RIESEL_LAZY", (int)rieselLazy);
+  defines += toDefine("GOLD_PAIR", (int)goldPair);
+  defines += toDefine("GOOD_THOMAS3", (int)goodThomas3);
+  defines += toDefine("GOOD_THOMAS7", (int)goodThomas7);
+  defines += toDefine("GOOD_THOMAS9", (int)goodThomas9);
+  defines += toDefine("M19_FIELD", (int)m19Field);
   defines += toDefine("MAXBPW", (u32)(fft.maxBpw() * 100.0f));
 
   if (fft.FFT_FP64 || fft.FFT_FP32) {
@@ -392,7 +599,73 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
     defines += toDefine("TAILTGF31", root1GF31(fft.shape.height * 2, 1));
   }
   if (fft.NTT_GF61) {
-    defines += toDefine("TAILTGF61", root1GF61(fft.shape.height * 2, 1));
+    defines += toDefine("TAILTGF61", goldPair ?
+                        root1GoldPair(fft.shape.height * 2, 1) :
+                        (rieselPair ?
+                         root1Riesel(fft.shape.height * 2, 1, rieselLazy) :
+                         root1GF61(fft.shape.height * 2, 1)));
+  }
+  if (goldPair) {
+    u32 const deltaOne = step(N, E);
+    u32 const deltaX = u32(u64(deltaOne) *
+      (2u * (fft.shape.width / fft.shape.nW()) *
+       fft.shape.height * fft.shape.middle) % N);
+    u64 const inverseNd = goldHostPower(N / 2, GOLD_HOST_Q - 2);
+    assert(goldHostPower(GOLD_HOST_THETA, N) == 2);
+    defines += toDefine("GOLD_DELTA_ONE", deltaOne);
+    defines += toDefine("GOLD_DELTA_X", deltaX);
+    defines += toDefine("GOLD_FWD_ONE", goldWeightPower(deltaOne, false));
+    defines += toDefine("GOLD_INV_ONE", goldWeightPower(deltaOne, true));
+    defines += toDefine("GOLD_FWD_X", goldWeightPower(deltaX, false));
+    defines += toDefine("GOLD_INV_X", goldWeightPower(deltaX, true));
+    defines += toDefine("GOLD_INV_ND", inverseNd);
+  }
+  if (fft.shape.fft_type == FFT31R2) {
+    auto qValues = rieselQ(rieselLazy);
+    if (m19Field) qValues[1] = M19_Q;
+    u32 const deltaOne = step(N, E);
+    u32 const deltaX = u32(u64(step(N, E)) * (2u * (fft.shape.width / fft.shape.nW()) *
+                                               fft.shape.height * fft.shape.middle) % N);
+    // The unnormalised inverse radix-3 leaves a factor of three for the joint
+    // CRT to divide exactly.  Each field therefore removes only the 2B scale
+    // of its packed B-word power-of-two DGT here.
+    u64 const scale = u64(2) * (goodThomas3 ? N / 3 : N);
+    u64 const scaleInverse0 = powMod32(u32(scale % qValues[0]), qValues[0] - 2, qValues[0]);
+    u64 const scaleInverse1 = powMod32(u32(scale % qValues[1]), qValues[1] - 2, qValues[1]);
+    ulong2 tail = root1Riesel(fft.shape.height * 2, 1, rieselLazy);
+    if (m19Field) {
+      uint2 const tail19 = root1M19(fft.shape.height * 2, 1);
+      tail.first = (tail.first & 0xffffffffULL) | (u64(tail19.first) << 32);
+      tail.second = (tail.second & 0xffffffffULL) | (u64(tail19.second) << 32);
+    }
+    auto lane = [](u64 packed, u32 index) { return u32(packed >> (32 * index)); };
+    u64 const fwdOne = rieselFieldPower(deltaOne, false, rieselLazy, m19Field);
+    u64 const invOne = rieselFieldPower(deltaOne, true, rieselLazy, m19Field);
+    u64 const fwdX = rieselFieldPower(deltaX, false, rieselLazy, m19Field);
+    u64 const invX = rieselFieldPower(deltaX, true, rieselLazy, m19Field);
+    u64 const montOne = rieselFieldPower(0, false, rieselLazy, m19Field);
+    u64 const invScale = (rieselFieldScalar(scaleInverse0, rieselLazy, m19Field) & 0xffffffffULL) |
+                         (rieselFieldScalar(scaleInverse1, rieselLazy, m19Field) & 0xffffffff00000000ULL);
+    defines += toDefine("RIESEL_DELTA_ONE", deltaOne);
+    defines += toDefine("RIESEL_DELTA_X", deltaX);
+    defines += toDefine("RIESEL_WEIGHT_STRIDE", 2u * (fft.shape.width + fft.shape.height * fft.shape.middle));
+    defines += toDefine("RIESEL_FWD_ONE", fwdOne);
+    defines += toDefine("RIESEL_INV_ONE", invOne);
+    defines += toDefine("RIESEL_FWD_X", fwdX);
+    defines += toDefine("RIESEL_INV_X", invX);
+    defines += toDefine("RIESEL_MONT_ONE", montOne);
+    defines += toDefine("RIESEL_INV_SCALE", invScale);
+    for (u32 i = 0; i != 2; ++i) {
+      string const prefix = "RIESEL" + to_string(i) + '_';
+      defines += toDefine(prefix + "FWD_ONE", lane(fwdOne, i));
+      defines += toDefine(prefix + "INV_ONE", lane(invOne, i));
+      defines += toDefine(prefix + "FWD_X", lane(fwdX, i));
+      defines += toDefine(prefix + "INV_X", lane(invX, i));
+      defines += toDefine(prefix + "MONT_ONE", lane(montOne, i));
+      defines += toDefine(prefix + "INV_SCALE", lane(invScale, i));
+    }
+    defines += toDefine("TAILTR0", uint2{lane(tail.first, 0), lane(tail.second, 0)});
+    defines += toDefine("TAILTR1", uint2{lane(tail.first, 1), lane(tail.second, 1)});
   }
 
   // Send the FFT/NTT type and booleans that enable/disable code for each possible FP and NTT
@@ -401,7 +674,37 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
 
   // When using multiple NTT primes or hybrid FFT/NTT, each FFT/NTT prime's data buffer and trig values are combined into one buffer.
   // The openCL code needs to know the offset to the data and trig values.  Distances are in "number of double2 values".
-  if (fft.FFT_FP64 && fft.NTT_GF31) {
+  if (fft.NTT_RIESEL) {
+    u32 const data31Plane = GF31_DATA_SIZE(fft.shape.width, fft.shape.middle, fft.shape.height, in_place, pad_size) / 2;
+    u32 const data61Plane = fft.NTT_GF61 ?
+      GF61_DATA_SIZE(fft.shape.width, fft.shape.middle, fft.shape.height, in_place, pad_size) / 2 : 0;
+    u32 const w31Plane = SMALLTRIG_GF31_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH());
+    u32 const w61Plane = fft.NTT_GF61 ?
+      SMALLTRIG_GF61_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()) : 0;
+    u32 const m31Plane = MIDDLETRIG_GF31_DIST(fft.shape.width, fft.shape.middle, fft.shape.height);
+    u32 const m61Plane = fft.NTT_GF61 ?
+      MIDDLETRIG_GF61_DIST(fft.shape.width, fft.shape.middle, fft.shape.height) : 0;
+    u32 const h31Plane = SMALLTRIGCOMBO_GF31_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH());
+    u32 const h61Plane = fft.NTT_GF61 ?
+      SMALLTRIGCOMBO_GF61_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()) : 0;
+    defines += toDefine("DISTGF31", 0);
+    defines += toDefine("DISTWTRIGGF31", 0);
+    defines += toDefine("DISTMTRIGGF31", 0);
+    defines += toDefine("DISTHTRIGGF31", 0);
+    defines += toDefine("DISTGF61", data31Plane);
+    defines += toDefine("DISTWTRIGGF61", w31Plane);
+    defines += toDefine("DISTMTRIGGF61", m31Plane);
+    defines += toDefine("DISTHTRIGGF61", h31Plane);
+    defines += toDefine("DISTR0", data31Plane + data61Plane);
+    defines += toDefine("DISTR1", 2 * data31Plane + data61Plane);
+    defines += toDefine("DISTWTR0", w31Plane + w61Plane);
+    defines += toDefine("DISTWTR1", 2 * w31Plane + w61Plane);
+    defines += toDefine("DISTMTR0", m31Plane + m61Plane);
+    defines += toDefine("DISTMTR1", 2 * m31Plane + m61Plane);
+    defines += toDefine("DISTHTR0", h31Plane + h61Plane);
+    defines += toDefine("DISTHTR1", 2 * h31Plane + h61Plane);
+  }
+  else if (fft.FFT_FP64 && fft.NTT_GF31) {
     // GF31 data is located after the FP64 data.  Compute size of the FP64 data and trigs.
     defines += toDefine("DISTGF31",      FP64_DATA_SIZE(fft.shape.width, fft.shape.middle, fft.shape.height, in_place, pad_size) / 2);
     defines += toDefine("DISTWTRIGGF31", SMALLTRIG_FP64_DIST(fft.shape.width, fft.shape.middle, fft.shape.height, fft.shape.nH()));
@@ -570,6 +873,60 @@ string formatSecsPerIter(float secsPerIter) {
 // --------
 
 unique_ptr<Gpu> Gpu::make(u64 E, GpuCommon shared, FFTConfig fftConfig, const vector<KeyVal>& extraConf, bool logFftSize) {
+  bool const lazyRiesel = fftConfig.NTT_RIESEL &&
+                          shared.args->value("RIESEL_LAZY", 0);
+  bool const goodThomas3 = shared.args->value("GOOD_THOMAS3", 0);
+  bool const goodThomas7 = shared.args->value("GOOD_THOMAS7", 0);
+  bool const goodThomas9 = shared.args->value("GOOD_THOMAS9", 0);
+  bool const m19Field = shared.args->value("M19_FIELD", 0);
+  if (goodThomas3 &&
+      ((fftConfig.shape.fft_type != FFT31R2 &&
+        fftConfig.shape.fft_type != FFT323161) ||
+       (fftConfig.shape.middle != 3 && fftConfig.shape.middle != 6) ||
+       fftConfig.shape.size() != 3u * 1024u * 1024u)) {
+    throw "GOOD_THOMAS3 requires FFT31R2 or FFT323161 at a 3M middle-3/6 geometry";
+  }
+  if (goodThomas7 &&
+      (fftConfig.shape.fft_type != FFT31R2 ||
+       fftConfig.shape.middle != 7 ||
+       fftConfig.shape.size() != 7u * 512u * 1024u)) {
+    throw "GOOD_THOMAS7 requires FFT31R2 at a 3.5M middle-7 geometry";
+  }
+  if (goodThomas9 &&
+      (fftConfig.shape.fft_type != FFT3261 ||
+       fftConfig.shape.middle != 9 ||
+       fftConfig.shape.size() != 9u * 512u * 1024u)) {
+    throw "GOOD_THOMAS9 requires FFT3261 at a 4.5M middle-9 geometry";
+  }
+  if ((int(goodThomas3) + int(goodThomas7) + int(goodThomas9)) > 1) {
+    throw "Good-Thomas experimental modes are mutually exclusive";
+  }
+  if ((goodThomas3 || goodThomas7) && lazyRiesel) {
+    throw "Good-Thomas modes require an admissible ordinary field, not RIESEL_LAZY";
+  }
+  if (m19Field && (!(goodThomas3 || goodThomas7) ||
+                   fftConfig.shape.fft_type != FFT31R2)) {
+    throw "M19_FIELD requires FFT31R2 with a Good-Thomas mode";
+  }
+  if (lazyRiesel && (shared.args->value("RIESEL_PACKED", 0) ||
+                     shared.args->value("RIESEL_FOUR", 0) ||
+                     shared.args->value("RIESEL_FUSED", 0))) {
+    throw "RIESEL_LAZY currently requires independent q fields and split carry";
+  }
+  // Experimental M31R2 representation: keep q0/q1 as independent residues,
+  // but vectorize them into the low/high halves of each 64-bit storage word.
+  // This is a two-stream M31 + (q0,q1) architecture, not M61 arithmetic.
+  if (fftConfig.NTT_RIESEL && shared.args->value("RIESEL_PACKED", 0)) {
+    fftConfig.NTT_RIESEL = false;
+    fftConfig.NTT_GF61 = true;
+  }
+  // Four independent fields: retain the M31 and q0/q1 planes and add the
+  // production M61 plane.  This is intentionally opt-in until the 154-bit
+  // carry and checkpoint representation are complete.
+  if (fftConfig.NTT_RIESEL &&
+      (shared.args->value("RIESEL_FOUR", 0) || goodThomas3 || goodThomas7)) {
+    fftConfig.NTT_GF61 = true;
+  }
   return make_unique<Gpu>(shared, fftConfig, E, extraConf, logFftSize);
 }
 
@@ -602,6 +959,10 @@ string Gpu::numCudaRegisters([[maybe_unused]] enum WHICH_KERNEL which_kernel) {
     case FFT3161:
       regs = nW == 8 ? 96 : 64;         // Tested on 4090, nW=8, CUDA 13.0 (88 regs is possible without spilling but is slower)
       use_override = "REGCF3161";
+      break;
+    case FFT31R2:
+      regs = nW == 8 ? 128 : 80;
+      use_override = "REGCF31R2";
       break;
     case FFT3261:
       regs = nW == 8 ? 96 : 64;
@@ -773,6 +1134,164 @@ ROE_SIZE = 100000,
 CARRY_SIZE = 100000
 };
 
+// A deliberately small, independently scheduled M31 cyclic square for the
+// folded error syndrome.  The input is already full-transform weighted, so its
+// first width edge does not apply Crandall--Fagin weights again.
+class FoldTransform {
+  u32 factor;
+  u32 sideN;
+  u32 hn;
+  FFTConfig fft;
+  u32 width;
+  u32 middle;
+  u32 height;
+  u32 bigHeight;
+  u32 nw;
+  u32 nh;
+  bool tailSingleWide{};
+  bool tailSingleKernel{};
+  u32 inPlace{};
+  u32 padSize{};
+  u32 wmul{};
+  Queue queue;
+  KernelCompiler compiler;
+  Kernel kCompact;
+  Kernel kP;
+  Kernel kMidIn;
+  Kernel kTail;
+  Kernel kMidOut;
+  Kernel kW;
+  TrigPtr trigH;
+  TrigPtr trigM;
+  TrigPtr trigW;
+  Buffer<u32> compact;
+  Buffer<double> data;
+  EventHolder inputRead;
+  bool pending{};
+
+  static u32 foldFactor(Args* args) {
+    u32 const factor = args->value("FOLD_FACTOR", 8);
+    if (factor != 8 && factor != 16) {
+      throw runtime_error("FOLD_FACTOR must be 8 or 16");
+    }
+    return factor;
+  }
+
+  static vector<KeyVal> config(u32 factor) {
+    return {{"INPLACE", "1"}, {"PAD", "0"}, {"TAIL_KERNELS", "2"},
+            {"MULTI_Q", "0"}, {"GRAPHS", "0"},
+            {"PARITY_CORRECT", "0"}, {"PARITY_PREPARED", "0"},
+            {"PARITY_PACKED", "0"}, {"PARITY_LAZY", "0"}, {"FOLD_SYNDROME", "0"},
+            {"FOLD_TRANSFORM", "1"}, {"FOLD_FACTOR", to_string(factor)}};
+  }
+
+  static string fftSpec(Args* args) {
+    if (foldFactor(args) == 16) {
+      if (args->value("FOLD_SHAPE", 0) != 0) {
+        throw runtime_error("FOLD_FACTOR=16 currently requires FOLD_SHAPE=0");
+      }
+      return "52:256:2:256:202";
+    }
+    switch (args->value("FOLD_SHAPE", 0)) {
+    case 0: return "52:256:4:256:202";
+    case 1: return "52:256:2:512:202";
+    case 2: return "52:512:2:256:202";
+    default: throw runtime_error("FOLD_SHAPE must be 0, 1, or 2");
+    }
+  }
+
+public:
+  FoldTransform(GpuCommon shared, Profile& profile, u32 mainN) :
+    factor{foldFactor(shared.args)},
+    sideN{mainN / factor},
+    hn{sideN / 2},
+    fft{fftSpec(shared.args)},
+    width{fft.shape.width},
+    middle{fft.shape.middle},
+    height{fft.shape.height},
+    bigHeight{middle * height},
+    nw{fft.shape.nW()},
+    nh{fft.shape.nH()},
+    queue{*shared.context, shared.args->profile, true},
+    compiler{*shared.args, shared.context,
+             clDefines(*shared.args, shared.context->deviceId(), fft, config(factor),
+                       u64(sideN) * 4, false, tailSingleWide,
+                       tailSingleKernel, inPlace, padSize, wmul)},
+    kCompact{"foldCompact", &compiler, profile.make("foldCompact"), &queue,
+       "foldp.cl", "foldCompact", hn,
+       "-DFFT_FP64=0 -DFFT_FP32=0 -DNTT_GF31=1 -DNTT_GF61=0 "},
+    kP{"foldP", &compiler, profile.make("foldP"), &queue,
+       "foldp.cl", "foldP", hn / nw,
+       "-DFFT_FP64=0 -DFFT_FP32=0 -DNTT_GF31=1 -DNTT_GF61=0 "},
+    kMidIn{"foldMidIn", &compiler, profile.make("foldMidIn"), &queue,
+       "fftmiddlein.cl", "fftMiddleInGF31", hn / (bigHeight / height),
+       "-DFFT_FP64=0 -DFFT_FP32=0 -DNTT_GF31=1 -DNTT_GF61=0 --maxrregcount=32 "},
+    kTail{"foldTail", &compiler, profile.make("foldTail"), &queue,
+       "tailsquare.cl", "tailSquareGF31", hn / nh,
+       "-DFFT_FP64=0 -DFFT_FP32=0 -DNTT_GF31=1 -DNTT_GF61=0 --maxrregcount=48 "},
+    kMidOut{"foldMidOut", &compiler, profile.make("foldMidOut"), &queue,
+       "fftmiddleout.cl", "fftMiddleOutGF31", hn / (bigHeight / height),
+       "-DFFT_FP64=0 -DFFT_FP32=0 -DNTT_GF31=1 -DNTT_GF61=0 "},
+    kW{"foldW", &compiler, profile.make("foldW"), &queue,
+       "fftw.cl", "fftWGF31", hn / nw,
+       "-DFFT_FP64=0 -DFFT_FP32=0 -DNTT_GF31=1 -DNTT_GF61=0 "},
+    trigH{shared.bufCache->smallTrigCombo(shared.args, fft, width, middle,
+                                          height, nh, tailSingleWide)},
+    trigM{shared.bufCache->middleTrig(shared.args, fft, height, middle, width)},
+    trigW{shared.bufCache->smallTrig(shared.args, fft, width, nw, middle,
+                                     height, nh, tailSingleWide)},
+    compact{profile.make("foldCompactData"), &queue, factor == 16 ? sideN : 1},
+    data{profile.make("foldData"), &queue,
+         TOTAL_DATA_SIZE(fft, width, middle, height, inPlace, padSize)}
+  {
+#if CUDA_BACKEND
+    // The main M61 path owns the critical integer pipeline.  Let the compact
+    // sidecar fill gaps at low priority; only its short input edge is a hard
+    // dependency, and protectInput() enforces that boundary explicitly.
+    queue.setCudaPriority(-1);
+#endif
+    kP.setFixedArgs(2, trigW);
+    kMidIn.setFixedArgs(3, trigM);
+    kTail.setFixedArgs(3, trigH);
+    kMidOut.setFixedArgs(3, trigM);
+    kW.setFixedArgs(2, trigW);
+  }
+
+  void wait(Queue& main) {
+    if (!pending) return;
+    EventHolder done = queue.createSyncEvent();
+    main.waitForSyncEvent(&done);
+    pending = false;
+  }
+
+  // Carry may overwrite the compact input as soon as foldP has consumed it;
+  // it need not wait for the middle, square, and inverse edge.  The side queue
+  // remains in order, so its private data buffer can safely pipeline iterations.
+  void protectInput(Queue& main) {
+    if (inputRead) main.waitForSyncEvent(&inputRead);
+  }
+
+  void launch(Queue& main, Buffer<u32>& input) {
+    EventHolder ready = main.createSyncEvent();
+    queue.waitForSyncEvent(&ready);
+    if (factor == 16) {
+      kCompact(compact, input);
+      inputRead = queue.createSyncEvent();
+      kP(data, compact);
+    } else {
+      kP(data, input);
+      inputRead = queue.createSyncEvent();
+    }
+    kMidIn(data, data, 0);
+    kTail(data, data, 0);
+    kMidOut(data, data, 0);
+    kW(data, data);
+    pending = true;
+  }
+
+  Buffer<double>& output() { return data; }
+};
+
 Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, bool logFftSize) :
   shared(s),
   background{shared.background},
@@ -786,7 +1305,19 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   hN(N / 2),
   nW(fft.shape.nW()),
   nH(fft.shape.nH()),
+  carryLen{carryLength(args, fft)},
   useLongCarry{args.carry == CARRY_64},
+  useMiddleCarry{args.value("MIDCARRY_FUSED", 0) == 1},
+  useSplitCarry{args.value("MIDCARRY_FUSED", 0) == 2},
+  parityCorrect{args.value("PARITY_CORRECT", 0) &&
+                (fft.shape.fft_type == FFT3261 || fft.shape.fft_type == FFT323161)},
+  parityPrepared{args.value("PARITY_PREPARED", 0) == 1 && parityCorrect},
+  parityDirect{args.value("PARITY_PREPARED", 0) == 2 && parityCorrect},
+  parityPhysical{args.value("PARITY_PREPARED", 0) == 3 && parityCorrect},
+  parityPacked{args.value("PARITY_PACKED", 0) != 0 && parityCorrect},
+  foldSyndrome{args.value("FOLD_SYNDROME", 0) != 0},
+  foldValidate{args.value("FOLD_SYNDROME", 0) > 1},
+  foldTransformEnabled{args.value("FOLD_TRANSFORM", 0) != 0},
   queue{*shared.context, args.profile},
       
   compiler{args, shared.context, clDefines(args, shared.context->deviceId(), fft, extraConf, E, logFftSize, tail_single_wide, tail_single_kernel, in_place, pad_size, wmul)},
@@ -819,6 +1350,36 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   K(kfftMidOutGF31,        "fftmiddleout.cl", "fftMiddleOutGF31", hN / (BIG_H / SMALL_H), kernelDefines(K31) + numCudaRegisters(MIDOUT31)),
   K(kfftWGF31,             "fftw.cl", "fftWGF31", hN / nW, kernelDefines(K31)),
 
+  K(kfftMidInR0,           "fftmiddlein.cl", "fftMiddleInGF31", hN / (BIG_H / SMALL_H), kernelDefines(K31) + "-DRIESEL_FIELD=1 " + numCudaRegisters(MIDIN31)),
+  K(kfftHinR0,             "ffthin.cl", "fftHinGF31", hN / nH, kernelDefines(K31) + "-DRIESEL_FIELD=1 "),
+  K(ktailSquareZeroR0,     "tailsquare.cl", "tailSquareZeroGF31", SMALL_H / nH * 2, kernelDefines(K31) + "-DRIESEL_FIELD=1 "),
+  K(ktailSquareR0,         "tailsquare.cl", "tailSquareGF31",
+                                               !tail_single_wide && !tail_single_kernel ? hN / nH - SMALL_H / nH * 2 :
+                                               !tail_single_wide ? hN / nH :
+                                               !tail_single_kernel ? hN / nH / 2 - SMALL_H / nH :
+                                               hN / nH / 2, kernelDefines(K31) + "-DRIESEL_FIELD=1 " + numCudaRegisters(TAIL31)),
+  K(ktailMulR0,            "tailmul.cl", "tailMulGF31", hN / nH / 2, kernelDefines(K31) + "-DRIESEL_FIELD=1 "),
+  K(ktailMulLowR0,         "tailmul.cl", "tailMulGF31", hN / nH / 2, kernelDefines(K31) + "-DRIESEL_FIELD=1 -DMUL_LOW=1 "),
+  K(kfftMidOutR0,          "fftmiddleout.cl", "fftMiddleOutGF31", hN / (BIG_H / SMALL_H), kernelDefines(K31) + "-DRIESEL_FIELD=1 " + numCudaRegisters(MIDOUT31)),
+  K(kfftWR0,               "fftw.cl", "fftWGF31", hN / nW, kernelDefines(K31) + "-DRIESEL_FIELD=1 "),
+  K(kfftPR0,               "fftp.cl", "fftP", hN / nW, kernelDefines(K31) + "-DRIESEL_FIELD=1 "),
+
+  K(kfftMidInR1,           "fftmiddlein.cl", "fftMiddleInGF31", hN / (BIG_H / SMALL_H), kernelDefines(K31) + "-DRIESEL_FIELD=2 " + numCudaRegisters(MIDIN31)),
+  K(kfftHinR1,             "ffthin.cl", "fftHinGF31", hN / nH, kernelDefines(K31) + "-DRIESEL_FIELD=2 "),
+  K(ktailSquareZeroR1,     "tailsquare.cl", "tailSquareZeroGF31", SMALL_H / nH * 2, kernelDefines(K31) + "-DRIESEL_FIELD=2 "),
+  K(ktailSquareR1,         "tailsquare.cl", "tailSquareGF31",
+                                               !tail_single_wide && !tail_single_kernel ? hN / nH - SMALL_H / nH * 2 :
+                                               !tail_single_wide ? hN / nH :
+                                               !tail_single_kernel ? hN / nH / 2 - SMALL_H / nH :
+                                               hN / nH / 2, kernelDefines(K31) + "-DRIESEL_FIELD=2 " + numCudaRegisters(TAIL31)),
+  K(ktailMulR1,            "tailmul.cl", "tailMulGF31", hN / nH / 2, kernelDefines(K31) + "-DRIESEL_FIELD=2 "),
+  K(ktailMulLowR1,         "tailmul.cl", "tailMulGF31", hN / nH / 2, kernelDefines(K31) + "-DRIESEL_FIELD=2 -DMUL_LOW=1 "),
+  K(kfftMidOutR1,          "fftmiddleout.cl", "fftMiddleOutGF31", hN / (BIG_H / SMALL_H), kernelDefines(K31) + "-DRIESEL_FIELD=2 " + numCudaRegisters(MIDOUT31)),
+  K(kfftWR1,               "fftw.cl", "fftWGF31", hN / nW, kernelDefines(K31) + "-DRIESEL_FIELD=2 "),
+  K(kfftPR1,               "fftp.cl", "fftP", hN / nW, kernelDefines(K31) + "-DRIESEL_FIELD=2 "),
+  K(kfftP31R2,             "fftp.cl", "fftP", hN / nW, kernelDefines(K31)),
+  K(kfftPRPair,            "fftp.cl", "fftP", hN / nW, kernelDefines(K61)),
+
   K(kfftMidInGF61,         "fftmiddlein.cl",  "fftMiddleInGF61",  hN / (BIG_H / SMALL_H), kernelDefines(K61) + numCudaRegisters(MIDIN61)),
   K(kfftHinGF61,           "ffthin.cl",  "fftHinGF61",  hN / nH, kernelDefines(K61)),
   K(ktailSquareZeroGF61,   "tailsquare.cl", "tailSquareZeroGF61", SMALL_H / nH * 2, kernelDefines(K61)),
@@ -833,24 +1394,35 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   K(kfftWGF61,             "fftw.cl", "fftWGF61", hN / nW, kernelDefines(K61)),
 
   K(kfftP,                 "fftp.cl", "fftP", hN / nW, kernelDefines(KALL)),
-  K(kCarryA,               "carry.cl", "carry", hN / CARRY_LEN, kernelDefines(KALL)),
-  K(kCarryAROE,            "carry.cl", "carry", hN / CARRY_LEN, kernelDefines(KALL) + "-DROE=1"),
-  K(kCarryM,               "carry.cl", "carry", hN / CARRY_LEN, kernelDefines(KALL) + "-DMUL3=1"),
-  K(kCarryMROE,            "carry.cl", "carry", hN / CARRY_LEN, kernelDefines(KALL) + "-DMUL3=1 -DROE=1"),
-  K(kCarryLL,              "carry.cl", "carry", hN / CARRY_LEN, kernelDefines(KALL) + "-DLL=1"),
-  K(kCarryFused,           "carryfused.cl", "carryFused", WIDTH * (BIG_H + wmul) / nW, kernelDefines(KALL) + numCudaRegisters(CARRYFUSED)),
-  K(kCarryFusedROE,        "carryfused.cl", "carryFused", WIDTH * (BIG_H + wmul) / nW, kernelDefines(KALL) + numCudaRegisters(CARRYFUSED) + "-DROE=1"),
+  K(kCarryA,               "carry.cl", "carry", hN / carryLen, kernelDefines(KALL)),
+  K(kCarryAROE,            "carry.cl", "carry", hN / carryLen, kernelDefines(KALL) + "-DROE=1"),
+  K(kCarryAParity,         "carry.cl", "carry", hN / carryLen, kernelDefines(KALL) + "-DPARITY_SQUARE=1 " + (parityPrepared || parityDirect || parityPacked ? "-DPARITY_PREPARED=1 " : "") + (parityDirect ? "-DPARITY_DIRECT=1 " : "") + (parityPhysical ? "-DPARITY_PHYSICAL=1 " : "") + (parityPacked ? "-DPARITY_PACKED=1 " : "")),
+  K(kCarryAROEParity,      "carry.cl", "carry", hN / carryLen, kernelDefines(KALL) + "-DPARITY_SQUARE=1 -DROE=1 " + (parityPrepared || parityDirect || parityPacked ? "-DPARITY_PREPARED=1 " : "") + (parityDirect ? "-DPARITY_DIRECT=1 " : "") + (parityPhysical ? "-DPARITY_PHYSICAL=1 " : "") + (parityPacked ? "-DPARITY_PACKED=1 " : "")),
+  K(kCarryM,               "carry.cl", "carry", hN / carryLen, kernelDefines(KALL) + "-DMUL3=1"),
+  K(kCarryMROE,            "carry.cl", "carry", hN / carryLen, kernelDefines(KALL) + "-DMUL3=1 -DROE=1"),
+  K(kCarryLL,              "carry.cl", "carry", hN / carryLen, kernelDefines(KALL) + "-DLL=1"),
+  K(kCarryFused,           "carryfused.cl", "carryFused", WIDTH * (BIG_H + wmul) / nW, kernelDefines(KALL) + numCudaRegisters(CARRYFUSED) + (parityCorrect ? "-DPARITY_SQUARE=1 " : "") + (parityPrepared || parityDirect || parityPacked ? "-DPARITY_PREPARED=1 " : "") + (parityDirect ? "-DPARITY_DIRECT=1 " : "") + (parityPhysical ? "-DPARITY_PHYSICAL=1 " : "") + (parityPacked ? "-DPARITY_PACKED=1 " : "") + (foldValidate ? "-DFOLD_SYNDROME_VALIDATE=1 " : "")),
+  K(kCarryFusedROE,        "carryfused.cl", "carryFused", WIDTH * (BIG_H + wmul) / nW, kernelDefines(KALL) + numCudaRegisters(CARRYFUSED) + "-DROE=1 " + (parityCorrect ? "-DPARITY_SQUARE=1 " : "") + (parityPrepared || parityDirect || parityPacked ? "-DPARITY_PREPARED=1 " : "") + (parityDirect ? "-DPARITY_DIRECT=1 " : "") + (parityPhysical ? "-DPARITY_PHYSICAL=1 " : "") + (parityPacked ? "-DPARITY_PACKED=1 " : "") + (foldValidate ? "-DFOLD_SYNDROME_VALIDATE=1 " : "")),
   K(kCarryFusedMul,        "carryfused.cl", "carryFused", WIDTH * (BIG_H + wmul) / nW, kernelDefines(KALL) + numCudaRegisters(CARRYFUSED) + "-DMUL3=1"),
   K(kCarryFusedMulROE,     "carryfused.cl", "carryFused", WIDTH * (BIG_H + wmul) / nW, kernelDefines(KALL) + numCudaRegisters(CARRYFUSED) + "-DMUL3=1 -DROE=1"),
-  K(kCarryFusedLL,         "carryfused.cl", "carryFused", WIDTH * (BIG_H + wmul) / nW, kernelDefines(KALL) + numCudaRegisters(CARRYFUSED) + "-DLL=1"),
+  K(kCarryFusedLL,         "carryfused.cl", "carryFused", WIDTH * (BIG_H + wmul) / nW, kernelDefines(KALL) + numCudaRegisters(CARRYFUSED) + "-DLL=1 " + (parityCorrect ? "-DPARITY_SQUARE=1 " : "") + (parityPrepared || parityDirect || parityPacked ? "-DPARITY_PREPARED=1 " : "") + (parityDirect ? "-DPARITY_DIRECT=1 " : "") + (parityPhysical ? "-DPARITY_PHYSICAL=1 " : "") + (parityPacked ? "-DPARITY_PACKED=1 " : "") + (foldValidate ? "-DFOLD_SYNDROME_VALIDATE=1 " : "")),
+  K(kCarryMiddleOut,       "carrymiddle.cl", "carryMiddleOut", SMALL_H * 512, kernelDefines(KALL) + "-DLDSPAD_W=0", 8 * 512 * (8 + 16)),
+  K(kCarryMiddleOutROE,    "carrymiddle.cl", "carryMiddleOut", SMALL_H * 512, kernelDefines(KALL) + "-DLDSPAD_W=0 -DROE=1", 8 * 512 * (8 + 16)),
+  K(kCarryMiddleIn,        "carrymiddle.cl", "carryMiddleIn", SMALL_H * 512, kernelDefines(KALL) + "-DLDSPAD_W=0", 8 * 512 * (8 + 16)),
+  K(kCarrySplitOut,        "carrymiddle.cl", "carryMiddleOut", SMALL_H * 512, kernelDefines(KALL) + "-DLDSPAD_W=0 -DCM_SKIP_MIDDLE=1", 8 * 512 * (8 + 16)),
+  K(kCarrySplitOutROE,     "carrymiddle.cl", "carryMiddleOut", SMALL_H * 512, kernelDefines(KALL) + "-DLDSPAD_W=0 -DCM_SKIP_MIDDLE=1 -DROE=1", 8 * 512 * (8 + 16)),
+  K(kCarrySplitIn,         "carrymiddle.cl", "carryMiddleIn", SMALL_H * 512, kernelDefines(KALL) + "-DLDSPAD_W=0 -DCM_SKIP_MIDDLE=1", 8 * 512 * (8 + 16)),
 
-  K(carryB,                "carryb.cl", "carryB",   hN / CARRY_LEN, kernelDefines(KALL)),
+  K(carryB,                "carryb.cl", "carryB",   hN / carryLen, kernelDefines(KALL)),
 
   // 64
   K(transpIn,  "transpose.cl", "transposeIn",  hN / 64),
   K(transpOut, "transpose.cl", "transposeOut", hN / 64),
 
   K(readResidue, "etc.cl", "readResidue", 32, "-DREADRESIDUE=1"),
+  K(parityInit, "etc.cl", "parityInit", hN, kernelDefines(KALL) + "-DPARITY_INIT=1 " + (parityPrepared || parityDirect || parityPacked ? "-DPARITY_PREPARED=1 " : "") + (parityDirect ? "-DPARITY_DIRECT=1 " : "") + (parityPhysical ? "-DPARITY_PHYSICAL=1 " : "") + (parityPacked ? "-DPARITY_PACKED=1 " : "")),
+  K(parityPrepare, "etc.cl", "parityPrepare", hN, kernelDefines(KALL) + "-DPARITY_PREPARE=1 " + (parityPrepared || parityPacked ? "-DPARITY_PREPARED=1 " : "") + (parityPacked ? "-DPARITY_PACKED=1 " : "")),
+  K(kFoldValidate, "foldsyndrome.cl", "foldValidate", N / 16, kernelDefines(KALL) + (foldValidate ? "-DFOLD_SYNDROME_VALIDATE=1 " : "")),
 
   // 256
   K(kernIsEqual, "etc.cl", "isEqual", 256 * 256, "-DISEQUAL=1"),
@@ -869,7 +1441,11 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   bufTrigM{shared.bufCache->middleTrig(shared.args, fft, SMALL_H, BIG_H / SMALL_H, WIDTH)},
   bufTrigW{shared.bufCache->smallTrig(shared.args, fft, WIDTH, nW, fft.shape.middle, SMALL_H, nH, tail_single_wide)},
 
-  weights{genWeights(fft, E, WIDTH, BIG_H, nW, isNvidiaGpu(shared.context->deviceId()))},
+  weights{genWeights(fft, E, WIDTH, BIG_H, nW,
+                     isNvidiaGpu(shared.context->deviceId()),
+                     args.value("RIESEL_LAZY", 0),
+                     args.value("GOLD_PAIR", 0),
+                     args.value("M19_FIELD", 0))},
   bufConstWeights{shared.context, std::move(weights.weightsConstIF)},
   bufWeights{shared.context,      std::move(weights.weightsIF)},
 
@@ -880,8 +1456,19 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   BUF(bufAux, N * fft.WordSize / sizeof(Word)),
   BUF(bufCheck, N * fft.WordSize / sizeof(Word)),
   // Every double-word (i.e. N/2) produces one carry. In addition we may have one extra group thus WIDTH more carries.
-  BUF(bufCarry, N / 2 + WIDTH),
+  // FFT31R2 fused carry uses a small private spill area for workgroup zero so
+  // it cannot overwrite line zero before the duplicate wraparound workgroup
+  // has read the original transform data.
+  BUF(bufCarry, N / 2 + WIDTH + (fft.NTT_RIESEL ? 2 * WIDTH * wmul : 0)),
   BUF(bufReady, (N / 2 + WIDTH) / 32), // Every wavefront (32 or 64 lanes) needs to signal "carry is ready"
+  BUF(bufParityA, parityCorrect ? (parityPacked ? hN / 16 : hN) : 1),
+  BUF(bufParityB, parityCorrect ? (parityPacked ? hN / 16 : hN) : 1),
+  BUF(bufParityExpected, parityPrepared || parityPacked ? (parityPacked ? hN / 32 : hN) : 1),
+  parityIn{&bufParityA},
+  parityOut{&bufParityB},
+  BUF(bufFolded, foldSyndrome ? N / 8 : 1),
+  BUF(bufFoldWords, foldValidate ? N : 1),
+  BUF(bufFoldMismatches, 1),
 
   BUF(bufSmallOut, 256),
   BUF(bufSumOut,     1),
@@ -919,9 +1506,75 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
     throw "FFT size too large";
   }
 
-  useLongCarry = useLongCarry || (bitsPerWord < 10.0);
+  // The independent field queues are currently substantially faster for M31R2.
+  // Keep the fused three-prime carry available for experiments without making
+  // its present performance cost the default.
+  useLongCarry = useLongCarry ||
+                 (fft.shape.fft_type == FFT31R2 && args.carry == CARRY_AUTO &&
+                  !args.value("RIESEL_FUSED", 0)) ||
+                 args.value("GOOD_THOMAS9", 0) ||
+                 (bitsPerWord < 10.0);
 
   if (useLongCarry) { log("Using long carry!\n"); }
+
+  if (foldSyndrome) {
+    if (fft.shape.fft_type != FFT3261 || WIDTH != 512 ||
+        fft.shape.middle != 8 || SMALL_H != 512 || !in_place ||
+        useLongCarry) {
+      throw std::runtime_error(
+        "FOLD_SYNDROME requires in-place FFT3261 512:8:512 and short carry");
+    }
+    log(foldValidate ? "Using folded M31 sidecar with standalone validation\n" :
+                       "Using folded M31 sidecar\n");
+  }
+  if (foldTransformEnabled && !foldSyndrome) {
+    throw std::runtime_error("FOLD_TRANSFORM requires FOLD_SYNDROME=1");
+  }
+  if (args.value("FOLD_FACTOR", 8) == 16 && (!foldTransformEnabled || !parityPacked)) {
+    throw std::runtime_error("FOLD_FACTOR=16 requires FOLD_TRANSFORM=1 and PARITY_PACKED=1");
+  }
+  if (args.value("FOLD_FACTOR", 8) == 16 && foldValidate) {
+    throw std::runtime_error("FOLD_SYNDROME=2 validation currently supports only FOLD_FACTOR=8");
+  }
+  if (args.value("PARITY_PREPARED", 0) && !parityCorrect) {
+    throw std::runtime_error("PARITY_PREPARED requires the FFT3261/FFT323161 PARITY_CORRECT path");
+  }
+  if (args.value("PARITY_PREPARED", 0) < 0 || args.value("PARITY_PREPARED", 0) > 3) {
+    throw std::runtime_error("PARITY_PREPARED must be 0, 1 (overlap), 2 (direct scatter), or 3 (physical natural)");
+  }
+  if (args.value("PARITY_PACKED", 0) && !parityCorrect) {
+    throw std::runtime_error("PARITY_PACKED requires the FFT3261/FFT323161 PARITY_CORRECT path");
+  }
+  if (args.value("PARITY_PACKED", 0) && args.value("PARITY_PREPARED", 0)) {
+    throw std::runtime_error("PARITY_PACKED is a separate prepared-parity mode; PARITY_PREPARED must be 0");
+  }
+#if !CUDA_BACKEND
+  if (parityPacked) {
+    throw std::runtime_error("PARITY_PACKED currently requires the CUDA backend");
+  }
+#endif
+  if (args.value("PARITY_LAZY", 0) &&
+      (fft.shape.fft_type != FFT3261 || (!parityPrepared && !parityDirect && !parityPhysical))) {
+    throw std::runtime_error("PARITY_LAZY requires FFT3261 and PARITY_PREPARED=1, 2, or 3");
+  }
+
+  int const middleCarryMode = args.value("MIDCARRY_FUSED", 0);
+  if (middleCarryMode < 0 || middleCarryMode > 2) {
+    throw std::runtime_error("MIDCARRY_FUSED must be 0, 1 (middle fusion), or 2 (split-carry diagnostic)");
+  }
+  if (useMiddleCarry || useSplitCarry) {
+#if !CUDA_BACKEND
+    throw std::runtime_error("MIDCARRY_FUSED is CUDA-only");
+#endif
+    if (fft.shape.fft_type != FFT3161 || WIDTH != 512 ||
+        fft.shape.middle != 8 || SMALL_H != 512 || !in_place ||
+        useLongCarry || parityCorrect) {
+      throw std::runtime_error(
+        "MIDCARRY_FUSED requires in-place FFT3161 512:8:512, short carry, and no parity mode");
+    }
+    log(useMiddleCarry ? "Using two-phase middle/carry fusion\n" :
+                         "Using two-phase split-carry diagnostic\n");
+  }
 
   if (fft.FFT_FP64 || fft.FFT_FP32) {
     kfftMidIn.setFixedArgs(3, bufTrigM);
@@ -956,27 +1609,86 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
     kfftWGF61.setFixedArgs(2, bufTrigW);
   }
 
-  if (fft.FFT_FP64 || fft.FFT_FP32) {                         // The FP versions take bufWeight arguments
-    kfftP.setFixedArgs(2, bufTrigW, bufWeights);
-    for (Kernel* k : {&kCarryA, &kCarryAROE, &kCarryM, &kCarryMROE, &kCarryLL}) { k->setFixedArgs(3, bufCarry, bufWeights); }
+  if (fft.NTT_RIESEL) {
+    for (Kernel* k : {&kfftMidInR0, &kfftMidInR1}) k->setFixedArgs(3, bufTrigM);
+    for (Kernel* k : {&kfftHinR0, &kfftHinR1}) k->setFixedArgs(3, bufTrigH);
+    for (Kernel* k : {&ktailSquareZeroR0, &ktailSquareZeroR1}) k->setFixedArgs(2, bufTrigH);
+    for (Kernel* k : {&ktailSquareR0, &ktailSquareR1}) k->setFixedArgs(3, bufTrigH);
+    for (Kernel* k : {&ktailMulLowR0, &ktailMulLowR1, &ktailMulR0, &ktailMulR1}) k->setFixedArgs(4, bufTrigH);
+    for (Kernel* k : {&kfftMidOutR0, &kfftMidOutR1}) k->setFixedArgs(3, bufTrigM);
+    for (Kernel* k : {&kfftWR0, &kfftWR1}) k->setFixedArgs(2, bufTrigW);
+    kfftPR0.setFixedArgs(2, bufTrigW, bufWeights);
+    kfftPR1.setFixedArgs(2, bufTrigW, bufWeights);
+  }
+
+  if (fft.shape.fft_type == FFT31R2) {
+    // M31's premultiplication is independent of the Riesel transform stream(s).
+    kfftP.setFixedArgs(2, bufTrigW);
+    kfftP31R2.setFixedArgs(2, bufTrigW);
+    if (fft.NTT_RIESEL && fft.NTT_GF61) kfftPRPair.setFixedArgs(2, bufTrigW);
+    else kfftPRPair.setFixedArgs(2, bufTrigW, bufWeights);
+    for (Kernel* k : {&kCarryA, &kCarryAROE, &kCarryM, &kCarryMROE, &kCarryLL}) {
+      k->setFixedArgs(3, bufCarry, bufWeights);
+    }
     for (Kernel* k : {&kCarryA, &kCarryM, &kCarryLL}) { k->setFixedArgs(5, bufStatsCarry); }
     for (Kernel* k : {&kCarryAROE, &kCarryMROE})      { k->setFixedArgs(5, bufROE); }
+    for (Kernel* k : {&kCarryFused, &kCarryFusedROE, &kCarryFusedMul, &kCarryFusedMulROE, &kCarryFusedLL}) {
+      k->setFixedArgs(3, bufCarry, bufReady, bufTrigW, bufWeights);
+    }
+    for (Kernel* k : {&kCarryFusedROE, &kCarryFusedMulROE})           { k->setFixedArgs(7, bufROE); }
+    for (Kernel* k : {&kCarryFused, &kCarryFusedMul, &kCarryFusedLL}) { k->setFixedArgs(7, bufStatsCarry); }
+  } else if (fft.FFT_FP64 || fft.FFT_FP32) {                  // The FP versions take bufWeight arguments
+    kfftP.setFixedArgs(2, bufTrigW, bufWeights);
+    for (Kernel* k : {&kCarryA, &kCarryAROE, &kCarryM, &kCarryMROE, &kCarryLL}) { k->setFixedArgs(3, bufCarry, bufWeights); }
+    for (Kernel* k : {&kCarryAParity, &kCarryAROEParity}) { k->setFixedArgs(3, bufCarry, bufWeights); }
+    for (Kernel* k : {&kCarryA, &kCarryM, &kCarryLL}) { k->setFixedArgs(5, bufStatsCarry); }
+    for (Kernel* k : {&kCarryAROE, &kCarryMROE})      { k->setFixedArgs(5, bufROE); }
+    kCarryAParity.setFixedArgs(5, bufStatsCarry);
+    kCarryAROEParity.setFixedArgs(5, bufROE);
     for (Kernel* k : {&kCarryFused, &kCarryFusedROE, &kCarryFusedMul, &kCarryFusedMulROE, &kCarryFusedLL}) {
       k->setFixedArgs(3, bufCarry, bufReady, bufTrigW, bufConstWeights, bufWeights);
     }
     for (Kernel* k : {&kCarryFusedROE, &kCarryFusedMulROE})           { k->setFixedArgs(8, bufROE); }
     for (Kernel* k : {&kCarryFused, &kCarryFusedMul, &kCarryFusedLL}) { k->setFixedArgs(8, bufStatsCarry); }
   } else {
-    kfftP.setFixedArgs(2, bufTrigW);
-    for (Kernel* k : {&kCarryA, &kCarryAROE, &kCarryM, &kCarryMROE, &kCarryLL}) { k->setFixedArgs(3, bufCarry); }
-    for (Kernel* k : {&kCarryA, &kCarryM, &kCarryLL}) { k->setFixedArgs(4, bufStatsCarry); }
-    for (Kernel* k : {&kCarryAROE, &kCarryMROE})      { k->setFixedArgs(4, bufROE); }
-    for (Kernel* k : {&kCarryFused, &kCarryFusedROE, &kCarryFusedMul, &kCarryFusedMulROE, &kCarryFusedLL}) {
-      k->setFixedArgs(3, bufCarry, bufReady, bufTrigW);
+    bool const useGoldWeights = fft.shape.fft_type == FFT3161 &&
+                                args.value("GOLD_PAIR", 0);
+    if (useGoldWeights) kfftP.setFixedArgs(2, bufTrigW, bufWeights);
+    else kfftP.setFixedArgs(2, bufTrigW);
+    for (Kernel* k : {&kCarryA, &kCarryAROE, &kCarryM, &kCarryMROE, &kCarryLL}) {
+      if (useGoldWeights) k->setFixedArgs(3, bufCarry, bufWeights);
+      else k->setFixedArgs(3, bufCarry);
     }
-    for (Kernel* k : {&kCarryFusedROE, &kCarryFusedMulROE}) { k->setFixedArgs(6, bufROE); }
-    for (Kernel* k : {&kCarryFused, &kCarryFusedMul, &kCarryFusedLL}) { k->setFixedArgs(6, bufStatsCarry); }
+    for (Kernel* k : {&kCarryAParity, &kCarryAROEParity}) { k->setFixedArgs(3, bufCarry); }
+    u32 const carryStatsArg = useGoldWeights ? 5 : 4;
+    for (Kernel* k : {&kCarryA, &kCarryM, &kCarryLL}) { k->setFixedArgs(carryStatsArg, bufStatsCarry); }
+    for (Kernel* k : {&kCarryAROE, &kCarryMROE})      { k->setFixedArgs(carryStatsArg, bufROE); }
+    kCarryAParity.setFixedArgs(4, bufStatsCarry);
+    kCarryAROEParity.setFixedArgs(4, bufROE);
+    for (Kernel* k : {&kCarryFused, &kCarryFusedROE, &kCarryFusedMul, &kCarryFusedMulROE, &kCarryFusedLL}) {
+      if (useGoldWeights) k->setFixedArgs(3, bufCarry, bufReady, bufTrigW, bufWeights);
+      else k->setFixedArgs(3, bufCarry, bufReady, bufTrigW);
+    }
+    u32 const statsArg = useGoldWeights ? 7 : 6;
+    for (Kernel* k : {&kCarryFusedROE, &kCarryFusedMulROE}) { k->setFixedArgs(statsArg, bufROE); }
+    for (Kernel* k : {&kCarryFused, &kCarryFusedMul, &kCarryFusedLL}) { k->setFixedArgs(statsArg, bufStatsCarry); }
   }
+
+  if (foldSyndrome) {
+    // The folded sidecar follows the optional parity input/output arguments.
+    for (Kernel* k : {&kCarryFused, &kCarryFusedROE, &kCarryFusedLL}) {
+      u32 const foldArg = parityCorrect ? 11 : 9;
+      k->setFixedArgs(foldArg, bufFolded);
+      if (foldValidate) k->setFixedArgs(foldArg + 1, bufFoldWords);
+    }
+  }
+
+  kCarryMiddleOut.setFixedArgs(4, bufTrigM, bufTrigW, bufStatsCarry);
+  kCarryMiddleOutROE.setFixedArgs(4, bufTrigM, bufTrigW, bufROE);
+  kCarryMiddleIn.setFixedArgs(3, bufTrigM, bufTrigW);
+  kCarrySplitOut.setFixedArgs(4, bufTrigM, bufTrigW, bufStatsCarry);
+  kCarrySplitOutROE.setFixedArgs(4, bufTrigM, bufTrigW, bufROE);
+  kCarrySplitIn.setFixedArgs(3, bufTrigM, bufTrigW);
 
   carryB.setFixedArgs(1, bufCarry);
 
@@ -991,10 +1703,33 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
     selftestTrig();
   }
 
-  // Create aux queues.  For now, we only have one auxiliary queue.  We could do more.
+  // Three-plane Good-Thomas transforms can schedule one independent field per
+  // queue.  Other mixed transforms retain the historical two-queue setup.
   if (args.value("MULTI_Q", 0)) {
     auxQueues.push_back(Queue{*shared.context, args.profile, true});
+    if (fft.NTT_RIESEL ||
+        (args.value("GOOD_THOMAS3", 0) && fft.shape.fft_type == FFT323161))
+      auxQueues.push_back(Queue{*shared.context, args.profile, true});
   }
+  if (parityPrepared || parityPacked) {
+    parityQueue = std::make_unique<Queue>(*shared.context, args.profile, true);
+    parityPrepare.setQueue(parityQueue.get());
+  }
+  if (foldTransformEnabled) {
+    foldTransform = std::make_unique<FoldTransform>(shared, profile, N);
+  }
+
+#if CUDA_BACKEND
+  if (args.value("L2_PERSIST", 0)) {
+    std::vector<cl_mem> const readOnlyBuffers{
+      bufTrigH->get(), bufTrigM->get(), bufTrigW->get(),
+      bufConstWeights.get(), bufWeights.get()
+    };
+    cudaSetL2Persistent(queue.get(), readOnlyBuffers);
+    for (auto& auxQueue : auxQueues)
+      cudaSetL2Persistent(auxQueue.get(), readOnlyBuffers);
+  }
+#endif
 
   // Set flag indicating we're going to use CUDA graphs
   use_graphs = graph_square[0].isSupported(shared.context->deviceId()) && args.value("GRAPHS", 1);
@@ -1029,6 +1764,25 @@ void Gpu::mergeQueue() {
   }
 }
 
+// Convert the natural packed parity of the current integer words into one
+// carry-ready bit per output coefficient.  It runs on its own queue so the
+// permutation can overlap the much longer FP32/M61 bottom half.
+void Gpu::prepareParity() {
+  assert((parityPrepared || parityPacked) && parityQueue && !parityExpectedPending);
+  EventHolder event = queue.createSyncEvent();
+  parityQueue->waitForSyncEvent(&event);
+  parityPrepare(*parityIn, bufParityExpected);
+  parityExpectedPending = true;
+}
+
+void Gpu::waitParity() {
+  if (!parityPrepared && !parityPacked) return;
+  assert(parityExpectedPending && parityQueue);
+  EventHolder event = parityQueue->createSyncEvent();
+  queue.waitForSyncEvent(&event);
+  parityExpectedPending = false;
+}
+
 // We've finished the "bottom half" of a squaring or multiply.  Replay the recorded bottom half kernel calls.
 void Gpu::endBottomHalf() {
   replay();
@@ -1045,6 +1799,16 @@ void Gpu::replay() {
   // Get MULTI_Q and L2_STRIPING settings
   bool multi_q = args.value("MULTI_Q", 0);
   int l2_striping = args.value("L2_STRIPING", 0);
+  auto inactiveCacheGroup = [&](int cache_group) {
+    if (cache_group == 1) return !(fft.FFT_FP64 || fft.FFT_FP32);
+    if (cache_group == 2) return !fft.NTT_GF31;
+    if (cache_group == 3) return !fft.NTT_GF61;
+    if (cache_group == 4)
+      return !fft.NTT_RIESEL || args.value("GOOD_THOMAS3", 0) ||
+             args.value("GOOD_THOMAS7", 0);
+    if (cache_group == 5) return !fft.NTT_RIESEL;
+    return true;
+  };
 
   // In the simplest case, we use one command queue and process one data type at a time.  By processing one data type at a time, we reduce maximum L2 cache used.
   // For example, a 4M GF61+GF31 NTT needs just 32MB L2 cache during GF61 processing of fftMiddleIn, tailSquare, and fftMiddleOut (and only 16MB duing GF31 processing).
@@ -1053,9 +1817,7 @@ void Gpu::replay() {
   if ((!multi_q || fft.shape.fft_type == FFT64 || fft.shape.fft_type == FFT61 || fft.shape.fft_type == FFT31 || fft.shape.fft_type == FFT32) && !l2_striping) {
     for (int cache_group = 1; cache_group <= NUM_CACHE_GROUPS; ++cache_group) {
       // Check for irrelevant cache group
-      if (cache_group == 1 && !(fft.FFT_FP64 || fft.FFT_FP32)) continue;
-      if (cache_group == 2 && !fft.NTT_GF31) continue;
-      if (cache_group == 3 && !fft.NTT_GF61) continue;
+      if (inactiveCacheGroup(cache_group)) continue;
 
       // Iterate over the recorded kernels.  Execute each.
       int arg = 0;
@@ -1075,15 +1837,20 @@ void Gpu::replay() {
     splitQueue();
     for (int cache_group = 1; cache_group <= NUM_CACHE_GROUPS; ++cache_group) {
       // Check for irrelevant cache group
-      if (cache_group == 1 && !(fft.FFT_FP64 || fft.FFT_FP32)) continue;
-      if (cache_group == 2 && !fft.NTT_GF31) continue;
-      if (cache_group == 3 && !fft.NTT_GF61) continue;
+      if (inactiveCacheGroup(cache_group)) continue;
 
       // To better balance the load on the two command queues, put a 64-bit data type in one queue and two 32-bit data types in the other queue.
       Queue *q;
       if (cache_group == 1) q = &queue;
-      if (cache_group == 2) q = (fft.shape.fft_type == FFT323161 || fft.shape.fft_type == FFT3161) ? &queue : &auxQueues[0];
+      if (cache_group == 2)
+        q = (args.value("GOOD_THOMAS3", 0) &&
+             fft.shape.fft_type == FFT323161) ? &auxQueues[1] :
+            ((fft.shape.fft_type == FFT323161 ||
+              fft.shape.fft_type == FFT3161 ||
+              fft.shape.fft_type == FFT31R2) ? &queue : &auxQueues[0]);
       if (cache_group == 3) q = &auxQueues[0];
+      if (cache_group == 4) q = (fft.NTT_RIESEL && fft.NTT_GF61) ? &queue : &auxQueues[0];
+      if (cache_group == 5) q = &auxQueues[1];
 
       // Iterate over the recorded kernels.  Execute each.
       int arg = 0;
@@ -1103,9 +1870,7 @@ void Gpu::replay() {
   else if (!multi_q && l2_striping) {
     for (int cache_group = 1; cache_group <= NUM_CACHE_GROUPS; ++cache_group) {
       // Check for irrelevant cache group
-      if (cache_group == 1 && !(fft.FFT_FP64 || fft.FFT_FP32)) continue;
-      if (cache_group == 2 && !fft.NTT_GF31) continue;
-      if (cache_group == 3 && !fft.NTT_GF61) continue;
+      if (inactiveCacheGroup(cache_group)) continue;
 
       // Allow larger caches to do several L2 stripes in a single "stripe group" at a time (increases occupancy, reduces kernel launch costs).
       u32 stripe_group_size = l2_striping;
@@ -1207,9 +1972,7 @@ void Gpu::replay() {
   else if (!multi_q && l2_striping) {
     for (int cache_group = 1; cache_group <= NUM_CACHE_GROUPS; ++cache_group) {
       // Check for irrelevant cache group
-      if (cache_group == 1 && !(fft.FFT_FP64 || fft.FFT_FP32)) continue;
-      if (cache_group == 2 && !fft.NTT_GF31) continue;
-      if (cache_group == 3 && !fft.NTT_GF61) continue;
+      if (inactiveCacheGroup(cache_group)) continue;
 
       // Allow larger caches to do several L2 stripes in a single "stripe group" at a time (increases occupancy, reduces kernel launch costs).
       u32 stripe_group_size = l2_striping;
@@ -1304,9 +2067,7 @@ void Gpu::replay() {
       bool has_unexecuted_kernels = false;
 
       // Check for irrelevant cache group
-      if (cache_group == 1 && !(fft.FFT_FP64 || fft.FFT_FP32)) continue;
-      if (cache_group == 2 && !fft.NTT_GF31) continue;
-      if (cache_group == 3 && !fft.NTT_GF61) continue;
+      if (inactiveCacheGroup(cache_group)) continue;
 
       // Allow larger caches to do several L2 stripes at a time (increases occupancy, reduces kernel launch costs).
       u32 stripe_group_size = l2_striping;
@@ -1427,6 +2188,8 @@ void Gpu::replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Qu
     if (cache_group == 1) { kfftMidIn.setQueue(q); kfftMidIn.setKernelsToExecute(kernelsToExecuteX); kfftMidIn(*out, *in, base); }
     if (cache_group == 2) { kfftMidInGF31.setQueue(q); kfftMidInGF31.setKernelsToExecute(kernelsToExecuteX); kfftMidInGF31(*out, *in, base); }
     if (cache_group == 3) { kfftMidInGF61.setQueue(q); kfftMidInGF61.setKernelsToExecute(kernelsToExecuteX); kfftMidInGF61(*out, *in, base); }
+    if (cache_group == 4) { kfftMidInR0.setQueue(q); kfftMidInR0.setKernelsToExecute(kernelsToExecuteX); kfftMidInR0(*out, *in, base); }
+    if (cache_group == 5) { kfftMidInR1.setQueue(q); kfftMidInR1.setKernelsToExecute(kernelsToExecuteX); kfftMidInR1(*out, *in, base); }
   }
 
   if (kern == KFFTHIN) {
@@ -1435,6 +2198,8 @@ void Gpu::replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Qu
     if (cache_group == 1) { kfftHin.setQueue(q); kfftHin.setKernelsToExecute(kernelsToExecuteX); kfftHin(*out, *in, base); }
     if (cache_group == 2) { kfftHinGF31.setQueue(q); kfftHinGF31.setKernelsToExecute(kernelsToExecuteX); kfftHinGF31(*out, *in, base); }
     if (cache_group == 3) { kfftHinGF61.setQueue(q); kfftHinGF61.setKernelsToExecute(kernelsToExecuteX); kfftHinGF61(*out, *in, base); }
+    if (cache_group == 4) { kfftHinR0.setQueue(q); kfftHinR0.setKernelsToExecute(kernelsToExecuteX); kfftHinR0(*out, *in, base); }
+    if (cache_group == 5) { kfftHinR1.setQueue(q); kfftHinR1.setKernelsToExecute(kernelsToExecuteX); kfftHinR1(*out, *in, base); }
   }
 
   if (kern == KTAILSQUARE) {
@@ -1446,11 +2211,15 @@ void Gpu::replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Qu
       if (cache_group == 1) { ktailSquareZero.setQueue(q); ktailSquareZero(*out, *in); }
       if (cache_group == 2) { ktailSquareZeroGF31.setQueue(q); ktailSquareZeroGF31(*out, *in); }
       if (cache_group == 3) { ktailSquareZeroGF61.setQueue(q); ktailSquareZeroGF61(*out, *in); }
+      if (cache_group == 4) { ktailSquareZeroR0.setQueue(q); ktailSquareZeroR0(*out, *in); }
+      if (cache_group == 5) { ktailSquareZeroR1.setQueue(q); ktailSquareZeroR1(*out, *in); }
       if (kernelsToExecuteX) kernelsToExecuteX--;
     }
     if (cache_group == 1) { ktailSquare.setQueue(q); ktailSquare.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailSquare(*out, *in, base); }
     if (cache_group == 2) { ktailSquareGF31.setQueue(q); ktailSquareGF31.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailSquareGF31(*out, *in, base); }
     if (cache_group == 3) { ktailSquareGF61.setQueue(q); ktailSquareGF61.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailSquareGF61(*out, *in, base); }
+    if (cache_group == 4) { ktailSquareR0.setQueue(q); ktailSquareR0.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailSquareR0(*out, *in, base); }
+    if (cache_group == 5) { ktailSquareR1.setQueue(q); ktailSquareR1.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailSquareR1(*out, *in, base); }
   }
 
   if (kern == KTAILMUL) {
@@ -1462,6 +2231,8 @@ void Gpu::replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Qu
     if (cache_group == 1) { ktailMul.setQueue(q); ktailMul.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailMul(*out, *in1, *in2, base); }
     if (cache_group == 2) { ktailMulGF31.setQueue(q); ktailMulGF31.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailMulGF31(*out, *in1, *in2, base); }
     if (cache_group == 3) { ktailMulGF61.setQueue(q); ktailMulGF61.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailMulGF61(*out, *in1, *in2, base); }
+    if (cache_group == 4) { ktailMulR0.setQueue(q); ktailMulR0.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailMulR0(*out, *in1, *in2, base); }
+    if (cache_group == 5) { ktailMulR1.setQueue(q); ktailMulR1.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailMulR1(*out, *in1, *in2, base); }
   }
 
   if (kern == KTAILMULLOW) {
@@ -1473,6 +2244,8 @@ void Gpu::replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Qu
     if (cache_group == 1) { ktailMulLow.setQueue(q); ktailMulLow.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailMulLow(*out, *in1, *in2, base); }
     if (cache_group == 2) { ktailMulLowGF31.setQueue(q); ktailMulLowGF31.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailMulLowGF31(*out, *in1, *in2, base); }
     if (cache_group == 3) { ktailMulLowGF61.setQueue(q); ktailMulLowGF61.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailMulLowGF61(*out, *in1, *in2, base); }
+    if (cache_group == 4) { ktailMulLowR0.setQueue(q); ktailMulLowR0.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailMulLowR0(*out, *in1, *in2, base); }
+    if (cache_group == 5) { ktailMulLowR1.setQueue(q); ktailMulLowR1.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailMulLowR1(*out, *in1, *in2, base); }
   }
 
   if (kern == KMIDOUT) {
@@ -1483,6 +2256,8 @@ void Gpu::replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Qu
     if (cache_group == 1) { kfftMidOut.setQueue(q); kfftMidOut.setKernelsToExecute(kernelsToExecuteX); kfftMidOut(*out, *in, base); }
     if (cache_group == 2) { kfftMidOutGF31.setQueue(q); kfftMidOutGF31.setKernelsToExecute(kernelsToExecuteX); kfftMidOutGF31(*out, *in, base); }
     if (cache_group == 3) { kfftMidOutGF61.setQueue(q); kfftMidOutGF61.setKernelsToExecute(kernelsToExecuteX); kfftMidOutGF61(*out, *in, base); }
+    if (cache_group == 4) { kfftMidOutR0.setQueue(q); kfftMidOutR0.setKernelsToExecute(kernelsToExecuteX); kfftMidOutR0(*out, *in, base); }
+    if (cache_group == 5) { kfftMidOutR1.setQueue(q); kfftMidOutR1.setKernelsToExecute(kernelsToExecuteX); kfftMidOutR1(*out, *in, base); }
   }
 
   if (kern == KFFTW) {
@@ -1491,6 +2266,8 @@ void Gpu::replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Qu
     if (cache_group == 1) { kfftW.setQueue(q); kfftW(*out, *in); }
     if (cache_group == 2) { kfftWGF31.setQueue(q); kfftWGF31(*out, *in); }
     if (cache_group == 3) { kfftWGF61.setQueue(q); kfftWGF61(*out, *in); }
+    if (cache_group == 4) { kfftWR0.setQueue(q); kfftWR0(*out, *in); }
+    if (cache_group == 5) { kfftWR1.setQueue(q); kfftWR1(*out, *in); }
   }
 }
 
@@ -1514,7 +2291,66 @@ void Gpu::fftP(Buffer<double>& buf, Buffer<Word>& in) {
   replay();  
   // If not in place, instead write the output to the scratch buffer
   Buffer<double>  const*out = in_place ? &buf : &buf3;
-  kfftP(*out, in);
+  bool const packedRiesel = fft.shape.fft_type == FFT31R2 && fft.NTT_GF61;
+  bool const fourRiesel = packedRiesel && fft.NTT_RIESEL;
+  bool const goodThomas = fourRiesel &&
+                          (args.value("GOOD_THOMAS3", 0) ||
+                           args.value("GOOD_THOMAS7", 0));
+  if (goodThomas && args.value("MULTI_Q", 0)) {
+    splitQueue();
+    kfftP.setQueue(&queue);
+    kfftPRPair.setQueue(&auxQueues[0]);
+    kfftPR1.setQueue(&auxQueues[1]);
+    kfftP(*out, in);
+    kfftPRPair(*out, in);
+    kfftPR1(*out, in);
+    mergeQueue();
+  } else if (goodThomas) {
+    kfftP(*out, in);
+    kfftPRPair(*out, in);
+    kfftPR1(*out, in);
+  } else if (fourRiesel && args.value("MULTI_Q", 0)) {
+    splitQueue();
+    kfftP.setQueue(&queue);
+    kfftPR0.setQueue(&queue);
+    kfftPRPair.setQueue(&auxQueues[0]);
+    kfftPR1.setQueue(&auxQueues[1]);
+    kfftP(*out, in);
+    kfftPR0(*out, in);
+    kfftPRPair(*out, in);
+    kfftPR1(*out, in);
+    mergeQueue();
+  } else if (fourRiesel) {
+    kfftP(*out, in);
+    kfftPRPair(*out, in);
+    kfftPR0(*out, in);
+    kfftPR1(*out, in);
+  } else if (packedRiesel && args.value("MULTI_Q", 0)) {
+    splitQueue();
+    kfftP31R2.setQueue(&queue);
+    kfftPRPair.setQueue(&auxQueues[0]);
+    kfftP31R2(*out, in);
+    kfftPRPair(*out, in);
+    mergeQueue();
+  } else if (packedRiesel) {
+    kfftP31R2(*out, in);
+    kfftPRPair(*out, in);
+  } else if (fft.NTT_RIESEL && args.value("MULTI_Q", 0)) {
+    splitQueue();
+    kfftP.setQueue(&queue);
+    kfftPR0.setQueue(&auxQueues[0]);
+    kfftPR1.setQueue(&auxQueues[1]);
+    kfftP(*out, in);
+    kfftPR0(*out, in);
+    kfftPR1(*out, in);
+    mergeQueue();
+  } else {
+    kfftP(*out, in);
+    if (fft.NTT_RIESEL) {
+      kfftPR0(*out, in);
+      kfftPR1(*out, in);
+    }
+  }
 }
 
 void Gpu::fftMidIn(Buffer<double>& buf) {
@@ -1571,6 +2407,17 @@ void Gpu::carryA(Buffer<Word>& out, Buffer<double>& in) {
                    : kCarryA(out, in, updateCarryPos(1 << 2));
 }
 
+void Gpu::carryAParity(Buffer<Word>& out, Buffer<double>& in) {
+  assert(parityCorrect);
+  waitParity();
+  assert(roePos <= ROE_SIZE);
+  Buffer<u32>& expected = parityPrepared || parityPacked ? bufParityExpected : *parityIn;
+  kCarryAParity.setFixedArgs(6, expected);
+  kCarryAROEParity.setFixedArgs(6, expected);
+  roePos < wantROE ? kCarryAROEParity(out, in, roePos++)
+                   : kCarryAParity(out, in, updateCarryPos(1 << 2));
+}
+
 void Gpu::carryM(Buffer<Word>& out, Buffer<double>& in) {
   assert(roePos <= ROE_SIZE);
   roePos < wantROE ? kCarryMROE(out, in, roePos++)
@@ -1584,12 +2431,39 @@ void Gpu::carryLL(Buffer<Word>& out, Buffer<double>& in) {
 void Gpu::carryFused(Buffer<double>& buf) {
   // This kernel always ends the "bottom half".  Replay the recorded kernel calls.
   endBottomHalf();
+  // Only foldP reads bufFolded.  Do not serialize the whole shortened
+  // convolution here: its private middle/tail/output work can overlap this
+  // carry and is consumed later with finer-grained readiness.
+  if (foldTransformEnabled) foldTransform->protectInput(queue);
   // Like fftP, if not in place write the output to the scratch buffer
   Buffer<double> const *in = &buf;
   Buffer<double> const *out = in_place ? &buf : &buf3;
   assert(roePos <= ROE_SIZE);
-  roePos < wantROE ? kCarryFusedROE(*out, *in, roePos++)
-                   : kCarryFused(*out, *in, updateCarryPos(1 << 0));
+  if (parityCorrect) {
+    waitParity();
+    Buffer<u32>& expected = parityPrepared || parityPacked ? bufParityExpected : *parityIn;
+    kCarryFused.setFixedArgs(9, expected, *parityOut);
+    kCarryFusedROE.setFixedArgs(9, expected, *parityOut);
+    roePos < wantROE ? kCarryFusedROE(*out, *in, roePos++)
+                     : kCarryFused(*out, *in, updateCarryPos(1 << 0));
+    swap(parityIn, parityOut);
+    if (foldValidate && !foldValidated) {
+      bufFoldMismatches.zero();
+      kFoldValidate(bufFoldWords, bufFolded, bufFoldMismatches);
+      u32 const mismatches = bufFoldMismatches.read(1)[0];
+      if (mismatches != 0) {
+        throw std::runtime_error("folded M31 carry output disagrees with standalone fold at " +
+                                 std::to_string(mismatches) + " bins");
+      }
+      log("Folded M31 carry output validated at all %u bins\n", N / 16);
+      foldValidated = true;
+    }
+    if (parityPrepared || parityPacked) prepareParity();
+  } else {
+    roePos < wantROE ? kCarryFusedROE(*out, *in, roePos++)
+                     : kCarryFused(*out, *in, updateCarryPos(1 << 0));
+  }
+  if (foldTransformEnabled) foldTransform->launch(queue, bufFolded);
 }
 
 void Gpu::carryFusedMul(Buffer<double>& buf) {
@@ -1609,7 +2483,40 @@ void Gpu::carryFusedLL(Buffer<double>& buf) {
   // Like fftP, if not in place write the output to the scratch buffer
   Buffer<double> const *in = &buf;
   Buffer<double> const *out = in_place ? &buf : &buf3;
-  kCarryFusedLL(*out, *in, updateCarryPos(1 << 0));
+  if (parityCorrect) {
+    waitParity();
+    Buffer<u32>& expected = parityPrepared || parityPacked ? bufParityExpected : *parityIn;
+    kCarryFusedLL.setFixedArgs(9, expected, *parityOut);
+    kCarryFusedLL(*out, *in, updateCarryPos(1 << 0));
+    swap(parityIn, parityOut);
+    if (parityPrepared || parityPacked) prepareParity();
+  } else {
+    kCarryFusedLL(*out, *in, updateCarryPos(1 << 0));
+  }
+}
+
+void Gpu::carryMiddle(Buffer<Word>& packed, Buffer<double>& buf) {
+  assert(useMiddleCarry);
+  endBottomHalf();
+  assert(roePos <= ROE_SIZE);
+  if (roePos < wantROE) {
+    kCarryMiddleOut(buf, packed, bufCarry, roePos++);
+  } else {
+    kCarryMiddleOut(buf, packed, bufCarry, updateCarryPos(1 << 0));
+  }
+  kCarryMiddleIn(buf, packed, bufCarry);
+}
+
+void Gpu::carrySplit(Buffer<Word>& packed, Buffer<double>& buf) {
+  assert(useSplitCarry);
+  endBottomHalf();
+  assert(roePos <= ROE_SIZE);
+  if (roePos < wantROE) {
+    kCarrySplitOut(buf, packed, bufCarry, roePos++);
+  } else {
+    kCarrySplitOut(buf, packed, bufCarry, updateCarryPos(1 << 0));
+  }
+  kCarrySplitIn(buf, packed, bufCarry);
 }
 
 
@@ -1651,6 +2558,39 @@ pair<RoeInfo, RoeInfo> Gpu::readROE() {
   if (roePos) {
     vector<float> roe = bufROE.read(roePos + 2);
     assert(roe.size() == roePos + 2);
+    // Experimental FP32+M61 diagnostics store an integer count in each ROE
+    // slot.  Convert the raw atomic-add result to a numeric float before the
+    // normal statistics machinery consumes it.  Normal ROE collection is
+    // bit-for-bit unchanged when ROE_COUNT is not requested.
+    if (args.value("ROE_COUNT", 0)) {
+      u64 sum = 0;
+      u32 countMax = 0;
+      u32 valid = 0;
+      u32 nonzero = 0;
+      u32 otherKernelSlots = 0;
+      for (size_t i = 2; i < roe.size(); ++i) {
+        u32 count;
+        static_assert(sizeof(count) == sizeof(roe[i]));
+        memcpy(&count, &roe[i], sizeof(count));
+        // Non-fused carry kernels still write an IEEE-754 ROE value to the
+        // shared diagnostic buffer at block boundaries.  Its bit pattern is
+        // far above the maximum possible coefficient-pair count; exclude
+        // those sparse slots from this experiment.
+        if (count <= N / 2) {
+          sum += count;
+          countMax = max(countMax, count);
+          valid++;
+          nonzero += count != 0;
+          roe[i] = float(count);
+        } else {
+          otherKernelSlots++;
+          roe[i] = 0;
+        }
+      }
+      log("ROE_COUNT >= %.3f: %u valid iterations, %u nonzero, max %u, mean %.3f; %u non-fused slots excluded\n",
+          args.value("ROE_COUNT", 0) * .001, valid, nonzero, countMax,
+          valid ? double(sum) / valid : 0.0, otherKernelSlots);
+    }
     // Split the roe buffer into two.  One for squarings and one for multiplications.  This is likely overkill as the multiplication ROE is not used - though
     // it could be useful for debugging (in which case we could support getting roe for squarings or multipplications, but not both).
     auto [squareRoe, mulRoe] = split(roe, mulRoePos);
@@ -1797,7 +2737,13 @@ void Gpu::writeState(u64 k, const vector<u32>& check, u32 blockSize) {
 
     squareLoop(bufData, 0, n);
   }
-  modMul(bufData, bufAux, true);
+  // The middle-3/7 bring-up has not yet generalized tailMul's Hermitian
+  // channel pairing.  GT9 has a complete multiply path and uses normal
+  // initialization below.
+  if (!k && (args.value("GOOD_THOMAS3", 0) ||
+             args.value("GOOD_THOMAS7", 0)))
+    writeIn(bufData, makeWords(E, 3));
+  else modMul(bufData, bufAux, true);
 }
 
 bool Gpu::doCheck(u32 blockSize) {
@@ -1964,8 +2910,7 @@ void Gpu::doCarry(Buffer<double>& in, Buffer<Word>& wordBuf) {
 
 // Use buf1 (and buf23 if not in place) to do a single squaring.
 void Gpu::square(Buffer<Word>& out, Buffer<Word>& in, enum LEAD_TYPE leadIn, enum LEAD_TYPE leadOut, bool doMul3, bool doLL) {
-  // leadOut = LEAD_MIDDLE is not supported (slower than LEAD_WIDTH)
-  assert(leadOut != LEAD_MIDDLE);
+  assert(leadOut != LEAD_MIDDLE || useMiddleCarry);
   // LL does not do Mul3
   assert(!(doMul3 && doLL));
 
@@ -1995,32 +2940,48 @@ void Gpu::square(Buffer<Word>& out, Buffer<Word>& in, enum LEAD_TYPE leadIn, enu
   // If leadIn is LEAD_WIDTH, buf1 (or buf3 if not in place) contains the input data, squaring starts at fftMidIn
   // If leadIn is LEAD_MIDDLE, buf1 contains the input data, squaring starts at tailSquare
   // If leadOut is LEAD_WIDTH, then buf1 (or buf3 if not in place) will contain the output of carryFused -- to be used as input to the next squaring.
-  if (leadIn == LEAD_NONE) fftP(buf1, in);
+  if (leadIn == LEAD_NONE) {
+    if (parityCorrect) {
+      parityInit(*parityIn, in);
+      if (parityPrepared || parityPacked) prepareParity();
+    }
+    fftP(buf1, in);
+  }
   if (leadIn != LEAD_MIDDLE) fftMidIn(buf1);
   tailSquare(buf1);
-  fftMidOut(buf1);
 
-  // If leadOut is not allowed then we cannot use the faster carryFused kernel
-  if (leadOut == LEAD_NONE) {
-    fftW(buf3, buf1);
-    if (!doLL && !doMul3) {
-      carryA(out, buf3);
-    } else if (doLL) {
-      carryLL(out, buf3);
-    } else {
-      carryM(out, buf3);
+  // The experimental middle/carry path consumes tail output directly and
+  // leaves the next iteration at the tail-input boundary.
+  if (leadOut == LEAD_MIDDLE) {
+    assert(!doLL && !doMul3);
+    carryMiddle(out, buf1);
+  } else {
+    fftMidOut(buf1);
+
+    // If leadOut is not allowed then we cannot use the faster carryFused kernel
+    if (leadOut == LEAD_NONE) {
+      fftW(buf3, buf1);
+      if (!doLL && !doMul3) {
+        parityCorrect ? carryAParity(out, buf3) : carryA(out, buf3);
+      } else if (doLL) {
+        carryLL(out, buf3);
+      } else {
+        carryM(out, buf3);
+      }
+      carryB(out);
     }
-    carryB(out);
-  }
 
-  // Use CarryFused
-  else {
-    assert(!useLongCarry);
-    assert(!doMul3);
-    if (doLL) {
-      carryFusedLL(buf1);
-    } else {
-      carryFused(buf1);
+    // Use CarryFused
+    else {
+      assert(!useLongCarry);
+      assert(!doMul3);
+      if (doLL) {
+        carryFusedLL(buf1);
+      } else if (useSplitCarry) {
+        carrySplit(out, buf1);
+      } else {
+        carryFused(buf1);
+      }
     }
   }
 
@@ -2035,7 +2996,8 @@ u64 Gpu::squareLoop(Buffer<Word>& out, Buffer<Word>& in, u64 from, u64 to, bool 
   assert(from < to);
   enum LEAD_TYPE leadIn = LEAD_NONE;
   for (u64 k = from; k < to; ++k) {
-    enum LEAD_TYPE const leadOut = useLongCarry || (k == to - 1) ? LEAD_NONE : LEAD_WIDTH;
+    enum LEAD_TYPE const leadOut = useLongCarry || (k == to - 1) ? LEAD_NONE :
+                                   useMiddleCarry ? LEAD_MIDDLE : LEAD_WIDTH;
     square(out, (k==from) ? in : out, leadIn, leadOut, doTailMul3 && (k == to - 1));
     leadIn = leadOut;
   }
@@ -2132,9 +3094,14 @@ void Gpu::doBigLog(u64 k, u64 res, bool checkOK, float secsPerIt, u64 nIters, u3
 
   RoeInfo const carryStats = readCarryStats();
   if (carryStats.N > 2) {
-    u32 const m = u32(ldexp(carryStats.max, 32));
-    double const z = carryStats.z();
-    log("Carry: %x Z(%u)=%.1f\n", m, carryStats.N, z);
+    if (args.value("SPIN_STATS", 0)) {
+      log("Carry readiness loops: max %.0f mean %.3f sd %.3f over %u iterations\n",
+          carryStats.max, carryStats.mean, carryStats.sd, carryStats.N);
+    } else {
+      u32 const m = u32(ldexp(carryStats.max, 32));
+      double const z = carryStats.z();
+      log("Carry: %x Z(%u)=%.1f\n", m, carryStats.N, z);
+    }
   }
 }
 
@@ -2298,6 +3265,13 @@ PRPState Gpu::loadPRP(Saver<PRPState>& saver) {
 
     log("EE %9" PRIu64 " on-load: %016" PRIx64 " vs. %016" PRIx64 "\n", state.k, res, state.res64);
 
+    // The older GT3/GT7 scaffolds still lack a complete persisted-state
+    // boundary.  GT9 is exact and must pass the ordinary on-load check.
+    if (args.value("GOOD_THOMAS3", 0) || args.value("GOOD_THOMAS7", 0)) {
+      log("Good-Thomas prototype: deferring on-load residue validation until the dedicated carry boundary is installed\n");
+      return state;
+    }
+
     if (!state.k) { break; }  // We failed on PRP start
   }
 
@@ -2343,7 +3317,8 @@ tuple<bool, RoeInfo> Gpu::measureCarry() {
   modMul(bufCheck, bufData, leadIn);
   leadIn = LEAD_MIDDLE;
 
-  enum LEAD_TYPE const leadOut = useLongCarry ? LEAD_NONE : LEAD_WIDTH;
+  enum LEAD_TYPE const leadOut = useLongCarry ? LEAD_NONE :
+                                 useMiddleCarry ? LEAD_MIDDLE : LEAD_WIDTH;
   square(bufData, bufData, leadIn, leadOut);
   leadIn = leadOut;
   ++k;
@@ -2413,7 +3388,8 @@ tuple<bool, u64, RoeInfo, RoeInfo> Gpu::measureROE(bool  /*quick*/) {
   modMul(bufCheck, bufData, leadIn);
   leadIn = LEAD_MIDDLE;
 
-  enum LEAD_TYPE const leadOut = useLongCarry ? LEAD_NONE : LEAD_WIDTH;
+  enum LEAD_TYPE const leadOut = useLongCarry ? LEAD_NONE :
+                                 useMiddleCarry ? LEAD_MIDDLE : LEAD_WIDTH;
   square(bufData, bufData, leadIn, leadOut);
   leadIn = leadOut;
   ++k;
@@ -2482,7 +3458,8 @@ double Gpu::timePRP(int quick) {        // Quick varies from 1 (slowest, longest
   modMul(bufCheck, bufData, leadIn);
   leadIn = LEAD_MIDDLE;
 
-  enum LEAD_TYPE const leadOut = useLongCarry ? LEAD_NONE : LEAD_WIDTH;
+  enum LEAD_TYPE const leadOut = useLongCarry ? LEAD_NONE :
+                                 useMiddleCarry ? LEAD_MIDDLE : LEAD_WIDTH;
   square(bufData, bufData, leadIn, leadOut);
   leadIn = leadOut;
   ++k;
@@ -2606,7 +3583,9 @@ PRPResult Gpu::isPrimePRP([[maybe_unused]] const Task& task) {
     bool const doStop = (k % blockSize == 0) && (Signal::stopRequested() || (args.iters && k - startK >= args.iters));
     bool const doCheck = doStop || (k % checkStep == 0) || (k >= kEndEnd) || (k - startK == 2 * blockSize);
     bool const doLog = k % logStep == 0;
-    enum LEAD_TYPE const leadOut = doCheck || doLog || k == persistK || k == kEnd || useLongCarry ? LEAD_NONE : LEAD_WIDTH;
+    enum LEAD_TYPE const leadOut =
+      doCheck || doLog || k == persistK || k == kEnd || useLongCarry ? LEAD_NONE :
+      useMiddleCarry ? LEAD_MIDDLE : LEAD_WIDTH;
 
     if (doStop) { log("Stopping, please wait..\n"); }
 
@@ -2658,9 +3637,14 @@ PRPResult Gpu::isPrimePRP([[maybe_unused]] const Task& task) {
       log("   %9" PRIu64 " %016" PRIx64 " %s\n", k, res, formatSecsPerIter(secsPerIt).c_str());
       RoeInfo const carryStats = readCarryStats();
       if (carryStats.N) {
-        u32 const m = u32(ldexp(carryStats.max, 32));
-        double const z = carryStats.z();
-        log("Carry: %x Z(%u)=%.1f\n", m, carryStats.N, z);
+        if (args.value("SPIN_STATS", 0)) {
+          log("Carry readiness loops: max %.0f mean %.3f sd %.3f over %u iterations\n",
+              carryStats.max, carryStats.mean, carryStats.sd, carryStats.N);
+        } else {
+          u32 const m = u32(ldexp(carryStats.max, 32));
+          double const z = carryStats.z();
+          log("Carry: %x Z(%u)=%.1f\n", m, carryStats.N, z);
+        }
       }
     } else {
       bool const ok = this->doCheck(blockSize);
@@ -2686,6 +3670,9 @@ PRPResult Gpu::isPrimePRP([[maybe_unused]] const Task& task) {
       } else {
         ++nErrors;
         doBigLog(k, res, ok, secsPerIt, kEndEnd, nErrors);
+        if (args.value("GOOD_THOMAS3", 0) || args.value("GOOD_THOMAS7", 0) ||
+            args.value("GOOD_THOMAS9", 0))
+          logTimeKernels();
         if (++nSeqErrors > 2) {
           log("%d sequential errors, will stop.\n", nSeqErrors);
           throw "too many errors";
@@ -2752,7 +3739,8 @@ LLResult Gpu::isPrimeLL([[maybe_unused]] const Task& task) {
     }
 
     bool const doLog = (k % args.logStep == 0) || doStop;
-    enum LEAD_TYPE const leadOut = doLog || useLongCarry ? LEAD_NONE : LEAD_WIDTH;
+    enum LEAD_TYPE const leadOut = doLog || useLongCarry ? LEAD_NONE :
+                                   useMiddleCarry ? LEAD_MIDDLE : LEAD_WIDTH;
 
     squareLL(bufData, leadIn, leadOut);
     leadIn = leadOut;
@@ -2828,7 +3816,8 @@ array<u64, 4> Gpu::isCERT(const Task& task) {
     }
 
     bool const doLog = (k % 100'000 == 0) || doStop;
-    enum LEAD_TYPE const leadOut = doLog || useLongCarry ? LEAD_NONE : LEAD_WIDTH;
+    enum LEAD_TYPE const leadOut = doLog || useLongCarry ? LEAD_NONE :
+                                   useMiddleCarry ? LEAD_MIDDLE : LEAD_WIDTH;
 
     squareCERT(bufData, leadIn, leadOut);
     leadIn = leadOut;

@@ -6,7 +6,7 @@
 
 Kernel::Kernel(string_view name, KernelCompiler* compiler, TimeInfo* timeInfo, Queue* queue,
        string_view fileName, string_view nameInFile,
-       size_t workSize, string_view defines):
+       size_t workSize, string_view defines, u32 dynamicSharedBytes):
   name{name},
   compiler{compiler},
   fileName{fileName},
@@ -15,7 +15,8 @@ Kernel::Kernel(string_view name, KernelCompiler* compiler, TimeInfo* timeInfo, Q
   timeInfo{timeInfo},
   queue{queue},
   workSizeX{workSize},
-  workSizeY{1}
+  workSizeY{1},
+  dynamicSharedBytes{dynamicSharedBytes}
 {}
 
 Kernel::~Kernel() = default;
@@ -32,6 +33,9 @@ void Kernel::finishLoad() {
   kernel = pendingKernel.get();
   assert(kernel);
   groupSize = getWorkGroupSize(kernel.get(), deviceId, name.c_str());
+#ifdef CUDA_BACKEND
+  if (dynamicSharedBytes) cudaSetKernelDynamicShared(kernel.get(), dynamicSharedBytes);
+#endif
   assert(groupSize);
   assert(workSizeX % groupSize == 0);
 

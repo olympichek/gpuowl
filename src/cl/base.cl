@@ -171,6 +171,15 @@ G_H        "group height" == SMALL_HEIGHT / NH
 #if !defined(MODM31)
 #define MODM31 0
 #endif
+#if !defined(PARITY_SQUARE)
+#define PARITY_SQUARE 0
+#endif
+#if !defined(FP32_CMUL64)
+#define FP32_CMUL64 0
+#endif
+#if !defined(FP32_CFMA64)
+#define FP32_CFMA64 0
+#endif
 
 #if !defined(MIDDLE_CHAIN)
 #define MIDDLE_CHAIN 0
@@ -250,7 +259,70 @@ typedef ulong2 GF61;        // A complex value using two Z61s.  For a GF(M61^2) 
 #define FFT6431         51
 #define FFT31           52
 #define FFT32           53
-#if FFT_TYPE < 0 || (FFT_TYPE > 4 && FFT_TYPE < 50) || FFT_TYPE > 53
+#define FFT31R2         54
+#ifndef RIESEL_PAIR
+#define RIESEL_PAIR     0
+#endif
+#ifndef RIESEL_FOUR
+#define RIESEL_FOUR     0
+#endif
+#ifndef RIESEL_LAZY
+#define RIESEL_LAZY     0
+#endif
+#ifndef RIESEL_FIELD
+#define RIESEL_FIELD    0
+#endif
+#ifndef M19_FIELD
+#define M19_FIELD       0
+#endif
+#ifndef GOLD_PAIR
+#define GOLD_PAIR       0
+#endif
+#ifndef GOOD_THOMAS3
+#define GOOD_THOMAS3    0
+#endif
+#ifndef GOOD_THOMAS7
+#define GOOD_THOMAS7    0
+#endif
+#ifndef GOOD_THOMAS9
+#define GOOD_THOMAS9    0
+#endif
+#if RIESEL_FIELD == 1
+#undef DISTGF31
+#undef DISTWTRIGGF31
+#undef DISTMTRIGGF31
+#undef DISTHTRIGGF31
+#undef TAILTGF31
+#define DISTGF31       DISTR0
+#define DISTWTRIGGF31  DISTWTR0
+#define DISTMTRIGGF31  DISTMTR0
+#define DISTHTRIGGF31  DISTHTR0
+#define TAILTGF31      TAILTR0
+#define RF_FWD_ONE     RIESEL0_FWD_ONE
+#define RF_INV_ONE     RIESEL0_INV_ONE
+#define RF_FWD_X       RIESEL0_FWD_X
+#define RF_INV_X       RIESEL0_INV_X
+#define RF_MONT_ONE    RIESEL0_MONT_ONE
+#define RF_INV_SCALE   RIESEL0_INV_SCALE
+#elif RIESEL_FIELD == 2
+#undef DISTGF31
+#undef DISTWTRIGGF31
+#undef DISTMTRIGGF31
+#undef DISTHTRIGGF31
+#undef TAILTGF31
+#define DISTGF31       DISTR1
+#define DISTWTRIGGF31  DISTWTR1
+#define DISTMTRIGGF31  DISTMTR1
+#define DISTHTRIGGF31  DISTHTR1
+#define TAILTGF31      TAILTR1
+#define RF_FWD_ONE     RIESEL1_FWD_ONE
+#define RF_INV_ONE     RIESEL1_INV_ONE
+#define RF_FWD_X       RIESEL1_FWD_X
+#define RF_INV_X       RIESEL1_INV_X
+#define RF_MONT_ONE    RIESEL1_MONT_ONE
+#define RF_INV_SCALE   RIESEL1_INV_SCALE
+#endif
+#if FFT_TYPE < 0 || (FFT_TYPE > 4 && FFT_TYPE < 50) || FFT_TYPE > 54
 #error - unsupported FFT/NTT
 #endif
 // Word and Word2 define the data type for FFT integers passed between the CPU and GPU.
@@ -787,4 +859,3 @@ void dependentLaunchWait() {
   __asm volatile("griddepcontrol.wait;");                 // same as cudaGridDependencySynchronize();
 #endif
 }
-

@@ -65,3 +65,69 @@ void fft9(T2 *u) {
 }
 
 #endif
+
+#if FFT_FP32
+
+// FP32 counterpart of the Nussbaumer 9-point DFT above.
+// 12 FMA + 8 MUL, 72 ADD
+void fft9(F2 *u) {
+  float const
+      C0 = 0x1.8836fap-1f,
+      C1 = 0x1.e11f64p-1f,
+      C2 = 0x1.63a1a8p-3f,
+      C3 = 0x1.bb67aep-1f,
+      C4 = 0x1.491b76p-1f,
+      C5 = 0x1.5e3a88p-2f,
+      C6 = 0x1.f838b8p-1f;
+
+  X2(u[1], u[8]);
+  X2(u[2], u[7]);
+  X2(u[3], u[6]);
+  X2(u[4], u[5]);
+
+  F2 m4 = (u[4] - u[2]) * C1;
+  F2 s0 = fmaT2(C0, u[2] - u[1], m4);
+
+  X2(u[1], u[4]);
+
+  F2 t5 = u[1] + u[2];
+
+  F2 m8  = mul_t4(u[8] + u[7]);
+  F2 m10 = mul_t4(u[8] - u[5]);
+
+  X2(u[5], u[7]);
+
+  F2 m9  = mul_t4(u[5]) * C5;
+  F2 t10 = u[8] + u[7];
+
+  F2 s2 = fmaT2(C4, m8, m9);
+  u[5]  = fmaT2(C6, m10, m9);
+
+  u[2] = fmaT2(-0.5f, u[3], u[0]);
+  u[0] += u[3];
+
+  u[3] = fmaT2(-0.5f, t5, u[0]);
+  u[0] += t5;
+
+  u[7] = mul_t4(u[6]) * C3;
+  u[8] = u[7] + s2;
+  u[6] = mul_t4(t10) * C3;
+
+  u[1] = u[2] - s0;
+
+  u[4] = fmaT2(C2, u[4], m4);
+
+  X2(u[2], u[4]);
+
+  u[4] += s0;
+
+  X2(u[5], u[7]);
+  u[5] -= s2;
+
+  X2(u[4], u[5]);
+  X2(u[3], u[6]);
+  X2(u[2], u[7]);
+  X2(u[1], u[8]);
+}
+
+#endif

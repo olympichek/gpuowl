@@ -1,5 +1,6 @@
 // Copyright Mihai Preda
 
+#include <bit>
 #include <cstring>
 #include "TrigBufCache.h"
 
@@ -675,7 +676,14 @@ static vector<uint2> genSmallTrigComboGF31(Args *args, u32 width, u32 middle, u3
 static vector<uint2> genMiddleTrigGF31(u32 smallH, u32 middle, u32 width) {
   vector<uint2> tab;
   if (middle == 1) {
-    tab.resize(1);
+    GF31 const root1w = GF31::root_one(width);
+    for (u32 k = 0; k < width; ++k) {
+      tab.push_back(root1GF31(root1w, k));
+    }
+    GF31 const root1wh = GF31::root_one(width * smallH);
+    for (u32 k = 0; k < smallH; ++k) {
+      tab.push_back(root1GF31(root1wh, k));
+    }
   } else {
     GF31 const root1hm = GF31::root_one(smallH * middle);
     for (u32 m = 1; m < middle; ++m) {
@@ -837,7 +845,14 @@ static vector<ulong2> genSmallTrigComboGF61(Args *args, u32 width, u32 middle, u
 static vector<ulong2> genMiddleTrigGF61(u32 smallH, u32 middle, u32 width) {
   vector<ulong2> tab;
   if (middle == 1) {
-    tab.resize(1);
+    GF61 const root1w = GF61::root_one(width);
+    for (u32 k = 0; k < width; ++k) {
+      tab.push_back(root1GF61(root1w, k));
+    }
+    GF61 const root1wh = GF61::root_one(width * smallH);
+    for (u32 k = 0; k < smallH; ++k) {
+      tab.push_back(root1GF61(root1wh, k));
+    }
   } else {
     GF61 const root1hm = GF61::root_one(smallH * middle);
     for (u32 m = 1; m < middle; ++m) {
@@ -852,11 +867,401 @@ static vector<ulong2> genMiddleTrigGF61(u32 smallH, u32 middle, u32 width) {
 }
 
 
+/**************************************************************************/
+/*  Two independent scalar Goldilocks transforms stored as one ulong2     */
+/**************************************************************************/
+
+namespace {
+
+constexpr u64 GOLD_Q = 0xffffffff00000001ull;
+
+u64 goldMulHost(u64 a, u64 b) {
+  return u64(u128(a) * b % GOLD_Q);
+}
+
+u64 goldPowHost(u64 value, u64 exponent) {
+  u64 result = 1;
+  while (exponent != 0) {
+    if (exponent & 1) result = goldMulHost(result, value);
+    exponent >>= 1;
+    if (exponent != 0) value = goldMulHost(value, value);
+  }
+  return result;
+}
+
+struct GoldPairRoot {
+  u64 forward;
+  u64 inverse;
+};
+
+GoldPairRoot goldRootOne(u32 n) {
+  assert(n != 0 && (n & (n - 1)) == 0);
+  u64 const forward = goldPowHost(7, (GOLD_Q - 1) / n);
+  return {forward, goldPowHost(forward, GOLD_Q - 2)};
+}
+
+ulong2 goldRootPower(GoldPairRoot root, u32 exponent) {
+  return {goldPowHost(root.forward, exponent),
+          goldPowHost(root.inverse, exponent)};
+}
+
+vector<ulong2> genSmallTrigGoldPair(u32 size, u32 radix) {
+  u32 const workgroup = size / radix;
+  vector<ulong2> table;
+  GoldPairRoot const root = goldRootOne(size);
+  for (u32 line = 1; line < radix; ++line) {
+    for (u32 column = 0; column < workgroup; ++column) {
+      table.push_back(goldRootPower(root, column * line));
+    }
+  }
+  table.resize(size);
+  return table;
+}
+
+vector<ulong2> genSmallTrigComboGoldPair(Args *args, u32 width, u32 middle,
+                                         u32 size, u32 radix,
+                                         bool tailSingleWide) {
+  vector<ulong2> table = genSmallTrigGoldPair(size, radix);
+  u32 const tailTrigs = args->value("TAIL_TRIGS61", 0);
+  GoldPairRoot const root = goldRootOne(width * middle * size);
+  if (tailTrigs >= 1) {
+    for (u32 me = 0; me < size / radix; ++me) {
+      table.push_back(goldRootPower(root, width * middle * me));
+    }
+    for (u32 line = 0; line <= width * middle / 2; ++line) {
+      table.push_back(goldRootPower(root, line));
+      if (!tailSingleWide) {
+        table.push_back(goldRootPower(
+          root, line ? width * middle - line : width * middle / 2));
+      }
+    }
+  } else {
+    for (u32 u = 0; u <= width * middle / 2; ++u) {
+      for (u32 v = 0; std::cmp_less(v, tailSingleWide ? 1 : 2); ++v) {
+        u32 const line = v == 0 ? u :
+          (u ? width * middle - u : width * middle / 2);
+        for (u32 me = 0; me < size / radix; ++me) {
+          table.push_back(goldRootPower(root, line + width * middle * me));
+        }
+      }
+    }
+  }
+  return table;
+}
+
+vector<ulong2> genMiddleTrigGoldPair(u32 smallH, u32 middle, u32 width) {
+  vector<ulong2> table;
+  if (middle == 1) {
+    table.resize(1);
+    return table;
+  }
+  GoldPairRoot const rootHM = goldRootOne(smallH * middle);
+  for (u32 m = 1; m < middle; ++m) {
+    for (u32 k = 0; k < smallH; ++k) {
+      table.push_back(goldRootPower(rootHM, k * m));
+    }
+  }
+  GoldPairRoot const rootMW = goldRootOne(middle * width);
+  for (u32 k = 0; k < width; ++k) {
+    table.push_back(goldRootPower(rootMW, k));
+  }
+  GoldPairRoot const rootWMH = goldRootOne(width * middle * smallH);
+  for (u32 k = 0; k < smallH; ++k) {
+    table.push_back(goldRootPower(rootWMH, k));
+  }
+  return table;
+}
+
+}  // namespace
+
+ulong2 root1GoldPair(u32 n, u32 exponent) {
+  assert(exponent < n);
+  return goldRootPower(goldRootOne(n), exponent);
+}
+
+
+/**************************************************************************/
+/*     Packed pair of quadratic Riesel fields used by experimental FFT54  */
+/**************************************************************************/
+
+namespace {
+
+// Lane order is ascending so the packed CRT can use the simple Garner step
+// r1-r0 without first reducing r0 modulo q1.
+constexpr array<u32, 2> RIESEL_MODULUS_CANONICAL {2090860543u, 2141192191u};
+constexpr array<u32, 2> RIESEL_MODULUS_LAZY {1031798783u, 1038090239u};
+
+auto const& rieselModulus(bool lazy) {
+  return lazy ? RIESEL_MODULUS_LAZY : RIESEL_MODULUS_CANONICAL;
+}
+
+struct RieselGF {
+  array<u32, 2> re;
+  array<u32, 2> im;
+};
+
+u32 rieselSub(u32 a, u32 b, u32 q) { return a >= b ? a - b : q - (b - a); }
+
+RieselGF rieselMul(RieselGF a, RieselGF b, bool lazy) {
+  auto const& moduli = rieselModulus(lazy);
+  RieselGF result;
+  for (u32 lane = 0; lane != 2; ++lane) {
+    u32 const q = moduli[lane];
+    u32 const ac = u32(u64(a.re[lane]) * b.re[lane] % q);
+    u32 const bd = u32(u64(a.im[lane]) * b.im[lane] % q);
+    result.re[lane] = rieselSub(ac, bd, q);
+    result.im[lane] = u32((u64(a.re[lane]) * b.im[lane] +
+                           u64(a.im[lane]) * b.re[lane]) % q);
+  }
+  return result;
+}
+
+RieselGF rieselPow(RieselGF value, u64 exponent, bool lazy) {
+  RieselGF result {{{1, 1}}, {{0, 0}}};
+  while (exponent != 0) {
+    if (exponent & 1) result = rieselMul(result, value, lazy);
+    exponent >>= 1;
+    if (exponent != 0) value = rieselMul(value, value, lazy);
+  }
+  return result;
+}
+
+RieselGF rieselRootOne(u32 n, bool lazy) {
+  assert(std::has_single_bit(n) && n <= (u32(1) << 21));
+  // Roots found and independently validated by riesel-algebra-test.  Both are
+  // in the norm-one subgroup and have exact order 2^21.
+  // Select the orientation whose quarter turn is +i in both lanes.  The
+  // conjugate of the first independently-found root is required here; mixing
+  // a -i root with radix kernels that hard-code multiplication by +i gives a
+  // deterministic but incorrect transform.
+  RieselGF const full = lazy ?
+    RieselGF{{{451776209u, 219392826u}}, {{678011953u, 888955106u}}} :
+    RieselGF{{{1201478489u, 1577799866u}}, {{1751544430u, 615077540u}}};
+  return rieselPow(full, (u32(1) << 21) / n, lazy);
+}
+
+u64 packRiesel(array<u32, 2> lane) { return u64(lane[0]) | (u64(lane[1]) << 32); }
+
+ulong2 storeRiesel(RieselGF value, bool lazy) {
+  auto const& moduli = rieselModulus(lazy);
+  for (u32 lane = 0; lane != 2; ++lane) {
+    u32 const q = moduli[lane];
+    u64 const montgomeryOne = (u64(1) << 32) % q;
+    value.re[lane] = u32(u64(value.re[lane]) * montgomeryOne % q);
+    value.im[lane] = u32(u64(value.im[lane]) * montgomeryOne % q);
+  }
+  return {packRiesel(value.re), packRiesel(value.im)};
+}
+
+ulong2 root1Riesel(RieselGF root, u32 k, bool lazy) {
+  return storeRiesel(rieselPow(root, k, lazy), lazy);
+}
+
+vector<ulong2> genSmallTrigRiesel(u32 size, u32 radix, bool lazy) {
+  u32 const WG = size / radix;
+  vector<ulong2> tab;
+  RieselGF const root = rieselRootOne(size, lazy);
+  for (u32 line = 1; line < radix; ++line) {
+    for (u32 col = 0; col < WG; ++col) {
+      tab.push_back(root1Riesel(root, col * line, lazy));
+    }
+  }
+  tab.resize(size);
+  return tab;
+}
+
+vector<ulong2> genSmallTrigComboRiesel(Args *args, u32 width, u32 middle,
+                                       u32 size, u32 radix, bool tail_single_wide) {
+  bool const lazy = args->value("RIESEL_LAZY", 0);
+  vector<ulong2> tab = genSmallTrigRiesel(size, radix, lazy);
+  u32 const tailTrigs = args->value("TAIL_TRIGS61", 0);
+  RieselGF const root = rieselRootOne(width * middle * size, lazy);
+  if (tailTrigs >= 1) {
+    for (u32 me = 0; me < size / radix; ++me) {
+      tab.push_back(root1Riesel(root, width * middle * me, lazy));
+    }
+    for (u32 line = 0; line <= width * middle / 2; ++line) {
+      tab.push_back(root1Riesel(root, line, lazy));
+      if (!tail_single_wide) {
+        tab.push_back(root1Riesel(root, line ? width * middle - line : width * middle / 2,
+                                 lazy));
+      }
+    }
+  }
+  if (tailTrigs == 0) {
+    for (u32 u = 0; u <= width * middle / 2; ++u) {
+      for (u32 v = 0; std::cmp_less(v, tail_single_wide ? 1 : 2); ++v) {
+        u32 const line = v == 0 ? u : (u ? width * middle - u : width * middle / 2);
+        for (u32 me = 0; me < size / radix; ++me) {
+          tab.push_back(root1Riesel(root, line + width * middle * me, lazy));
+        }
+      }
+    }
+  }
+  return tab;
+}
+
+vector<ulong2> genMiddleTrigRiesel(u32 smallH, u32 middle, u32 width,
+                                  bool lazy) {
+  vector<ulong2> tab;
+  if (middle == 1) {
+    tab.resize(1);
+  } else {
+    RieselGF const rootHM = rieselRootOne(smallH * middle, lazy);
+    for (u32 m = 1; m < middle; ++m) {
+      for (u32 k = 0; k < smallH; ++k) {
+        tab.push_back(root1Riesel(rootHM, k * m, lazy));
+      }
+    }
+    RieselGF const rootMW = rieselRootOne(middle * width, lazy);
+    for (u32 k = 0; k < width; ++k) tab.push_back(root1Riesel(rootMW, k, lazy));
+    RieselGF const rootWMH = rieselRootOne(width * middle * smallH, lazy);
+    for (u32 k = 0; k < smallH; ++k) {
+      tab.push_back(root1Riesel(rootWMH, k, lazy));
+    }
+  }
+  return tab;
+}
+
+} // namespace
+
+ulong2 root1Riesel(u32 N, u32 k, bool lazy) {
+  assert(k < N);
+  return root1Riesel(rieselRootOne(N, lazy), k, lazy);
+}
+
+namespace {
+
+constexpr u32 M19_MODULUS = (u32(1) << 19) - 1;
+
+struct M19GF {
+  u32 re;
+  u32 im;
+};
+
+M19GF m19Mul(M19GF a, M19GF b) {
+  u32 const re = u32((u64(a.re) * b.re +
+                      u64(M19_MODULUS) * M19_MODULUS -
+                      u64(a.im) * b.im) % M19_MODULUS);
+  u32 const im = u32((u64(a.re) * b.im + u64(a.im) * b.re) %
+                     M19_MODULUS);
+  return {re, im};
+}
+
+M19GF m19Pow(M19GF value, u64 exponent) {
+  M19GF result {1, 0};
+  while (exponent != 0) {
+    if (exponent & 1) result = m19Mul(result, value);
+    exponent >>= 1;
+    if (exponent != 0) value = m19Mul(value, value);
+  }
+  return result;
+}
+
+M19GF m19RootOne(u32 n) {
+  assert(std::has_single_bit(n) && n <= (u32(1) << 19));
+  // Exact order 2^19, norm one, oriented so its quarter turn is +i.
+  M19GF const full {104858u, 209714u};
+  return m19Pow(full, (u32(1) << 19) / n);
+}
+
+uint2 m19RootPower(M19GF root, u32 exponent) {
+  M19GF const value = m19Pow(root, exponent);
+  return {value.re, value.im};
+}
+
+vector<uint2> genSmallTrigM19(u32 size, u32 radix) {
+  u32 const WG = size / radix;
+  vector<uint2> tab;
+  M19GF const root = m19RootOne(size);
+  for (u32 line = 1; line < radix; ++line) {
+    for (u32 col = 0; col < WG; ++col) {
+      tab.push_back(m19RootPower(root, col * line));
+    }
+  }
+  tab.resize(size);
+  return tab;
+}
+
+vector<uint2> genSmallTrigComboM19(Args *args, u32 width, u32 middle,
+                                    u32 size, u32 radix,
+                                    bool tail_single_wide) {
+  vector<uint2> tab = genSmallTrigM19(size, radix);
+  u32 const tailTrigs = args->value("TAIL_TRIGS61", 0);
+  M19GF const root = m19RootOne(width * middle * size);
+  if (tailTrigs >= 1) {
+    for (u32 me = 0; me < size / radix; ++me) {
+      tab.push_back(m19RootPower(root, width * middle * me));
+    }
+    for (u32 line = 0; line <= width * middle / 2; ++line) {
+      tab.push_back(m19RootPower(root, line));
+      if (!tail_single_wide) {
+        tab.push_back(m19RootPower(
+          root, line ? width * middle - line : width * middle / 2));
+      }
+    }
+  }
+  if (tailTrigs == 0) {
+    for (u32 u = 0; u <= width * middle / 2; ++u) {
+      for (u32 v = 0; std::cmp_less(v, tail_single_wide ? 1 : 2); ++v) {
+        u32 const line = v == 0 ? u :
+          (u ? width * middle - u : width * middle / 2);
+        for (u32 me = 0; me < size / radix; ++me) {
+          tab.push_back(m19RootPower(root, line + width * middle * me));
+        }
+      }
+    }
+  }
+  return tab;
+}
+
+vector<uint2> genMiddleTrigM19(u32 smallH, u32 middle, u32 width) {
+  vector<uint2> tab;
+  if (middle == 1) {
+    tab.resize(1);
+  } else {
+    M19GF const rootHM = m19RootOne(smallH * middle);
+    for (u32 m = 1; m < middle; ++m) {
+      for (u32 k = 0; k < smallH; ++k) {
+        tab.push_back(m19RootPower(rootHM, k * m));
+      }
+    }
+    M19GF const rootMW = m19RootOne(middle * width);
+    for (u32 k = 0; k < width; ++k) {
+      tab.push_back(m19RootPower(rootMW, k));
+    }
+    M19GF const rootWMH = m19RootOne(width * middle * smallH);
+    for (u32 k = 0; k < smallH; ++k) {
+      tab.push_back(m19RootPower(rootWMH, k));
+    }
+  }
+  return tab;
+}
+
+} // namespace
+
+uint2 root1M19(u32 N, u32 k) {
+  assert(k < N);
+  return m19RootPower(m19RootOne(N), k);
+}
+
+static vector<uint2> splitRieselLane(const vector<ulong2>& packed, u32 lane) {
+  vector<uint2> result;
+  result.reserve(packed.size());
+  for (auto const& value : packed) {
+    result.push_back({u32(value.first >> (32 * lane)),
+                      u32(value.second >> (32 * lane))});
+  }
+  return result;
+}
+
+
 /**********************************************************/
 /*  Build all the needed trig values into one big buffer  */
 /**********************************************************/
 
-static vector<double2> genSmallTrig(FFTConfig fft, u32 size, u32 radix) {
+static vector<double2> genSmallTrig(Args *args, FFTConfig fft, u32 size,
+                                    u32 radix) {
   vector<double2> tab;
   size_t tabsize;
 
@@ -884,12 +1289,30 @@ static vector<double2> genSmallTrig(FFTConfig fft, u32 size, u32 radix) {
   }
 
   if (fft.NTT_GF61) {
-    vector<ulong2> tab3 = genSmallTrigGF61(size, radix);
+    vector<ulong2> tab3 = args->value("GOLD_PAIR", 0) ?
+      genSmallTrigGoldPair(size, radix) :
+      (fft.shape.fft_type == FFT31R2 && !fft.NTT_RIESEL ?
+       genSmallTrigRiesel(size, radix, args->value("RIESEL_LAZY", 0)) :
+       genSmallTrigGF61(size, radix));
     tab3.resize(SMALLTRIG_GF61_SIZE(size, 0, 0, 0));
     // Append tab3 to tab
     tabsize = tab.size();
     tab.resize(tabsize + tab3.size());
     memcpy((double *) tab.data() + tabsize * 2, tab3.data(), tab3.size() * 2 * sizeof(ulong));
+  }
+
+  if (fft.NTT_RIESEL) {
+    vector<ulong2> const packed = genSmallTrigRiesel(
+      size, radix, args->value("RIESEL_LAZY", 0));
+    for (u32 lane = 0; lane != 2; ++lane) {
+      vector<uint2> laneTab = lane == 1 && args->value("M19_FIELD", 0) ?
+        genSmallTrigM19(size, radix) : splitRieselLane(packed, lane);
+      laneTab.resize(SMALLTRIG_GF31_SIZE(size, 0, 0, 0));
+      tabsize = tab.size();
+      tab.resize(tabsize + laneTab.size() / 2);
+      memcpy((double *)tab.data() + tabsize * 2, laneTab.data(),
+             laneTab.size() * 2 * sizeof(uint));
+    }
   }
 
   return tab;
@@ -898,6 +1321,9 @@ static vector<double2> genSmallTrig(FFTConfig fft, u32 size, u32 radix) {
 static vector<double2> genSmallTrigCombo(Args *args, FFTConfig fft, u32 width, u32 middle, u32 size, u32 radix, bool tail_single_wide) {
   vector<double2> tab;
   size_t tabsize;
+  u32 const transformMiddle = args->value("GOOD_THOMAS9", 0) ? middle / 9 :
+                              args->value("GOOD_THOMAS7", 0) ? middle / 7 :
+                              args->value("GOOD_THOMAS3", 0) ? middle / 3 : middle;
 
   if (fft.FFT_FP64) {
     tab = genSmallTrigComboFP64(args, width, middle, size, radix, tail_single_wide);
@@ -914,7 +1340,7 @@ static vector<double2> genSmallTrigCombo(Args *args, FFTConfig fft, u32 width, u
   }
 
   if (fft.NTT_GF31) {
-    vector<uint2> tab2 = genSmallTrigComboGF31(args, width, middle, size, radix, tail_single_wide);
+    vector<uint2> tab2 = genSmallTrigComboGF31(args, width, transformMiddle, size, radix, tail_single_wide);
     tab2.resize(SMALLTRIGCOMBO_GF31_SIZE(width, middle, size, radix));
     // Append tab2 to tab
     tabsize = tab.size();
@@ -923,7 +1349,12 @@ static vector<double2> genSmallTrigCombo(Args *args, FFTConfig fft, u32 width, u
   }
 
   if (fft.NTT_GF61) {
-    vector<ulong2> tab3 = genSmallTrigComboGF61(args, width, middle, size, radix, tail_single_wide);
+    vector<ulong2> tab3 = args->value("GOLD_PAIR", 0) ?
+      genSmallTrigComboGoldPair(args, width, middle, size, radix,
+                                tail_single_wide) :
+      (fft.shape.fft_type == FFT31R2 && !fft.NTT_RIESEL ?
+       genSmallTrigComboRiesel(args, width, transformMiddle, size, radix, tail_single_wide) :
+       genSmallTrigComboGF61(args, width, transformMiddle, size, radix, tail_single_wide));
     tab3.resize(SMALLTRIGCOMBO_GF61_SIZE(width, middle, size, radix));
     // Append tab3 to tab
     tabsize = tab.size();
@@ -931,12 +1362,32 @@ static vector<double2> genSmallTrigCombo(Args *args, FFTConfig fft, u32 width, u
     memcpy((double *) tab.data() + tabsize * 2, tab3.data(), tab3.size() * 2 * sizeof(ulong));
   }
 
+  if (fft.NTT_RIESEL) {
+    vector<ulong2> const packed = genSmallTrigComboRiesel(
+      args, width, transformMiddle, size, radix, tail_single_wide);
+    for (u32 lane = 0; lane != 2; ++lane) {
+      vector<uint2> laneTab = lane == 1 && args->value("M19_FIELD", 0) ?
+        genSmallTrigComboM19(args, width, transformMiddle, size, radix,
+                             tail_single_wide) :
+        splitRieselLane(packed, lane);
+      laneTab.resize(SMALLTRIGCOMBO_GF31_SIZE(width, middle, size, radix));
+      tabsize = tab.size();
+      tab.resize(tabsize + laneTab.size() / 2);
+      memcpy((double *)tab.data() + tabsize * 2, laneTab.data(),
+             laneTab.size() * 2 * sizeof(uint));
+    }
+  }
+
   return tab;
 }
 
-static vector<double2> genMiddleTrig(FFTConfig fft, u32 smallH, u32 middle, u32 width) {
+static vector<double2> genMiddleTrig(Args *args, FFTConfig fft, u32 smallH,
+                                     u32 middle, u32 width) {
   vector<double2> tab;
   size_t tabsize;
+  u32 const transformMiddle = args->value("GOOD_THOMAS9", 0) ? middle / 9 :
+                              args->value("GOOD_THOMAS7", 0) ? middle / 7 :
+                              args->value("GOOD_THOMAS3", 0) ? middle / 3 : middle;
 
   if (fft.FFT_FP64) {
     tab = genMiddleTrigFP64(smallH, middle, width);
@@ -953,7 +1404,7 @@ static vector<double2> genMiddleTrig(FFTConfig fft, u32 smallH, u32 middle, u32 
   }
 
   if (fft.NTT_GF31) {
-    vector<uint2> tab2 = genMiddleTrigGF31(smallH, middle, width);
+    vector<uint2> tab2 = genMiddleTrigGF31(smallH, transformMiddle, width);
     tab2.resize(MIDDLETRIG_GF31_SIZE(width, middle, smallH));
     // Append tab2 to tab
     tabsize = tab.size();
@@ -962,12 +1413,32 @@ static vector<double2> genMiddleTrig(FFTConfig fft, u32 smallH, u32 middle, u32 
   }
 
   if (fft.NTT_GF61) {
-    vector<ulong2> tab3 = genMiddleTrigGF61(smallH, middle, width);
+    vector<ulong2> tab3 = args->value("GOLD_PAIR", 0) ?
+      genMiddleTrigGoldPair(smallH, middle, width) :
+      (fft.shape.fft_type == FFT31R2 && !fft.NTT_RIESEL ?
+       genMiddleTrigRiesel(smallH, transformMiddle, width,
+                           args->value("RIESEL_LAZY", 0)) :
+       genMiddleTrigGF61(smallH, transformMiddle, width));
     tab3.resize(MIDDLETRIG_GF61_SIZE(width, middle, smallH));
     // Append tab3 to tab
     tabsize = tab.size();
     tab.resize(tabsize + tab3.size());
     memcpy((double *) tab.data() + tabsize * 2, tab3.data(), tab3.size() * 2 * sizeof(ulong));
+  }
+
+  if (fft.NTT_RIESEL) {
+    vector<ulong2> const packed = genMiddleTrigRiesel(
+      smallH, transformMiddle, width, args->value("RIESEL_LAZY", 0));
+    for (u32 lane = 0; lane != 2; ++lane) {
+      vector<uint2> laneTab = lane == 1 && args->value("M19_FIELD", 0) ?
+        genMiddleTrigM19(smallH, transformMiddle, width) :
+        splitRieselLane(packed, lane);
+      laneTab.resize(MIDDLETRIG_GF31_SIZE(width, middle, smallH));
+      tabsize = tab.size();
+      tab.resize(tabsize + laneTab.size() / 2);
+      memcpy((double *)tab.data() + tabsize * 2, laneTab.data(),
+             laneTab.size() * 2 * sizeof(uint));
+    }
   }
 
   return tab;
@@ -991,7 +1462,7 @@ TrigPtr TrigBufCache::smallTrig(Args *args, FFTConfig fft, u32 width, u32 nW, u3
   u32 const tail_trigs31 = args->value("TAIL_TRIGS31", 2);             // Default is reading GF31 trigs from memory
   u32 const tail_trigs32 = args->value("TAIL_TRIGS32", 2);             // Default is calculating FP32 trigs from scratch, no memory accesses
   u32 const tail_trigs61 = args->value("TAIL_TRIGS61", 2);             // Default is reading GF61 trigs from memory
-  u32 const key_part = make_key_part(fft.FFT_FP64, tail_trigs, fft.NTT_GF31, tail_trigs31, fft.FFT_FP32, tail_trigs32, fft.NTT_GF61, tail_trigs61, tail_single_wide);
+  u32 const key_part = make_key_part(fft.FFT_FP64, tail_trigs, fft.NTT_GF31, tail_trigs31, fft.FFT_FP32, tail_trigs32, fft.NTT_GF61, tail_trigs61, tail_single_wide) + (fft.NTT_RIESEL << 20) + (args->value("RIESEL_LAZY", 0) << 21) + (args->value("GOOD_THOMAS3", 0) << 22) + (args->value("M19_FIELD", 0) << 23) + (args->value("GOOD_THOMAS7", 0) << 24) + (args->value("GOOD_THOMAS9", 0) << 25);
 
   // See if there is an existing smallTrigCombo that we can return (using only a subset of the data)
   // In theory, we could match any smallTrigCombo where width matches.  However, SMALLTRIG_GF31_SIZE wouldn't be able to figure out the size.
@@ -1008,7 +1479,7 @@ TrigPtr TrigBufCache::smallTrig(Args *args, FFTConfig fft, u32 width, u32 nW, u3
   if (it != m.end() && (p = it->second.lock())) return p;
 
   // Create a new non-combo
-  p = make_shared<TrigBuf>(context, genSmallTrig(fft, width, nW));
+  p = make_shared<TrigBuf>(context, genSmallTrig(args, fft, width, nW));
   m[key] = p;
   smallCache.add(p);
   return p;
@@ -1019,10 +1490,10 @@ TrigPtr TrigBufCache::smallTrigCombo(Args *args, FFTConfig fft, u32 width, u32 m
   u32 const tail_trigs31 = args->value("TAIL_TRIGS31", 2);             // Default is reading GF31 trigs from memory
   u32 const tail_trigs32 = args->value("TAIL_TRIGS32", 2);             // Default is calculating FP32 trigs from scratch, no memory accesses
   u32 const tail_trigs61 = args->value("TAIL_TRIGS61", 2);             // Default is reading GF61 trigs from memory
-  u32 const key_part = make_key_part(fft.FFT_FP64, tail_trigs, fft.NTT_GF31, tail_trigs31, fft.FFT_FP32, tail_trigs32, fft.NTT_GF61, tail_trigs61, tail_single_wide);
+  u32 const key_part = make_key_part(fft.FFT_FP64, tail_trigs, fft.NTT_GF31, tail_trigs31, fft.FFT_FP32, tail_trigs32, fft.NTT_GF61, tail_trigs61, tail_single_wide) + (fft.NTT_RIESEL << 20) + (args->value("RIESEL_LAZY", 0) << 21) + (args->value("GOOD_THOMAS3", 0) << 22) + (args->value("M19_FIELD", 0) << 23) + (args->value("GOOD_THOMAS7", 0) << 24) + (args->value("GOOD_THOMAS9", 0) << 25);
 
   // If there are no pre-computed trig values we might be able to share this trig table with fft_WIDTH
-  if (((tail_trigs == 2 && fft.FFT_FP64) || (tail_trigs32 == 2 && fft.FFT_FP32)) && !fft.NTT_GF31 && !fft.NTT_GF61)
+  if (((tail_trigs == 2 && fft.FFT_FP64) || (tail_trigs32 == 2 && fft.FFT_FP32)) && !fft.NTT_GF31 && !fft.NTT_GF61 && !fft.NTT_RIESEL)
     return smallTrig(args, fft, height, nH, middle, height, nH, tail_single_wide);
 
   std::scoped_lock const lock{mut};
@@ -1039,16 +1510,16 @@ TrigPtr TrigBufCache::smallTrigCombo(Args *args, FFTConfig fft, u32 width, u32 m
   return p;
 }
 
-TrigPtr TrigBufCache::middleTrig(Args * /*args*/, FFTConfig fft, u32 SMALL_H, u32 MIDDLE, u32 width) {
+TrigPtr TrigBufCache::middleTrig(Args *args, FFTConfig fft, u32 SMALL_H, u32 MIDDLE, u32 width) {
   std::scoped_lock const lock{mut};
   auto& m = middle;
-  u32 const key_part = make_key_part(fft.FFT_FP64, 0, fft.NTT_GF31, 0, fft.FFT_FP32, 0, fft.NTT_GF61, 0, 0);
+  u32 const key_part = make_key_part(fft.FFT_FP64, 0, fft.NTT_GF31, 0, fft.FFT_FP32, 0, fft.NTT_GF61, 0, 0) + (fft.NTT_RIESEL << 20) + (args->value("RIESEL_LAZY", 0) << 21) + (args->value("GOOD_THOMAS3", 0) << 22) + (args->value("M19_FIELD", 0) << 23) + (args->value("GOOD_THOMAS7", 0) << 24) + (args->value("GOOD_THOMAS9", 0) << 25);
   decay_t<decltype(m)>::key_type const key{SMALL_H, MIDDLE, width, key_part};
 
   TrigPtr p{};
   auto it = m.find(key);
   if (it == m.end() || !(p = it->second.lock())) {
-    p = make_shared<TrigBuf>(context, genMiddleTrig(fft, SMALL_H, MIDDLE, width));
+    p = make_shared<TrigBuf>(context, genMiddleTrig(args, fft, SMALL_H, MIDDLE, width));
     m[key] = p;
     middleCache.add(p);
   }
