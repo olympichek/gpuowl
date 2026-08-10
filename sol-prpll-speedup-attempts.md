@@ -6477,3 +6477,70 @@ for this layout, and do not quote the single-tile timing as an engine speedup.
 Future DSM work would need a substantially smaller live representation or a
 way to preserve the existing line-pair block parallelism; merely distributing
 the two complete tiles cannot pass the gate.
+
+## Two-61-bit-field 3M architecture
+
+After the Hermitian DSM rejection, the registry was searched for a 3M design
+using two quadratic 61-bit fields rather than the previously tested
+`M31+M61+q31` three-field system.  This is a real representation-level
+distinction: two 16-byte quadratic values over 1.5M packed positions retain the
+same 48-MiB state, supply roughly 122 CRT bits, and avoid transforming two
+separate 32-bit fields.  No earlier local benchmark included its shorter
+population or its two-stream overlap against production.
+
+A deterministic 64-bit prime search jointly required:
+
+1. `q+1` divisible by `2^19` for the three packed 1M-word channels;
+2. `3 | q-1` for the scalar Good--Thomas radix three;
+3. `2^((q^2-1)/gcd(3*2^20,q^2-1)) = 1 (mod q)` for the exact
+   Crandall--Fagin weight; and
+4. the smallest pseudo-Mersenne complement to make reduction as favorable as
+   possible.
+
+The first useful candidate is
+
+```text
+q = 2^61 - 72,351,745 = 2,305,843,009,141,342,207.
+```
+
+Deterministic Miller--Rabin and `openssl prime` both classify it as prime;
+`q+1` is divisible by `2^20`, `q-1` is divisible by three, and the weight test
+returns one.  `M61*q/2` has just under 121 usable balanced bits, versus the
+existing conservative p150 3M coefficient bound of about 118.17 bits, so this
+is a general 140--150M-capable range rather than a p136 sparse-error trick.
+
+The early arithmetic test first compared exact canonical pseudo-Mersenne fold
+and radix-`2^64` Montgomery reducers over 1,572,864 quadratic values.  At eight
+dependent products the fold is 1.565x M61 and Montgomery is 1.494x; Montgomery
+is therefore the candidate representation.  It uses 36 registers versus 32
+for M61, with no stack or spills.
+
+[`src/cuda/m61_near61_overlap_bench.cu`](src/cuda/m61_near61_overlap_bench.cu)
+then performs the decisive matched gate.  It compares concurrent M31/M61
+kernels at the real 4M population (2,097,152 quadratic values per field) with
+concurrent M61/q kernels at the shorter 3M population (1,572,864 per field).
+The q stream remains in Montgomery form.  Every tested output agrees with an
+independent host `unsigned __int128` calculation.  Five fresh 31-sample
+processes gave:
+
+| Dependent quadratic products | 4M M31+M61 | 3M M61+q | Candidate/control |
+|---:|---:|---:|---:|
+| 2 | 77.770--78.536 us | 77.061--77.662 us | 0.981--0.999 |
+| 4 | 84.379--85.752 us | 86.458--87.979 us | 1.014--1.030 |
+| 8 | 116.464--117.587 us | 129.045--130.178 us | **1.100--1.111** |
+| 16 | 195.208--196.240 us | 219.514--220.549 us | **1.121--1.127** |
+
+The one-load/two-product case nearly ties because the candidate moves 25% less
+data.  As soon as arithmetic reuse approaches an NTT tile, two wide modular
+streams contend for the same integer pipelines and the generic field loses
+10--13% despite its shorter population.  A full transform would add the radix-3
+edge, generic q roots/weights, and a wider 122-bit CRT/carry; none can reverse
+an already negative transform-density gate or produce the required 12.4%
+whole-iteration gain.
+
+Decision: **reject the two-61-bit 3M architecture before a radix tile or PRPLL
+integration.**  Its algebra and capacity are sound, but replacing the cheap
+M31 stream by a second wide field removes the incumbent's complementary
+arithmetic scheduling.  Do not repeat this design with a larger complement;
+the selected q is already the most reduction-favorable compatible candidate
+found, and generic Montgomery was faster than its pseudo-Mersenne fold.
