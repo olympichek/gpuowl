@@ -6431,3 +6431,49 @@ therefore include production M61 range-redundant arithmetic, middle/height
 twiddles, transposes, the Hermitian pointwise square, and simultaneous M31
 work.  Do not count the 11% proxy result as a PRPLL speedup until that exact
 dependency-closed path is measured.
+
+### Hermitian-pair strengthening: reject production DSM residency
+
+The required follow-up exposed a dependency omitted by the passing gate above.
+Its independent cyclic square keeps one `8x512` tile live (64 KiB), whereas
+PRPLL's `onePairSq` couples each spectrum line to its reversed conjugate line.
+A resident implementation must therefore hold **two** complete tiles, 128 KiB,
+not one.  This was checked before attempting runtime cluster-launch integration.
+
+The benchmark now ports the canonical exact type-zero `onePairSq` algebra:
+`X2(a,conj(b))`, two field squares, multiplication by `t_squared`, `2ab`, the
+second `X2`/conjugation, and the production component swap.  Tile B is reversed
+in shared memory before pairing and reversed back afterwards, matching the
+actual `revCrossLine` dependency.  A spill-free 512-thread control processes
+two conjugate 512-point lines concurrently in 16 KiB, with the middle forward
+and inverse remaining separate.  The resident candidate uses a four-block
+cluster: ranks 0/1 retain tile A and ranks 2/3 tile B, each block owning four
+height lines in 32 KiB.  Radix eight crosses the two blocks of each tile and
+the pair square crosses corresponding blocks through DSM.
+
+Every value from the separate and resident paths matches after both an isolated
+application and the accumulated timed applications.  The double-wide control
+uses 48 registers; the clustered kernel uses 80 registers and one barrier.
+Neither has a stack frame or spills.  Across five fresh 21-sample processes:
+
+| Exact 2,097,152-value Hermitian-pair core | Median range | Relative |
+|---|---:|---:|
+| separate middle / double-wide tail / middle | **238.016--239.680 us** | 1.000 |
+| four-block, 128-KiB paired DSM residency | 366.144--368.416 us | **1.536--1.547** |
+
+The dependency-correct resident layout loses `128.000--130.272 us`, roughly
+54%.  The control exposes all 2,048 line pairs as independent blocks; the
+cluster instead serializes four 512-point lines per block and adds cluster-wide
+synchronization.  Eliminating two global tile boundaries does not compensate.
+A two-block version with one 64-KiB tile per block would serialize all eight
+lines per block and inherits the already measured loss of the one-block
+single-tile layout, so it is not a stronger alternative.
+
+Decision: **reject full M61 transform residency for the production Hermitian
+tail.**  The earlier 11% result remains a valid single-tile DSM primitive, but
+its direct 12-us PRPLL forecast is invalid because it omitted the conjugate
+tile.  Do not integrate cluster launch support or production lazy arithmetic
+for this layout, and do not quote the single-tile timing as an engine speedup.
+Future DSM work would need a substantially smaller live representation or a
+way to preserve the existing line-pair block parallelism; merely distributing
+the two complete tiles cannot pass the gate.
