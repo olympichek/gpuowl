@@ -6371,3 +6371,63 @@ not sources for the missing 16 us.  Decision: **retain the short exact reducer
 as a component result, but keep q24 times M61 rejected for the 180-us gate.**
 Do not repeat the compensated q24 quotient or infer a full-engine speedup from
 the improved isolated FP32 timing.
+
+## Two-block DSM M61 resident-transform gate
+
+The earlier M61 resident experiment above was checked before reopening this
+route.  Its one 256-thread block retained an entire `8x512` quadratic tile in
+64 KiB of shared memory, but serialized all eight height lines and measured
+2--3% slower than three cache-resident kernels.  That result explicitly left
+one architectural distinction untested: split the tile across a thread-block
+cluster so that each block uses less shared memory and multiple line groups
+execute concurrently, while distributed shared memory carries only the
+factorization boundary.
+
+[`src/cuda/m61_resident_tile_bench.cu`](src/cuda/m61_resident_tile_bench.cu)
+now includes this exact DSM design.  A two-block cluster assigns four complete
+512-point lines and 32 KiB of shared memory to each 256-thread block.  The first
+forward and last inverse radix-8 middle stages exchange the opposite four lines
+through DSM; every 512-point forward/square/inverse transform remains local.
+This removes the same two global intermediate boundaries as the rejected
+one-block kernel without making one block serialize all eight lines.
+
+Random round trips, the independently known sparse square of `[1,2]`, and every
+value after the accumulated timed squares match the three-kernel exact M61
+control.  The clustered square kernel uses 80 registers, 32 KiB shared per
+block, one CTA barrier resource, and no stack or spills.  The one-block resident
+kernel uses 82 registers and 64 KiB; the separate middle/height controls use
+`96/40/94` registers.
+
+Five fresh 21-sample processes gave:
+
+| Exact 2,097,152-value M61 core | Median range | Relative to separate |
+|---|---:|---:|
+| three-kernel control | 344.288--345.632 us | 1.000 |
+| one-block 64-KiB resident | 351.968--353.824 us | 1.021--1.025 |
+| **two-block 32-KiB DSM cluster** | **306.240--307.328 us** | **0.886--0.890** |
+
+The cluster reproducibly saves `37.728--39.264 us`, or about **11%**, whereas
+the old one-block fusion remains slower.  This is the first evidence here that
+Blackwell DSM can profitably remove PRPLL-like transform boundaries: residency
+alone was insufficient; residency plus restored line-level parallelism is the
+mechanism.
+
+Two strengthenings delimit the useful layout.  A four-block cluster gives each
+block two lines and 16 KiB but adds a second cross-block middle stage; it is
+exact, spill-free at 46 registers, and measures 381.888 us versus a nearby
+348.608-us control (**1.096x**, a decisive loss).  Splitting the two-block
+cluster across the 512-point height rather than across the eight middle lines
+keeps radix 8 local and sends only the first/last height stage through DSM.  It
+is also exact and spill-free at 76 registers, but is effectively tied with the
+winning layout: 311.584 versus 310.688 us in the same run.  Thus two blocks are
+the useful cluster size; merely increasing cluster parallelism is not a win.
+
+This is a **passing component gate, not yet an end-to-end speedup**.  A direct
+ratio forecast would reduce the measured 111.9-us M61 bottom-half sum by about
+12 us.  That is large enough to justify a production-shaped gate because the
+ideal `M61 core + fused edge` floor would move from 185.7 us toward 174 us, but
+there is little allowance for lost M31 overlap.  The next implementation must
+therefore include production M61 range-redundant arithmetic, middle/height
+twiddles, transposes, the Hermitian pointwise square, and simultaneous M31
+work.  Do not count the 11% proxy result as a PRPLL speedup until that exact
+dependency-closed path is measured.
