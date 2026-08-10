@@ -6289,3 +6289,85 @@ arithmetic gate.**  Do not repeat separately-normalized limb transforms.  A
 future reopening would need to remove the remaining cross-limb normalization
 from an entire radix group, not merely from one quadratic product; the current
 candidate is already 12--19% behind before those group operations.
+
+## Exact q24 FP32 short-quotient reduction
+
+The q24 architecture was already rejected above after its compensated FP32
+reducer recovered only about 4 us when overlapped with M61.  Before reopening
+it, the registry and both q24 benchmarks were checked: every previous version
+formed a quotient-error correction with one extra FMA, multiply, and add.  The
+following shorter quotient selection was therefore new rather than a repeat.
+
+For `q = 14680063` and centered integral operands `|a|,|b| <= 7340031`, let
+`T=a*b`, `high=RN(T)`, `low=fma(a,b,-high)`, and let `inverseQ` be the binary32
+value of `1/q`.  The old reducer used `low` to correct `high*inverseQ` before
+rounding the quotient.  It is not necessary for this particular q.  Direct
+error bounds give
+
+```text
+|high - T|                                  <= 2^21
+|inverseQ - 1/q| = 1.5950962535145825e-15
+rounding error in high*inverseQ              <= 1/8
+|RN(high*inverseQ) - T/q|                    < 0.353795.
+```
+
+Thus `n=nearbyint(high*inverseQ)` guarantees `|T/q-n| < 0.853795`.
+The exact remainder has magnitude below 12,533,760, and the largest
+`high-n*q` FMA intermediate is below 14,630,912.  Both are comfortably below
+`2^24`, so the error-free `low` term is needed only when forming the final
+remainder:
+
+```c++
+high = a*b;
+low = fma(a,b,-high);
+n = nearbyint(high*inverseQ);
+r = fma(-n,q,high) + low;
+```
+
+One q correction then returns the exact centered result.  This is a proof for
+this q and centered range, not a license to use the shortcut for arbitrary
+24-bit primes.
+
+[`src/cuda/riesel_lazy_tile_bench.cu`](src/cuda/riesel_lazy_tile_bench.cu)
+now retains corrected and short-quotient variants side by side.  The short
+variant passed all 132,120,567 scalar pairs formed by enumerating every
+centered `a` against both endpoints, endpoint neighbors, `-1`, `0`, `1`, and
+two independent affine-hash `b` values.  It also matched Montgomery for every
+output of the 2,097,152-value radix-8/square tests through four rounds.
+
+Fresh production-population tile medians were:
+
+| Four radix-8/square rounds | median |
+|---|---:|
+| corrected exact FP32 | 20 us |
+| short-quotient exact FP32 | **18 us** |
+| canonical integer qC Montgomery | 16 us |
+| Harvey integer qC Montgomery | 15 us |
+
+The shortcut is a real 10% FP32 primitive improvement but still does not beat
+the integer qC tile.  Both FP32 tiles use 40 registers without stack or spills.
+
+The stronger test replaced the compensated reducer in
+[`src/cuda/q24_m61_overlap_bench.cu`](src/cuda/q24_m61_overlap_bench.cu) and
+reran three fresh processes.  At the transform-like chain length of eight,
+the isolated q24 kernel improved from `26.590--26.595 us` to
+`22.197--22.226 us`.  Its q24+M61 population time was
+`110.016--110.328 us`, versus `119.787--120.048 us` for M31+M61: a repeatable
+`9.459--9.962 us` advantage.  The old corrected q24 reducer had recovered only
+`4.000--4.320 us` in the same gate.  At chain 16, the new isolated q24 time was
+`39.888--39.950 us` and its overlap advantage was `18.197--18.251 us`.
+
+For chain eight, the short kernel uses 19 registers versus 22 for the
+corrected kernel, with no spills in either.  Final SASS shrinks from 944 to 800
+instructions, including 48 fewer `FFMA` and 24 fewer `FADD` instructions.
+
+This improves an exact reusable primitive, but it does **not** reverse the
+architecture decision.  The relevant eight-product overlap gain is about
+9.7 us, only 38% of the 25.5 us needed to move 205.5 to 180 us.  Moreover this
+proxy omits q24's generic transform roots, generic Crandall--Fagin weights, and
+less favorable CRT, while production M31 obtains unusually cheap rotations,
+weights, and carry constants.  All omitted whole-transform effects are costs,
+not sources for the missing 16 us.  Decision: **retain the short exact reducer
+as a component result, but keep q24 times M61 rejected for the 180-us gate.**
+Do not repeat the compensated q24 quotient or infer a full-engine speedup from
+the improved isolated FP32 timing.
