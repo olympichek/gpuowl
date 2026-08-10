@@ -6149,3 +6149,85 @@ iterations/s, approximately **500.23 us/iteration**.  Neither external backend
 is a speedup on this machine.  The local 296.2-us exact prototype remains the
 faster of the completed radix-nine implementations, but all measured exact
 paths are decisively behind production.
+
+## Complex-point Toom Tensor correction tile
+
+The correction-only q24 field was reconsidered only through an untried Tensor
+mapping, after checking the earlier `q24_tensor_bench` result.  That benchmark
+used schoolbook three-byte multiplication: nine unsigned-INT8 MMAs per dense
+base-field matrix product and three Karatsuba products per quadratic value.
+The new path instead treats each 24-bit operand as
+`d0+d1*x+d2*x^2` and evaluates it at `0`, infinity, `1`, `-1`, and
+`i`.  The product at `i` takes three real matrix products, for seven FP16 MMAs
+per base-field product rather than nine INT8 MMAs.
+
+This is exact floating-point integer arithmetic, not an approximate transform.
+All three input digits are bytes; the largest real evaluation is 765, which is
+exact in FP16.  Every 16-term matrix dot product is below `2^24`, so each exact
+FP16 product and its FP32 accumulation is integral without rounding.  The
+interpolation is particularly cheap:
+
+```text
+c2 = (C(1)+C(-1))/2 - c0 - c4
+c1+c3 = (C(1)-C(-1))/2
+c1-c3 = Im(C(i)).
+```
+
+[`src/cuda/q24_tensor_bench.cu`](src/cuda/q24_tensor_bench.cu) now validates
+both Tensor forms against the sparse Montgomery radix-16 transform over all
+2,097,152 `GF(qC^2)` values.  Every output agrees.  The Toom kernel uses 40
+registers with no stack or spill, versus 56 for the prior INT8 kernel and 16
+for sparse SIMT.  Final SASS contains native `HMMA.16816.F32` instructions, so
+the result is not a compiler fallback.
+
+```text
+schoolbook INT8 Tensor, 27 logical MMAs:   36.000 us
+complex-Toom FP16 Tensor, 21 logical MMAs: 87.776 us
+sparse SIMT radix-16:                      19.872 us
+Toom / INT8:                                2.438x
+Toom / SIMT:                                4.417x
+```
+
+FP16 Tensor throughput and the evaluation/interpolation data path overwhelm
+the nominal 22% reduction in dense matrix products.  This is a stronger failure
+than the original q24 Tensor tile, not a surviving component lead.  Decision:
+**reject complex-point Toom and do not build a full q24 correction sidecar from
+it.**  A future Tensor proposal must avoid dense radix matrices or encode more
+than one independently recoverable modular product per accumulator; merely
+changing limb multiplication from schoolbook to Toom is closed.
+
+## Exact FP64-FMA offload inside M61
+
+The pure-FP64 backend no-go above does not answer a narrower hardware question:
+whether one of the three independent scalar products in a quadratic M61
+Karatsuba multiply can move to the otherwise separate FP64 pipeline while the
+other two remain on integer units.  The experiment registry had no exact FP64
+arithmetic inside the production M61 representation, so this was eligible for
+an early primitive gate.
+
+[`src/cuda/m61_limb_bench.cu`](src/cuda/m61_limb_bench.cu) now includes an
+error-free FP64 product.  Each M61 scalar is split into 31- and 30-bit limbs.
+For two exactly represented 32-bit integers, `high=a*b` followed by
+`error=fma(a,b,-high)` gives an exact nonoverlapping product; converting and
+adding the two integral doubles recovers every product bit.  Three such products
+feed the same independently validated radix-`2^31` Karatsuba fold as the integer
+limb control.  The mixed quadratic multiply uses incumbent integer M61 products
+for `ac` and `bd` and the FP64 product only for `(a+b)(c+d)`.
+
+All 2,097,152 values match the incumbent after every timed chain.  Both FP64
+kernels use 40 registers and no stack or spills; the incumbent uses 32.  With
+eight dependent quadratic products, 31-sample medians are:
+
+```text
+incumbent 64x64 M61:             50.144 us
+integer radix-2^31 limbs:        73.504 us   (1.466x)
+all FP64-FMA limb products:    1034.016 us  (20.621x)
+two integer + one FP64 product: 346.976 us   (6.920x)
+```
+
+The FP64 multiply/FMA/conversion sequence has far lower throughput on this
+`sm_120` GPU than the compiler's 32-bit-IMAD lowering of the wide integer
+product.  Independent product scheduling cannot hide a roughly twentyfold
+primitive deficit.  Decision: **reject exact FP64 offload inside M61 before an
+NTT tile or production integration.**  This also rules out a hybrid FP64
+pipeline as the missing complement to the power-limited integer transform.
