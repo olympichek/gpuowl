@@ -42,8 +42,9 @@ if [ "${1:-}" = "pack" ]; then
   find . -maxdepth 2 \
       \( -path ./.git -o -name kernel-cache -o -name proof -o -name proof-tmp \
          -o -name '1[0-9]*' \) -prune -o \
-      -type f \( -name '*.out' -o -name '*.csv' -o -name 'gpuowl*.log' \
-         -o -name 'tune.txt' -o -name 'config.txt' -o -name 'clocks.txt' \) -path './.*' -print \
+      -type f \( \( -name '*.out' -o -name '*.csv' -o -name 'gpuowl*.log' \
+         -o -name 'tune.txt' -o -name 'config.txt' -o -name 'clocks.txt' \) -path './.*' \
+         -o -name 'nvidia-smi-q-*.txt' \) -print \
     | zip -q "$ZIP" -@
   [ -d _migration ] && zip -qr "$ZIP" _migration
   echo "Packed: $ZIP ($(du -h "$ZIP" | cut -f1))"
@@ -68,6 +69,11 @@ command -v make >/dev/null || { echo "ERROR: make not found"; exit 1; }
 # The 300 W and 600 W campaign boxes had NONE of these; each one that works
 # here unlocks a recorded open item (see next-steps below and the ledgers).
 echo "--- hardware-control probe ---"
+# Full device state snapshot (ECC mode, clocks, power limits, driver): the
+# Workstation-box pack omitted this and left the ECC default unverifiable.
+nvidia-smi -q > "nvidia-smi-q-$(date +%Y%m%d).txt" 2>&1 || true
+nvidia-smi --query-gpu=ecc.mode.current --format=csv,noheader | head -1 | \
+  xargs -I{} echo "ECC mode:                   {} (Server boards default Enabled; ~8% cycle cost measured on this workload)"
 CURPL=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits | head -1 | cut -d. -f1)
 if nvidia-smi -pl "$CURPL" >/dev/null 2>&1; then
   HAVE_PL=1; echo "power-limit control (-pl):  AVAILABLE ($(nvidia-smi --query-gpu=power.min_limit,power.max_limit --format=csv,noheader | head -1))"

@@ -606,6 +606,113 @@ Findings (per-instruction stall sampling):
    penalty: ECC adds memory latency; latency-exposed cycles scale with
    core clock; hence k grows, not c.
 
+### Directed occupancy experiment (register caps) — CLOSED, negative
+
+The one-step register reductions the crossover table allows (96->80 on
+carryFused/tailSquareGF61 for 20->24 warps/SM; 64->48 on the GF61 middles
+for 32->40; a prefer-shared+64-reg arm for 8-block carry/tail) were run as
+matched alternating fresh 100k runs at 600 W, 3 rounds, all residues exact,
+controls 152.45 +- 0.5 us:
+
+| arm | -use delta | d vs control |
+|---|---|---:|
+| R1 | REGCF3161=80 | +1.70 us |
+| R2 | R1 + REGTS61=80 | +2.79 us |
+| R3 | REGMI61=48,REGMO61=48 | +31.3 us (spills) |
+| R4 | R2 + R3 | +33.1 us |
+| R5 | L1CUDA=1,REGCF3161=64,REGTS61=64 | +20.6 us |
+
+**Occupancy-via-register-caps is closed on GB202**: the extra
+instructions/spills from tighter budgets always exceed the latency-hiding
+gain, confirming upstream's 4090 tuning.  The intermediate steps do not
+exist (88 regs buys no block at 128 threads; 56 buys none at 256), so the
+space is exhausted, not sampled.  Corollary: the latency exposure is
+structural at current occupancy — the remaining attacks on the
+long_scoreboard stall are (i) reduce the latency itself (ECC-off; measured
+next) and (ii) software prefetch/async-copy restructuring of the middles
+(the registry's "TMA rewrite — no evidence" closure now has direct counter
+evidence on its premise; see the Sol-registry audit).
+
+### Sol-registry methodology audit (2026-08-12)
+
+Six parallel auditors re-read all 9,578 lines of Sol's registry against the
+post-Sol facts (F1 corrected concurrency model, F2 NCU latency findings,
+F3 measured power scaling, F4 ~2-us noise floor, F5 scaffold-bound lesson),
+hunting false negatives.  Verdict: **the registry's closures are largely
+sound** — most rest on exact end-to-end measurements with 20-100+ us
+margins or algebraic impossibilities, and Sol's late-era protocol
+(alternated, order-reversed pairs) was good.  But the audit surfaced one
+systematic pricing error, two class-level foreclosures made on premises now
+overturned, and a handful of noise-level closures.  Cross-checked reopen
+shortlist:
+
+1. **TMA/cp.async prefetch of the middle kernels — REOPENED (HIGH).**
+   Sol closed it analytically: "Without counters there is no evidence for
+   a ... gain from merely replacing its existing cooperative loads"
+   (counters were permission-blocked).  The counters now exist and show
+   the middles are exactly what async prefetch targets: CPI 33-35,
+   long_scoreboard 22-24 cycles/instruction, DRAM 61-64%, no pipe above
+   30%.  The closure's stated reason is void.  Effort: days (kernel
+   rewrite); the diagnostic half is already done.
+2. **q24-replaces-M31 field swap — re-test the unmeasured charge (HIGH-MED).**
+   The strongest measured M31-shrinking candidate (co-run advantage
+   9.5-10.0 us at chain 8, 18.2 us at chain 16) was dismissed by an
+   UNMEASURED analytical charge (generic roots/weights/CRT "eat the rest")
+   against a 25.5-us denominator inflated by baseline drift.  Under F1,
+   M31-side work reduction is paid back at the dilated co-run rate, not
+   zero.  First gate: extend `q24_m61_overlap_bench.cu` with generic
+   twiddle products + CF weights, matched alternation (hours-day).
+3. **M31 co-run price calibration probe (cheap enabler).**  The "hidden
+   M31" decision rule priced all M31-side savings at zero; Sol's own data
+   (M31 raises the M61 path 111.9 -> 129.6 us) contradicts it.  A
+   correctness-off thinned-M31-tail run calibrates us-of-iteration per
+   us-of-M31-kernel-removed (~1 h), re-pricing q24 and any future M31-side
+   idea.
+4. **TAIL_TRIGS61 generate-vs-load (cheap, new).**  Cross-checking the
+   audit's "twiddle generation no-go overgeneralization" flag against the
+   code: the GF61/GF31 tails default to READING all trig values from
+   memory (`TAIL_TRIGS61=0`) — the memory-heavy choice inside the
+   latency-exposed tail — and no tune record toggles the GF61 knob.  The
+   opposite direction (full middle-root TABLES) lost 0.7-0.9% in
+   production, which under F2 pricing is evidence FOR generation.  Minutes
+   to test.
+5. **Resident 64-KiB M61 tile under real contention (MED).**  The isolated
+   proxy that rejected it (+1.9-2.7%) was fully L2-resident, erasing
+   exactly the global round trips the fusion deletes; under production
+   L2/DRAM contention the sign could flip.  Re-run the existing bench
+   beside an M31-shaped memory load (hours).
+6. **Two-field radix-7 q7/M61 3.5M (MED).**  Rejected on a ~1.5-us wash
+   between two DIFFERENT benchmark types, with the candidate's 12.5%
+   smaller state/carry traffic priced at zero — the currency F2 says is
+   binding.  Optimistic repricing brushes the old 25.5-us requirement.
+   Re-run both existing benches alternated + NCU the edge kernel (hours).
+7. **Two-61-bit-field 3M (MED-LOW).**  Rejected at ALU-chain depth 8-16
+   (loses 10-13%) but ties/wins at chain 2 — the memory-side regime F2
+   says production actually occupies; the candidate moves 25% fewer bytes.
+   Needs a memory-realistic tile gate (1-2 days).
+8. **Near-M61 radix-33 (LOW-MED)** — same invalid ALU-chain pricing, but
+   corrected pricing must net under 4.6 us; likely still rejects (0.5-1 d).
+9. **Batch-native M61 AoSoA (conditional)** — robust for the 180-us gate,
+   but its aggregate-throughput question was never closed; reopen only if
+   the two-worker map shows aggregate gains at some power point.
+
+Flags that DISSOLVE on cross-check: the 9-vs-10-product pair-square
+closures (noise-level as recorded, but re-closed decisively by this
+campaign's structured search: 9 is optimal, both spellings tied-or-lost);
+middle-root generation for the middles (production already generates —
+the "no-go" never governed production); the middle-6 geometry scaffolds
+(moot via the parent 3M closure); stream-priority and PDL (F1 supports the
+closures); Sol's noise-level Harvey/lazy-q deltas (route independently
+dead via the M19 bound).
+
+Model corrections for the ledger: (i) F1's "deleting side-queue work pays
+back ~fully" must NOT be generalized to mixed-pipe engines — the FP32
+factor-four data shows ~76% absorption there; (ii) several robust closures
+lean on one sub-noise number (the 1.28-us radix-9 core delta feeding the
+PFA33 bound) — their margins survive 3x error, so no action; (iii) the 3M
+hybrid scaffold (185.6 us "budget") is confirmed as the F5 exemplar: a
+false POSITIVE that consumed the campaign's largest wasted effort.
+
 ## Experiment log
 
 ### 2026-08-12: baseline reverification
