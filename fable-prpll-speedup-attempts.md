@@ -1196,3 +1196,8 @@ Two further routes toward 135 us after the fusion closure:
    NVRTC 13.2) sustained 2450 MHz gives ~136.6; 2520 gives ~133.0.
    Offsets +60..+200 with Gerbicz/residue gating per step are the last
    route to 135 on this box; offsets reset on reboot.
+
+Final permitted increment: `-lgc 2430,2430` biases the governor +20 MHz
+(2392 sustained) -> **142.8 us exact** with NVRTC 13.2.  This is the
+box's floor within the permission envelope; the residue-gated NVML
+offset ladder (user-gated) is the sole path below it.
