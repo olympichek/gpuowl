@@ -1456,3 +1456,36 @@ Checked facts en route: IADD.64 (12.3 pJ) beats 2xIADD3 (17.3 pJ) per
 on the chip (4.8) but useless for exact NTT arithmetic; DRAM data toggle
 alone is worth 50 W at production-like bandwidth (uncontrollable — residue
 data is pseudorandom).
+
+### E2: compiler-axis A/B + SASS-diff — CLOSED flat; 13.0->13.2 win explained
+
+**Production A/B, unlocked 600 W, all residue-gated exact** (`e2ab.sh`,
+`.e2ab-*` dirs): anchors (NVRTC 13.2) 142.2/143.5; NVRTC 13.3 with the new
+PTX-version clamp (`PRPLL_PTX_VERSION=9.2` — 13.3 emits `.version 9.3`
+which driver 595.84's JIT rejects outright; clamp added in clwrap_cuda.cpp)
+143.0/143.1/143.4 — **dead even, no prize**; driver-JIT opt levels
+(`PRPLL_JIT_OPT`, also new): O1 145.4 (worse), O2 143.0, O3 143.1 = default
+— **no prize**.  Both knobs stay in the tree as env-gated instruments.
+
+**SASS-diff across NVRTC 13.0/13.2/13.3 under the fixed 595 JIT**
+(`e2cap.sh`/`e2carve.py`/`e2stats.py`, artifacts in `e2-sass/`): the
+13.0->13.2 gain (-1.4 us, banked) is now causal: **carryFused shrinks 4680
+-> 4504 instructions (-3.8%)** — scheduling/folding wins spread across MOV
+-19, LOP3 -12, VIMNMX/IABS -34, ISETP -11 — in the serial-path kernel;
+13.3 sits between (4568), matching its flat A/B.  The hoped-for levers do
+NOT move on the compiler axis: **GF61 reg-reg MOV counts are pinned by the
+JIT's IMAD.WIDE pair allocation (209/203/209 across versions) and .reuse
+density is flat (~0.12)** — neither is pullable via NVRTC choice, JIT opt
+level, or PTX rewriting (the MOVs are born in the JIT's register
+allocator, downstream of everything we control).
+
+**Channel verdict (E1+E2 together): the power-aware-codegen channel is
+real but thin.**  Priced at 12 W per us, with compiler-reachable deltas
+measuring single-digit watts, the honest yield is <=0.5-1 us and today's
+measurements captured none of it.  CLOSED as a speedup route on this
+box/toolchain.  Reopen on: a driver/JIT major bump (each new ptxas
+re-rolls carryFused's schedule — re-run `e2ab.sh` + `e2stats.py`, ~30 min),
+or an NVRTC that beats 13.2's carryFused instruction count.  **The one
+quantified software-adjacent lever left is the NVML SM clock offset
+(user-gated): at 0.061 us/MHz, +60 MHz ~ -3.6 us, +120 ~ -7; the 135-us
+goal is reachable ONLY through that door (or >600 W hardware).**

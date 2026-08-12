@@ -1,0 +1,65 @@
+	.target	sm_120
+
+	.elftype	@"ET_EXEC"
+
+
+//--------------------- .text.isEqual             --------------------------
+	.section	.text.isEqual,"ax",@progbits
+	.align	128
+        .global         isEqual
+        .type           isEqual,@function
+        .size           isEqual,(.L_x_4 - isEqual)
+        .other          isEqual,@"STO_CUDA_ENTRY STV_DEFAULT"
+isEqual:
+.text.isEqual:
+        /*0000*/                   LDC R1, c[0x0][0x37c] ;
+        /*0010*/                   S2R R0, SR_TID.X ;
+        /*0020*/                   S2UR UR4, SR_CTAID.X ;
+        /*0030*/                   LDC R11, c[0x0][0x360] ;
+        /*0040*/                   IMAD R0, R11, UR4, R0 ;
+        /*0050*/                   ISETP.GT.U32.AND P0, PT, R0, 0x3fffff, PT ;
+        /*0060*/               @P0 EXIT ;
+        /*0070*/                   LDC.64 R6, c[0x0][0x380] ;
+        /*0080*/                   LDCU UR4, c[0x0][0x370] ;
+        /*0090*/                   BSSY.RECONVERGENT B0, `(.L_x_0) ;
+        /*00a0*/                   LDCU.64 UR6, c[0x0][0x358] ;
+        /*00b0*/                   LDC.64 R8, c[0x0][0x388] ;
+        /*00c0*/                   IMAD R11, R11, UR4, RZ ;
+.L_x_2:
+        /*00d0*/                   IMAD.WIDE.U32 R2, R0, 0x8, R6 ;
+        /*00e0*/                   IMAD.WIDE.U32 R4, R0, 0x8, R8 ;
+        /*00f0*/                   LDG.E.64.CONSTANT R2, desc[UR6][R2.64] ;
+        /*0100*/                   LDG.E.64.CONSTANT R4, desc[UR6][R4.64] ;
+        /*0110*/                   ISETP.NE.S64.AND P0, PT, R2, R4, PT ;
+        /*0120*/               @P0 BRA `(.L_x_1) ;
+        /*0130*/                   IADD3 R0, PT, PT, R11, R0, RZ ;
+        /*0140*/                   ISETP.GE.U32.AND P0, PT, R0, 0x400000, PT ;
+        /*0150*/              @!P0 BRA `(.L_x_2) ;
+        /*0160*/                   EXIT ;
+.L_x_1:
+        /*0170*/                   BSYNC.RECONVERGENT B0 ;
+.L_x_0:
+        /*0180*/                   LDC.64 R2, c[0x0][0x390] ;
+        /*0190*/                   STG.E desc[UR6][R2.64], RZ ;
+        /*01a0*/                   EXIT ;
+.L_x_3:
+        /*01b0*/                   BRA `(.L_x_3);
+        /*01c0*/                   NOP;
+        /*01d0*/                   NOP;
+        /*01e0*/                   NOP;
+        /*01f0*/                   NOP;
+        /*0200*/                   NOP;
+        /*0210*/                   NOP;
+        /*0220*/                   NOP;
+        /*0230*/                   NOP;
+        /*0240*/                   NOP;
+        /*0250*/                   NOP;
+        /*0260*/                   NOP;
+        /*0270*/                   NOP;
+.L_x_4:
+
+
+//--------------------- SYMBOLS --------------------------
+
+	.type		.nv.reservedSmem.offset0,@object
+	.size		.nv.reservedSmem.offset0,0x4
