@@ -805,6 +805,33 @@ pressure; spills are the known catastrophic mode; judge only by exact
 100k end-to-end runs).  Sequence AFTER the driver decision — codegen
 tuning must land on the final JIT.
 
+### Driver 580 -> 595.84: RESOLVED — the gap was the driver's memory path
+
+Swap executed (apt single-transaction 580-open -> 595-open, reboot; ECC
+stayed off; revert path `nvidia-driver-580-open`).  SASS diff first: 18 of
+19 kernels identical instruction counts (fftMiddleOutGF61 bit-identical;
+tailSquareGF61 only cosmetic IADD3->IADD spellings; carryFused +16 of
+4664, reordered prologue).  **Codegen is NOT the story.**  Perf battery
+(all residues exact):
+
+| point | 580/ECC-off | 595.84/ECC-off | delta |
+|---|---:|---:|---:|
+| unlocked 600 W, 100k tail | 150.2-151.1 | **141.8-143.2** | ~-7.5 us (-5%) |
+| locked-2100 (2084 MHz) | 171.7 | **160.9** | -10.8 us (-6.3%) |
+| ladder fit k | 347,700 | **325,116** (c 5.16) | -6.5% |
+
+- Identical SASS at identical clock running 6.3% faster = the GSP
+  firmware's memory-subsystem configuration (timings/latency), exactly
+  where the NCU stall profile said the time goes.  The "+10.1% Server
+  tax" was ~2/3 the 580 driver; residual vs the Workstation k is +2.9%
+  (board/bin at most).
+- **New campaign-best baseline: ~142-143 us/iteration at 600 W** — faster
+  than the Workstation box's 148.9.  1M steady confirm + two-worker
+  re-check (break-even was -0.1% under the old memory path) running.
+- Fleet/ops rule: **driver major version is a first-class performance
+  variable on this workload (~5-6%); pin and record it** (setup.sh
+  snapshots it); prefer 595.84+ over 580.x everywhere.
+
 ### Audit shortlist status update (post-inventory)
 
 The three flagged benches (q24 overlap, resident tile, radix-7) were
