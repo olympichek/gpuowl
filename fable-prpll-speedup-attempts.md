@@ -1489,3 +1489,26 @@ or an NVRTC that beats 13.2's carryFused instruction count.  **The one
 quantified software-adjacent lever left is the NVML SM clock offset
 (user-gated): at 0.061 us/MHz, +60 MHz ~ -3.6 us, +120 ~ -7; the 135-us
 goal is reachable ONLY through that door (or >600 W hardware).**
+
+### Clock-offset lever — CLOSED by hardware policy (Server Edition fuses OC off)
+
+The user ran the bootstrap (`sudo /tmp/clkoff 60`, tool recreated at
+`scratchpad/clkoff.c`, modern nvmlDeviceGet/SetClockOffsets v1 API):
+SM-type offsets unsupported (Invalid Argument); GRAPHICS P0 offset
+supported but **allowed range [0, 0]** — the RTX PRO 6000 Blackwell
+SERVER Edition vBIOS locks the V-f offset entirely (the Workstation
+edition of the same GB202 allows it; this is SKU policy, not a driver or
+permission issue).  The +60/+120 MHz ladder (-3.6/-7 us projected) is
+unreachable on this board.  Residual not pursued: the deprecated
+nvmlDeviceSetGpcClkVfOffset path reads the same vBIOS policy; on
+OC-fused server SKUs it returns the same refusal.
+
+**CAMPAIGN TERMINAL STATE (2026-08-12): production 142-143 us steady at
+600 W (best exact config: production -use line + NVRTC 13.2).  Every
+software channel is closed end-to-end (algorithmic, architectural,
+occupancy, compiler axis, power-aware codegen) and the two
+quasi-software levers are now both closed by hardware policy (clock
+offset fused off; 600 W = board max cap).  135 us on this exponent
+requires a different board: >600 W power headroom, an offset-unlocked
+Workstation-edition GB202 (+120 MHz there ~ -7 us -> ~136), or a
+next-generation part.**
