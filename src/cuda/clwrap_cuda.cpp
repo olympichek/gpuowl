@@ -433,6 +433,23 @@ cl_program clLinkProgram(cl_context  /*ctx*/, unsigned  /*nDevices*/, const cl_d
   auto* linked = new _cl_program;
   linked->ptx = progs[0]->ptx;
   linked->compiled = true;
+
+  // PRPLL_PTX_VERSION=9.2 rewrites the PTX ".version X.Y" directive before the
+  // driver JIT sees it: lets a newer NVRTC (e.g. 13.3, emitting .version 9.3)
+  // run on a driver whose JIT tops out lower.  Fails loudly at JIT if the PTX
+  // actually uses newer-ISA features.
+  {
+    static const char* clampVer = getenv("PRPLL_PTX_VERSION");
+    if (clampVer && clampVer[0]) {
+      string const key = ".version ";
+      size_t const pos = linked->ptx.find(key);
+      if (pos != string::npos) {
+        size_t const start = pos + key.size();
+        size_t const end = linked->ptx.find('\n', start);
+        if (end != string::npos) linked->ptx.replace(start, end - start, clampVer);
+      }
+    }
+  }
   // Carry preprocessed source through for KERNEL(N) parsing in clCreateKernel
   for (unsigned i = 0; i < nProgs; ++i) {
     if (progs[i] && !progs[i]->preprocessedSource.empty()) {
@@ -444,15 +461,25 @@ cl_program clLinkProgram(cl_context  /*ctx*/, unsigned  /*nDevices*/, const cl_d
   // Use cuModuleLoadDataEx with error log to see JIT errors
   char jitErrorLog[8192] = {};
   char jitInfoLog[4096] = {};
-  CUjit_option jitOpts[] = {
+  CUjit_option jitOpts[8] = {
     CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES, CU_JIT_ERROR_LOG_BUFFER,
     CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES, CU_JIT_INFO_LOG_BUFFER
   };
-  void* jitOptVals[] = {
+  void* jitOptVals[8] = {
     (void*)(size_t)sizeof(jitErrorLog), (void*)jitErrorLog,
     (void*)(size_t)sizeof(jitInfoLog), (void*)jitInfoLog
   };
-  CUresult const r = cuModuleLoadDataEx(&linked->module, linked->ptx.c_str(), 4, jitOpts, jitOptVals);
+  unsigned nJitOpts = 4;
+  // PRPLL_JIT_OPT=0..4 sets the driver JIT optimization level (default 4).
+  {
+    static const char* jitO = getenv("PRPLL_JIT_OPT");
+    if (jitO && jitO[0]) {
+      jitOpts[nJitOpts] = CU_JIT_OPTIMIZATION_LEVEL;
+      jitOptVals[nJitOpts] = (void*)(size_t)atoi(jitO);
+      ++nJitOpts;
+    }
+  }
+  CUresult const r = cuModuleLoadDataEx(&linked->module, linked->ptx.c_str(), nJitOpts, jitOpts, jitOptVals);
   if (r != CUDA_SUCCESS) {
     const char* errName = nullptr;
     cuGetErrorName(r, &errName);

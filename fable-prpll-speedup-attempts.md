@@ -1391,3 +1391,68 @@ Everything is committed and opt-in: shapes 1:4K:1:512 and 1:512:1:4K run
 exact through the normal pipeline; `-use TWO_STAGE=1` engages the
 middle-free bottom half.  The 135-us software path now rests on the
 power-aware codegen track (E1/E2) alone.
+
+### E1: Blackwell clock-cost table — BUILT and MEASURED (first per-class power table on GB202)
+
+Harness [`src/cuda/clockcost.cu`](src/cuda/clockcost.cu) (+ `e1run.sh`,
+`e1post.sh`, `e1sum.py`; raw CSVs in `e1-clockcost/`): one kernel per SASS
+class, 4 independent chains x 16-unroll, full occupancy, cuobjdump-verified;
+LO/HI operand-toggle variants run the SAME binary and differ only in runtime
+seeds, so toggle deltas are pure data-activity effects.  Observables: NVML
+integrated energy (nvmlDeviceGetTotalEnergyConsumption) + 20-Hz clock/power
+sampling, 60 s/run.  Three SASS-fidelity traps caught by inspection (each
+silently voids the measurement): thread-invariant chains get promoted to the
+UNIFORM datapath (wrong ALU); degenerate operands (add-0/mul-1/mov cycles)
+get constant-folded by ptxas — lo/hi must differ in DATA only, never in
+code; LDS chains that reload their own store get store-to-load-forwarded
+away (fix: load the neighbor slot).  Plus one OOB crash (k_lds [+4] read at
+tid 255 chain 3 -> pad the buffer).
+
+**P1a, locked 2092 MHz, chip watts (integrated energy, 188 SM):**
+
+| class (SASS)      | W lo  | W hi  | toggle | pJ/op lo |
+|-------------------|-------|-------|--------|----------|
+| SHF (funnel)      | 179.6 | 233.5 | +53.9  | 7.13     |
+| LOP3              | 208.7*| 213.7 | +4.8   | 8.28     |
+| LDS/STS (+LOP3)   | 205.0 | 209.7 | +4.7   | 21.7/op3 |
+| IADD3             | 218.5*| 220.1*| ~+1.6  | 8.67     |
+| IMAD (32)         | 217.6 | 241.7 | +24.1  | 8.63     |
+| FFMA              | 240.2 | 245.6 | +5.4   | 4.82     |
+| IMAD.WIDE (+AND)  | 294.7 | 279.8 | -14.9  | 11.75    |
+| IADD.64           | 308.1 | 307.7 | ~0     | 12.28    |
+| M61-modmul mix    | 352.3 | —     | —      | 12.39    |
+| DRAM stream (.cv) | 245.5 | 295.5 | +50.0  | 159/byte |
+
+(*warm-rerun values; the sweep's first run reads ~+9 W cold-start high.
+IMAD.WIDE lo>hi inversion is real but unexplained, ~5%; treat +-5% between
+adjacent same-class arms as the systematic floor.)
+
+**P1b locked 2400: W ratios 1.31-1.48 over 2100 at f-ratio 1.147 -> local
+P ∝ f^2.8** (voltage riding up with clock).  **P2, 300 W cap, sustained
+MHz — instruction mix alone spans a 510-MHz clock range at fixed power:**
+lop3/shf-lo/lds 2422 (unbound) > imad32-hi 2302 > imadwide 2115-2160 >
+add64 2070 > **m61-mix 1912**.
+
+**Production operating point (this box, 595.84, NVRTC 13.2, telemetry in
+`e1-clockcost/prod-*.csv`):** lgc2100: 447 W @ 2085 (not power-bound),
+162.2 us; lgc2400 and unlocked both: **600 W binding, f=2313+-4, 144.6-
+145.5 us**.  Local slope: 1 W saved at iso-work = +1.37 MHz = -0.083 us,
+i.e. **-1 us costs -12 W (2% of chip)**; 135 us would need ~19% chip-power
+cut from codegen alone — NOT reachable; the honest ceiling of this channel
+is ~1-2% (6-24 W) -> 0.5-2 us, plus any latency-side instruction savings.
+
+**Time-weighted production SASS mix** (580 capture, 595 near-identical;
+weights = per-kernel us/iter): IADD3 20.6%, IADD.64 13.9%, SHF 13.3%,
+LOP3 11.5%, IMAD.WIDE 10.0%, ISETP 8.4%, MOV 7.4%.  The M61 field runs on
+the two most expensive classes measured (IADD.64 0.78 pJ/cyc, IMAD.WIDE
+0.75, vs LOP3 0.53) — the GF61 kernels are the power hogs, exactly matching
+their observed queue dominance.  **GF61 kernels carry 14-16% MOV, and 187
+of fftMiddleInGF61's 200 MOVs are pure reg-reg copies** — JIT register-pair
+shuffling around IMAD.WIDE's aligned-pair constraint; pure RF power + issue
+slots, and PTX-structure-dependent -> the E2 diff axis.
+
+Checked facts en route: IADD.64 (12.3 pJ) beats 2xIADD3 (17.3 pJ) per
+64-bit add — ptxas's choice is already optimal; FFMA is the cheapest op/pJ
+on the chip (4.8) but useless for exact NTT arithmetic; DRAM data toggle
+alone is worth 50 W at production-like bandwidth (uncontrollable — residue
+data is pseudorandom).
