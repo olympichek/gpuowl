@@ -218,6 +218,126 @@ Do not reopen without new evidence: width detachment in any direction or
 queue arrangement; sidecar transforms of any length; queue-priority/PDL/
 graph scheduling; persisting-L2 or full root tables; the tune option space.
 
+## 600 W phase (2026-08-12): power-limit scaling on the full-power board
+
+The campaign migrated (via `setup.sh`) to a Vast.ai box with an RTX PRO 6000
+Blackwell **Workstation Edition**: the same GB202 silicon, SM count, and
+97.9 GiB memory as the Max-Q board, but a **600 W power limit** (range
+150-600 W, default 600).  Driver 595.84, CUDA 13.2.  This realizes the
+300 W campaign's closing statement that a full-power GB202 board is the
+single largest available speedup, and turns the previously "unavailable
+control experiment" (power-limit scaling) into a measurable one.  Still
+blocked in this container: `nvidia-smi -pl` and `-lgc` (Insufficient
+Permissions; the limit is pinned at 600 W, so no direct sweep), and NCU
+counters (ERR_NVGPUCTRPERM), so the invisible-stall route stays closed.
+
+### New production baseline
+
+A 5M-iteration production run (`.pl600-steady.ul7Cke`) passed the Gerbicz
+check with exact residues at every checkpoint (1M = `52b03a7cc55e677d`,
+matching the registry; new 5M reference `7eca65291732df02`):
+
+- Cool (first ~100k): 137-138 us/iteration at ~2380-2470 MHz.
+- Thermal steady state (reached ~1.2M, held through 5M): **148.9
+  us/iteration at 2197-2247 MHz (mean 2210), 83-84 C, 600.0 W pinned**,
+  active throttle reason = SW Power Cap only — never thermal, never the
+  clock ceiling.
+- Versus the 300 W steady state (209.5 us at 1552 MHz, 81 C): **1.407x
+  sustained throughput from 2.00x power**, i.e. perf ∝ P^0.49 over this
+  span.  Energy per iteration rose from 62.9 to 89.3 mJ (+42%).
+
+### Scaling model (task: how does PRPLL scale with the power limit?)
+
+With the limit unsweepable, the model uses the 300 W box as one anchor and
+the 600 W thermal ramp as a natural clock sweep at constant power (the boost
+governor walks 2467 -> 2200 MHz as the GPU heats at exactly 600 W).  A
+single two-parameter model
+
+```text
+t(f_SM) = 6.0 us + 315,842 us*MHz / f_SM
+```
+
+fits the 300 W steady point, the 600 W steady point, and every 20k-block
+(us/iter, mean clock) pair along the ramp — a 1552-2467 MHz span — within
+about 1.5 us.  Consequences:
+
+- The iteration is ~96% pure SM-clock-scaled; the clock-independent
+  residue is only ~6 us.  Memory-controller activity is 18%; DRAM clock is
+  immaterial.  Performance therefore scales with the power limit exactly as
+  the power-capped clock does: measured perf ∝ P^0.49 between 300 and 600 W
+  (strongly sublinear; V/f curve).
+- At the 3090 MHz ceiling the model predicts ~108 us/iteration, but even
+  600 W sustains only 2210 MHz: the workload is **still power-limited at
+  the board maximum**, with ~29% clock headroom locked behind a power draw
+  the board cannot deliver (extrapolating P ∝ f*V^2, roughly 900+ W).
+- The `-time` profile at 600 W steady state shows every kernel scaling by
+  ~the clock ratio (kCarryFused 71.5 -> 49.7, kfftMidOutGF31 50.8 -> 34.6,
+  ktailSquareGF31 39.9 -> 28.4, kfftMidInGF31 17.9 -> 12.0; ratios
+  1.40-1.49x vs clock ratio 1.42x).  No kernel became memory-bound, and the
+  M31 dilation under concurrency is unchanged (~1.6x).  **The saturation
+  model transfers to 600 W intact**: both queues remain work-saturated,
+  only deleting work shortens the iteration, and every relocation/sidecar
+  closure in the registry stands.
+
+### Does 600 W open new optimization opportunities?
+
+Three candidate reopenings were tested; none flips.
+
+1. **Tune space (rerun per setup.sh).**  A fresh `-tune ntt` reconfirmed
+   every structural production setting (TAIL_KERNELS=2, WMUL=2, MULTI_Q=1,
+   L1CUDA=3, GRAPHS=0, NOREG=0, TABMUL_CHAIN32=1) and reconfirmed
+   `1:512:8:512:202` as the only shape at its speed class covering p136
+   (the faster table entries top out at exponent <= 133M; the next covering
+   shape costs 168 us).  Its probe-level deltas (LOADS 22042->20042,
+   STORES 21->24, MODM31 2->1; plus the commented
+   TAIL_TRIGS32=0/UNROLL/ZEROHACK toggles) were put through a three-arm
+   alternating 9x100k verification with exact residues at every 20k
+   checkpoint: after thermal-drift correction both trial arms sit within
+   +-0.5 us of control with inconsistent sign (round 3, near-steady:
+   control 145.9, tune line 146.5, toggles 146.2).  **Do not adopt; the
+   incumbent -use line remains optimal at 600 W.**  Notably GRAPHS=0 also
+   survives the shorter-kernel regime.
+2. **Two workers (reopened because the hardware condition materially
+   changed).**  `-prps 136279841,136279879 -workers 2`, 200k/exponent,
+   thermally matched, residues exact:
+
+   | Config | per-exp us/iter | SM clock | aggregate it/s | vs single |
+   |---|---:|---:|---:|---:|
+   | 1 worker | 148.9 | 2210 | 6,716 | baseline |
+   | 2 workers, TAIL_KERNELS=2 | 323.9 | 1848 | 6,175 | -8.1% |
+   | 2 workers, TAIL_KERNELS=3 | 327.5 | ~1848 | 6,107 | -9.1% |
+
+   The loss halves versus 300 W (-17.9%/-12.7%), and the decomposition is
+   informative: doubling the resident work now costs only x0.840 in clock
+   (x0.786 at 300 W — the V/f curve is steeper up here), while overlap
+   efficiency *improves* 9.4% (the second exponent fills queue gaps and the
+   serial fused carry the first cannot use).  But the clock penalty still
+   dominates; break-even needs f_2w/f_1w >= 0.914.  The TAIL_KERNELS
+   preference also flips (2 beats 3 with two workers at 600 W).  **Two
+   workers remain rejected at 600 W**; on a still-higher-ceiling board the
+   sign plausibly flips — first hardware condition to re-check on any
+   future >600 W machine.
+3. **Kernel balance / memory wall.**  Higher clocks with fixed DRAM
+   bandwidth could have exposed a memory-bound kernel worth re-tuning or
+   restructuring around; the `-time` profile above shows this did not
+   happen (all kernels ~clock-scaled, memory activity 18%).  No reopening.
+
+### Updated campaign boundary (600 W)
+
+The full-power board delivers +40.8% sustained throughput (209.5 -> 148.9
+us/iteration) purely from hardware; no software change is implicated, and
+every software conclusion from both campaigns carries over unchanged.  The
+GPU still runs at its power wall (SW Power Cap active at 600.0 W, 2210 of
+3090 MHz).  Remaining routes, in order of credibility:
+
+- Hardware again: more SMs or a higher ceiling (perf ∝ P^0.49 here; a
+  hypothetical uncapped clock ceiling is worth a further ~27%, but needs
+  ~900+ W).  On any >600 W or multi-GPU machine, re-check two workers
+  first (-8.1% margin at 600 W, improving with ceiling).
+- An algebraic reduction in total exact work per iteration (Sol's reopen
+  conditions stand unchanged).
+- NCU counters on a host that permits them (still ERR_NVGPUCTRPERM here).
+
 ## Experiment log
 
 ### 2026-08-12: baseline reverification
@@ -321,3 +441,30 @@ that reduces *total* M31 width work (not its location), or if hardware gains
 a genuinely idle execution reservoir.  This closes the last unexploited
 opening left by Sol's 186.3-us scaffold: the scaffold bound was real but
 unreachable because it deleted work rather than relocating it.
+
+### 2026-08-12: 600 W box — power-limit scaling investigation (see "600 W phase")
+
+Machine change, not a code change.  Runs and protocol, all with the
+unmodified production binary (commit 3071f48):
+
+- `setup.sh` bootstrap validation: 100k exact (2k/100k residues match).
+- `.pl600-steady.ul7Cke`: 5M iterations, production config, 1-s telemetry
+  (power/SM clock/temp/throttle reasons).  Exact through 5M; steady state
+  148.9 us at 2210 MHz / 600.0 W / 83-84 C, SW Power Cap the only active
+  throttle reason for the entire run.
+- `.time600.jCNBlT`: 100k with `-time` at matched thermal state; kernel
+  table in the section above.
+- `.w2tk2.qU8OAL`, `.w2tk3.pSUr5n`, `.w2clk.B5yGhE`: two-worker retest
+  (`-prps 136279841,136279879 -workers 2`), 200k/exponent + clock capture;
+  aggregate -8.1% (TK=2) / -9.1% (TK=3); 2-worker clock 1845-1852 MHz.
+- `.tune600.uAnxPd`: full `-tune ntt`; `.v600-{C,A,B}{1,2,3}.*`: three-arm
+  alternating 9x100k verification of its deltas (control / tune line /
+  commented toggles), residues exact everywhere, no reproducible gain.
+
+Conclusions recorded in the "600 W phase" section: perf ∝ P^0.49 (1.407x
+sustained from 2.00x power); t(f) = 6.0 us + 315,842/f fits all points
+1552-2467 MHz within ~1.5 us (~96% pure SM-clock scaling); still
+power-limited at the 600 W board maximum; saturation model, tune optimum,
+and the two-worker rejection all carry over; NCU still blocked; `-pl`/`-lgc`
+still permission-blocked, so the limit itself cannot be swept from this
+container.
