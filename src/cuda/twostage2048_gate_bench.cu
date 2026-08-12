@@ -101,6 +101,61 @@ __global__ void h2048Kernel(GF61 const* in, GF61* out, GF61 const* w8, GF61 cons
   for (u32 m = 0; m < 8; ++m) o[lane + m * 256] = row[lane + m * 256];
 }
 
+// Gate 2: tail-shaped pair kernel — both Hermitian partner rows resident
+// (64 KiB shared, 512 threads), fwd both, pointwise mul, second (inverse-
+// shaped) transform, write both.  Times the 1-block/SM tail regime.
+__global__ void __launch_bounds__(512, 1) h2048PairKernel(GF61 const* in, GF61* out,
+    GF61 const* w8, GF61 const* w4, GF61 const* w2048) {
+  extern __shared__ GF61 rowsDyn[];
+  GF61 (*rows)[2048] = (GF61 (*)[2048]) rowsDyn;
+  u32 const pairG = blockIdx.x;
+  u32 const half = threadIdx.x / 256, lane = threadIdx.x % 256;
+  GF61* row = rows[half];
+  GF61 const* g = in + (pairG * 2 + half) * 2048;
+  for (u32 m = 0; m < 8; ++m) row[lane + m * 256] = g[lane + m * 256];
+  __syncthreads();
+  // both halves run the pass ladder concurrently (pass syncs all 512)
+  pass<2048, 8, 256>(row, lane, 256, w8, w2048);
+  pass<2048, 8, 256>(row, lane, 32, w8, w2048);
+  pass<2048, 8, 256>(row, lane, 4, w8, w2048);
+  pass<2048, 4, 256>(row, lane, 1, w4, w2048);
+  for (u32 m = 0; m < 8; ++m) {                      // pointwise pair-mul stand-in
+    u32 const i = lane + m * 256;
+    rows[half][i] = cmul(rows[half][i], rows[1 - half][(2048 - i) & 2047]);
+  }
+  __syncthreads();
+  pass<2048, 8, 256>(row, lane, 256, w8, w2048);     // inverse-shaped ladder
+  pass<2048, 8, 256>(row, lane, 32, w8, w2048);
+  pass<2048, 8, 256>(row, lane, 4, w8, w2048);
+  pass<2048, 4, 256>(row, lane, 1, w4, w2048);
+  GF61* o = out + (pairG * 2 + half) * 2048;
+  for (u32 m = 0; m < 8; ++m) o[lane + m * 256] = row[lane + m * 256];
+}
+
+// production-shaped 512 comparator: pair of 512 rows (16 KiB), 128 threads
+__global__ void h512PairKernel(GF61 const* in, GF61* out, GF61 const* w8, GF61 const* w512) {
+  __shared__ GF61 rows[2][512];
+  u32 const pairG = blockIdx.x;
+  u32 const half = threadIdx.x / 64, lane = threadIdx.x % 64;
+  GF61* row = rows[half];
+  GF61 const* g = in + (pairG * 2 + half) * 512;
+  for (u32 m = 0; m < 8; ++m) row[lane + m * 64] = g[lane + m * 64];
+  __syncthreads();
+  pass<512, 8, 64>(row, lane, 64, w8, w512);
+  pass<512, 8, 64>(row, lane, 8, w8, w512);
+  pass<512, 8, 64>(row, lane, 1, w8, w512);
+  for (u32 m = 0; m < 8; ++m) {
+    u32 const i = lane + m * 64;
+    rows[half][i] = cmul(rows[half][i], rows[1 - half][(512 - i) & 511]);
+  }
+  __syncthreads();
+  pass<512, 8, 64>(row, lane, 64, w8, w512);
+  pass<512, 8, 64>(row, lane, 8, w8, w512);
+  pass<512, 8, 64>(row, lane, 1, w8, w512);
+  GF61* o = out + (pairG * 2 + half) * 512;
+  for (u32 m = 0; m < 8; ++m) o[lane + m * 64] = row[lane + m * 64];
+}
+
 u64 hMul(u64 a, u64 b) { return u64(u128(a) * b % M61); }
 struct HC { u64 x, y; };
 HC hCmul(HC a, HC b) {
@@ -174,7 +229,12 @@ int main() {
   };
   float const a = median([&] { h512Kernel<<<COUNT / 512 / 4, 256>>>(in, out, w8D, w512D); });
   float const b = median([&] { h2048Kernel<<<COUNT / 2048, 256>>>(in, out, w8D, w4D, w2048D); });
+  float const pa = median([&] { h512PairKernel<<<COUNT / 1024, 128>>>(in, out, w8D, w512D); });
+  CK(cudaFuncSetAttribute(h2048PairKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+  float const pb = median([&] { h2048PairKernel<<<COUNT / 4096, 512, 65536>>>(in, out, w8D, w4D, w2048D); });
   CK(cudaGetLastError());
   std::printf("512-pt rows %.3f us | 2048-pt rows %.3f us | ratio %.4f\n", 1000 * a, 1000 * b, b / a);
+  std::printf("tail-shaped: 512-pair %.3f us | 2048-pair (64K,1blk/SM) %.3f us | ratio %.4f\n",
+              1000 * pa, 1000 * pb, pb / pa);
   return 0;
 }

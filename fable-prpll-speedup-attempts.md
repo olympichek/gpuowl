@@ -1266,3 +1266,23 @@ scheme (table vs generated at 2M entries/field), Hermitian pair mapping
 at 2048, and carry/CRT integration.  **First genuinely new structural
 idea to survive its gate in three campaigns; recorded as the successor
 project.**
+
+### Two-stage gates 2: tail-shaped pair kernel — PASSED (work-proportional)
+
+Gate 2 extends the bench with tail-shaped pair arms (fwd + pointwise
+pair-mul + second ladder, both Hermitian partner rows resident):
+512-pair (16 KiB, 128 thr) 338.8 us vs 2048-pair (64 KiB dynamic shared,
+512 thr, 1 block/SM) 414.5 us — ratio 1.2234 vs butterfly-work ratio
+22/18 = 1.222.  **The 1-block/SM 64-KiB regime is exactly
+work-proportional**: 16 warps of dense ALU saturate the SM, so the
+FUSED31 occupancy collapse does not apply to this shape.  With Gates 1-2
+green, the 2048-wide fused carry also looks likely-pass by the same
+physics (per-thread structure identical to today's: NW=8 values/thread,
+just 256 lanes/line; 512 threads + 64-KiB lds = the regime Gate 2 just
+priced).  Successor-session build plan: (1) W2048 carry-fused kernel
+(mirror carryfused.cl structure at G_W=256), (2) T2048 tail (Gate-2 shape
++ production pairSq/trigs), (3) inter-stage twiddle via per-row base +
+chained powers (middleMul pattern), (4) new shape plumbing
+(FFTConfig/Gpu.cpp) behind a -use/shape flag, (5) exact 2k/100k gates
+then A/B vs 142.8.  Estimated prize: deletes 2 of 6 boundary round trips
+(~96 MiB/iter both fields) + 4 kernel launches -> 5-12 us/iter.
