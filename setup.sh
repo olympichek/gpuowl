@@ -85,14 +85,18 @@ if [ "${SKIP_VALIDATE:-0}" != "1" ]; then
   LOG="$RUNDIR/gpuowl-0.log"
   echo "--- validation summary ---"
   grep -E "FFT:|OK |00000 " "$LOG" | tail -8 || true
-  R2K=$(grep -E "OK +2000 " "$LOG" | awk '{print $5}' | head -1 || true)
-  R100K=$(grep -E "OK +100000 " "$LOG" | awk '{print $5}' | head -1 || true)
+  # Log line format: date time exponent OK iter residue ...
+  R2K=$(grep -E "OK +2000 " "$LOG" | awk '{print $6}' | head -1 || true)
+  R100K=$(grep -E "OK +100000 " "$LOG" | awk '{print $6}' | head -1 || true)
   FAIL=0
   [ "$R2K" = "05d6515c416b83e2" ]   || { echo "RESIDUE MISMATCH at 2k:   got '${R2K:-none}' want 05d6515c416b83e2"; FAIL=1; }
   [ "$R100K" = "52775eea4730be87" ] || { echo "RESIDUE MISMATCH at 100k: got '${R100K:-none}' want 52775eea4730be87"; FAIL=1; }
   [ "$FAIL" = 0 ] && echo "Residues at 2k and 100k match the recorded production values."
-  echo "--- steady-state telemetry (most common of last 30 samples) ---"
-  tail -30 "$RUNDIR/telemetry.csv" | sort | uniq -c | sort -rn | head -3 || true
+  echo "--- under-load telemetry (samples above 150 W) ---"
+  awk -F', ' '$1+0 > 150 {pw+=$1; ck+=$2+0; if ($2+0<mn||!n) mn=$2+0; if ($2+0>mx) mx=$2+0; n++} END {
+    if (n) printf "samples=%d  mean power=%.0f W  SM clock mean=%d MHz (min %d, max %d)\n", n, pw/n, ck/n, mn, mx
+    else print "no under-load samples captured (run too short for 2-s sampling)"
+  }' "$RUNDIR/telemetry.csv"
   echo "Reference on the Max-Q 300 W box: ~201.5 us/iteration at ~1552 MHz sustained."
   [ "$FAIL" = 0 ] || exit 1
 fi
