@@ -741,6 +741,31 @@ explains all of it; driver 580-vs-595 is the confound the on-box ECC
 toggle isolates).  The locked P(f) points (275->534 W over 1.52x clock)
 also give the V/f curve directly.
 
+### ECC-off — measured; the ECC-tax hypothesis is FALSIFIED
+
+Applied `-e 0` (in-place `--gpu-reset`, driver reload, and PCI
+remove+rescan all failed to apply it; only a cold reboot works on this
+board).  All residues exact (2k/…/100k and the 1M `52b03a7cc55e677d`).
+
+| point | ECC on | ECC off | delta |
+|---|---:|---:|---:|
+| locked-2100 (2085 MHz), 100k | 171.75 us | 171.7 us | **0.0** |
+| unlocked 600 W, 100k tail | 152.45 +- 0.5 (n=15) | 150.2-151.1 (n=3) | -1.8 us |
+| unlocked 600 W, 1M tail | 153.3 us @ 2338 MHz | ~152 us @ 2370 MHz | ~-1.3 us |
+
+- **At fixed clock ECC costs nothing**: the inline-ECC read path adds no
+  visible latency to this workload.  The unlocked ~1.2% gain is purely the
+  power channel — ECC logic/traffic draws board power, and removing it
+  buys ~32 MHz at the 600 W wall.
+- **The +10.1% k gap vs the Workstation box is therefore NOT ECC.**
+  Remaining suspects: driver 580.126 vs 595.84, board firmware/memory
+  timings, or bin.  Not actionable on this host; the next box with driver
+  595+ should re-fit t(f) to isolate the driver term (setup.sh now
+  snapshots `nvidia-smi -q`, so ECC state will be recorded).
+- Decision: **keep ECC off on campaign boxes** (+1.2% free; Gerbicz + PRP
+  double-checking cover integrity), with expectations calibrated: it is a
+  power optimization, not a latency one.
+
 ### Quick probes: -lmc and TAIL_TRIGS61 — both closed
 
 - **-lmc 405 (only alternative memory state)**: 404.6 us/iter — memory
