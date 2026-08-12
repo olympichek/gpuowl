@@ -483,7 +483,10 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
                               "L2_PERSIST",             // CUDA persisting-L2 window for the largest trig table
                               "ASYNC_MID61",            // cp.async tile-looped fftMiddleOutGF61: 1=full staging, 2=half
                               "ASYNC_TILES",            // Tiles per group for ASYNC_MID61 (default 4)
-                              "FUSED31"                 // Fused middle-in + tail for the M31 plane (pair-resident tile)
+                              "FUSED31",                // Fused middle-in + tail for the M31 plane (pair-resident tile)
+                              "CARRY_NOWAIT",           // Timing scaffold: skip the carry shuttle (WRONG results)
+                              "CARRY_EARLY",            // Hoist carryFused shuttle wait+load before weights/shuffle
+                              "CARRY_ACQREL"            // Release/acquire shuttle handshake instead of device fences
                             });
     if (!isValid) {
       log("Warning: unrecognized -use key '%s'\n", k.c_str());

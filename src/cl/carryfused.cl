@@ -1903,6 +1903,16 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
 #elif FFT_TYPE == FFT3161
 
+#ifndef CARRY_NOWAIT
+#define CARRY_NOWAIT 0     // Timing scaffold: skip the carry shuttle (WRONG results)
+#endif
+#ifndef CARRY_EARLY
+#define CARRY_EARLY 0      // BROKEN: early spin livelocks the grid; do not enable (kept as evidence)
+#endif
+#ifndef CARRY_ACQREL
+#define CARRY_ACQREL 0     // Release/acquire flag handshake instead of full device fences (exact)
+#endif
+
 // The "carryFused" is equivalent to the sequence: fftW, carryA, carryB, fftPremul.
 // It uses "stairway forwarding" (forwarding carry data from one workgroup to the next)
 KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShuttle, P(u32) ready, Trig smallTrig
@@ -2113,9 +2123,9 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
   // but it's fine either way.
   // AMD's OpenCL Windows compiler generates warnings about always true if statements for WMUL-1.  So instead an #if is required
 #if WMUL == 1
-  if (gr < H) {
+  if (gr < H && !CARRY_NOWAIT) {
 #else
-  if (gr < H / WMUL && me >= (WMUL-1) * G_W) {
+  if (gr < H / WMUL && me >= (WMUL-1) * G_W && !CARRY_NOWAIT) {
 #endif
     for (i32 i = 0; i < NW; ++i) { CSSTORE(&carryShuttlePtr[gr * WIDTH + CarryShuttleAccess(lowMe, i)], carry[i]); }
 
@@ -2126,16 +2136,55 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
     bar(G_W);
     if (lowMe == 0) { atomic_store((atomic_uint *) &ready[gr], 1); }
 #else
+#if CARRY_ACQREL
+    if (lowMe % WAVEFRONT == 0) {
+      u32 pos = gr * (G_W / WAVEFRONT) + lowMe / WAVEFRONT;
+      atomic_store_explicit((atomic_uint *) &ready[pos], 1, memory_order_release, memory_scope_device);
+    }
+#else
     write_mem_fence(CLK_GLOBAL_MEM_FENCE);
     if (lowMe % WAVEFRONT == 0) {
       u32 pos = gr * (G_W / WAVEFRONT) + lowMe / WAVEFRONT;
       atomic_store((atomic_uint *) &ready[pos], 1);
     }
 #endif
+#endif
   }
 
   // Group zero will be redone when gr == H / WMUL
   if (gr == 0) { return; }
+
+#if CARRY_EARLY
+  // Early shuttle wait+load: overlap the L2 round-trip latency with the
+  // weights/stats/shuffle work below.  Same protocol and values as the
+  // original late wait; incoming carries land in inCarry and are merged
+  // after shufl_carries_up.
+  CFcarry inCarry[NW];
+  if (me < G_W) {
+    u32 pos = (gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT;
+    if (me % WAVEFRONT == 0) {
+      do { spin(); } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+    }
+    mem_fence(CLK_GLOBAL_MEM_FENCE);
+    if (me % WAVEFRONT == 0) ready[(gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT] = 0;
+    if (gr < H / WMUL) {
+      for (i32 i = 0; i < NW; ++i) { inCarry[i] = CSLOAD(&carryShuttlePtr[(gr - 1) * WIDTH + CarryShuttleAccess(me, i)]); }
+    }
+  }
+  // Full-block barrier for the rotated-read group keeps barrier pairing
+  // uniform across warps (a conditional bar() here deadlocks the block).
+  if (gr >= H / WMUL) {
+    bar();
+    if (me < G_W) {
+      for (i32 i = 0; i < NW; ++i) { inCarry[i] = CSLOAD(&carryShuttlePtr[(gr - 1) * WIDTH + CarryShuttleAccess((me + G_W - 1) % G_W, i)]); }
+      if (me == 0) {
+        CFcarry t = inCarry[NW-1];
+        for (i32 i = NW-1; i; --i) { inCarry[i] = inCarry[i-1]; }
+        inCarry[0] = t;
+      }
+    }
+  }
+#endif
 
   // Do some work while our carries may not be ready
 #if HAS_ASM
@@ -2158,7 +2207,15 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 #if SPIN_STATS && !ROE
   u32 spinCount = 0;
 #endif
+#if CARRY_EARLY
+  if (me < G_W) { for (i32 i = 0; i < NW; ++i) carry[i] = inCarry[i]; }
+  if (false) {
+#elif CARRY_NOWAIT
+  if (me < G_W) { for (i32 i = 0; i < NW; ++i) carry[i] = 0; }
+  if (false) {
+#else
   if (me < G_W) {
+#endif
 #if OLD_FENCE
     if (me == 0) {
       do {
@@ -2181,9 +2238,10 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 #if SPIN_STATS && !ROE
         ++spinCount;
 #endif
-      } while(atomic_load_explicit((atomic_uint *) &ready[pos], memory_order_relaxed, memory_scope_device) == 0);
+      } while(atomic_load_explicit((atomic_uint *) &ready[pos],
+                 CARRY_ACQREL ? memory_order_acquire : memory_order_relaxed, memory_scope_device) == 0);
     }
-    mem_fence(CLK_GLOBAL_MEM_FENCE);
+    if (!CARRY_ACQREL) mem_fence(CLK_GLOBAL_MEM_FENCE);
     // Clear carry ready flag for next iteration
     if (me % WAVEFRONT == 0) ready[(gr - 1) * (G_W / WAVEFRONT) + me / WAVEFRONT] = 0;
 #endif

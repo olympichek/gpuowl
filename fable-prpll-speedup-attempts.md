@@ -1201,3 +1201,29 @@ Final permitted increment: `-lgc 2430,2430` biases the governor +20 MHz
 (2392 sustained) -> **142.8 us exact** with NVRTC 13.2.  This is the
 box's floor within the permission envelope; the residue-gated NVML
 offset ladder (user-gated) is the sole path below it.
+
+### Approach A: decoupled/speculative carry — probed to closure
+
+The serial carryFused's inter-group carry dependency was attacked in
+three steps (all on the FFT3161 kernel, driver 595.84/NVRTC 13.2):
+
+1. **CARRY_NOWAIT scaffold** (skip shuttle entirely, wrong results,
+   NCU-timed): carryFused 72.5 -> 66.3 us isolated — **the whole
+   shuttle/wait mechanism costs 6.2 us (~4.5 at production clocks)**.
+   That is the hard ceiling of any redesign.
+2. **CARRY_EARLY** (hoist wait+load before weights/shuffle to overlap the
+   L2 round trip): grid livelock — the early spin starves co-resident
+   groups' issue slots before their stores land; a barrier-pairing hang
+   in the rotate group compounds it.  Marked BROKEN, kept as evidence.
+3. **CARRY_ACQREL** (release/acquire flag handshake replacing both
+   device-scope fences): exact, 142.98 vs control 142.51 — no gain; the
+   driver's fence path is already efficient on sm_120.
+
+Conclusion: the fused-carry design is already the optimum of its class —
+the 6-us mechanism cost cannot be recovered without either de-fusing
+(pays a full data round trip, closed by the relocation model) or
+eliminating inter-group communication (impossible: carries must cross
+groups; Sol's transfer-function constancy shortcuts the CHAIN, but the
+VALUES still need one hop, which is exactly what the shuttle is).
+**Approach A closed by measurement; the upstream carry architecture is
+vindicated.**
