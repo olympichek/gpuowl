@@ -784,6 +784,27 @@ clocks.  Post-swap readout: SASS differs + perf moves = codegen; SASS
 same + perf moves = firmware/power; nothing = board/bin (close the gap as
 unactionable).
 
+### TMA/cp.async middle-prefetch feasibility — GO (design ready)
+
+Source-verified: the middles have NO latency hiding today (one tile per
+thread, all MIDDLE=8 16-B loads batched up-front in `readMiddle*Line`
+(middle.cl:845-847), first cmul eats the full round trip — the measured
+61% long_scoreboard).  Kernels compile as CUDA C++ via NVRTC (sm_120)
+with inline PTX already pervasive (base.cl:399-640), so cp.async staging
+needs no new host plumbing; full TMA/cuTensorMap is NOT recommended (XOR-
+swizzled 256-B chunks, no sm_120 clusters).  Upstream's PREFETCHL1 note
+("tried in fftMiddleInGF61 on a 5080 with no benefit", base.cl:758) tested
+scalar prefetch without restructuring — structurally unable to help,
+doesn't price this design.  MVP: fftMiddleOutGF61 INPLACE branch, grid
+1024->256 with a 4-tile block loop, 32-KiB cp.async stage (occupancy falls
+4->2 blocks/SM — the main bet), plus a half-staging hedge arm (16 KiB,
+keeps 4 blocks/SM).  DRAM-floor ceiling: 32.9 -> ~24 us isolated per
+kernel; end-to-end estimate 3-6 us for the MVP, 9-17 us (6-11%) with all
+four middles.  Risks and mitigations recorded (REGMO61 override hook for
+pressure; spills are the known catastrophic mode; judge only by exact
+100k end-to-end runs).  Sequence AFTER the driver decision — codegen
+tuning must land on the final JIT.
+
 ### Audit shortlist status update (post-inventory)
 
 The three flagged benches (q24 overlap, resident tile, radix-7) were
