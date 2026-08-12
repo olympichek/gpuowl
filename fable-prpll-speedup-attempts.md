@@ -907,6 +907,41 @@ was the strongest flagged candidate, and its measured charge exceeded the
 assertion — the resident-tile and radix-7 reconstructions (days-class)
 should be priced with that prior.
 
+### Resident M61 tile under contention: sign FLIPS — reopened for production
+
+Audit shortlist item 5 resolved by reconstruction
+([`src/cuda/m61_resident_tile_contention_bench.cu`](src/cuda/m61_resident_tile_contention_bench.cu),
+committed): 512 exact 8x512-tile 4096-point NTT squares (fused 64-KiB
+resident kernel vs three-kernel control, shared device transforms),
+gated by direct-convolution validation of the host NTT, full 2M-value
+path agreement, and 8-tile host oracles.  q65 alternation, stream-A
+makespan under a stream-B M31-shaped co-runner at two intensities:
+
+| arm | fused - ctl3 |
+|---|---:|
+| isolated (Sol's regime) | +34.7 us (ratio 1.097; Sol's leaner design: 1.019-1.027) |
+| moderate load (~0.7 TB/s, production-like DRAM pressure) | **-18.8 us — fused WINS (0.959)** |
+| heavy load (~1.4 TB/s, saturating) | +2.9 us (parity; all queued) |
+
+Sol's isolated gate was decided by the proxy's L2 residency: the control's
+two extra 64-MiB round trips were free there and are NOT free under
+production-like contention.  The ~53-us isolated->moderate swing is
+traffic-driven (design-independent to first order); with a Sol-lean fused
+kernel the moderate-load win would be larger still.  Notably the co-runner
+also crowds SMs, so the fused kernel's 1-block/SM occupancy cost is
+already priced in — unlike the cp.async case, deleting traffic (F1's
+winning currency) beats the occupancy loss.
+
+**Status: the M61 middle/height resident-fusion route REOPENS for
+production consideration** — the first audit flag to survive measurement.
+Production translation: fusing fftMiddleInGF61+tailSquareGF61+
+fftMiddleOutGF61 deletes ~128 MiB/iteration of round trips during the
+co-run window; naive scaling suggests a 10-25 us/iter potential at 600 W.
+The hard part stands as Sol recorded: the real stripe/twiddle mapping
+under INPLACE swizzling, the pair-square (not plain pointwise), and the
+64-KiB/1-block/SM regime — a multi-day kernel project, now with a
+measured motivation instead of a measured rejection.
+
 ### Audit shortlist status update (post-inventory)
 
 The three flagged benches (q24 overlap, resident tile, radix-7) were
