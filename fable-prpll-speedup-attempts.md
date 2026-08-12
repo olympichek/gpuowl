@@ -516,6 +516,96 @@ standing tensor reopen condition (multiple recoverable modular products per
 accumulator — it delivers one).  Do not revisit absent a part with a >=10x
 FP64 tensor/vector ratio.
 
+## Admin-host phase (2026-08-12): hardware controls unlocked
+
+The campaign migrated (setup.sh) to a bare-metal-class host with an RTX PRO
+6000 Blackwell **Server Edition**: the same GB202 silicon and 188 SMs, but
+max SM clock 2430 MHz (vs the Workstation's 3090), memory 12481 MHz with
+**ECC enabled**, power range 300-600 W (default 600), driver 580.126.09,
+CUDA 13.0, passwordless sudo.  Baseline validation exact (2k/100k residues
+match; ~150.8 us cool).  This host unlocks all three items the 600 W
+boundary left open:
+
+- `sudo nvidia-smi -pl` **works** (300-600 W, verified by setting).
+- `sudo nvidia-smi -lgc/-rgc` **works** (~120 graphics steps to 2430).
+- **NCU counters work** (`RmProfilingAdminOnly=1` + sudo; full metric sets
+  captured on production kernels; residues stay exact under profiling).
+- `-lmc` exists but the board exposes only two memory states (12481/405
+  MHz): no usable memory-power knob.
+- Thermal drift is absent (69 C max at 600 W): matched measurements no
+  longer need drift correction; a 600 W point repeated after a 30-minute
+  sweep reproduced within 0.2 us.
+
+### Direct perf/W sweep (efficiency knee) — MEASURED
+
+Fresh 1M-iteration production runs per power limit, all with exact registry
+residues at 1M (`52b03a7cc55e677d`); tail = blocks >= 600k:
+
+| W | us/iter | SM MHz | it/s | mJ/iter | it/s/W | local d ln perf/d ln P |
+|---:|---:|---:|---:|---:|---:|---:|
+| 300 | 215.5 | 1641 | 4641 | 64.7 | 15.5 | - |
+| 350 | 198.9 | 1763 | 5027 | 69.7 | 14.4 | 0.52 |
+| 400 | 182.6 | 1961 | 5476 | 72.8 | 13.7 | 0.64 |
+| 450 | 170.7 | 2103 | 5858 | 76.6 | 13.1 | 0.57 |
+| 500 | 163.4 | 2196 | 6120 | 81.7 | 12.3 | 0.42 |
+| 550 | 157.5 | 2274 | 6351 | 86.5 | 11.6 | 0.39 |
+| 600 | 153.3 | 2338 | 6522 | 91.6 | 10.9 | 0.31 |
+| 600rep | 153.1 | 2339 | 6533 | 91.9 | 10.9 | (drift ctrl) |
+
+- **The knee is at ~450-500 W**: the scaling exponent holds ~0.55-0.6 up to
+  450 W then collapses to 0.31 by 600 W; the last 100 W buy +6% throughput.
+  The Workstation two-point estimate (P^0.49) was the average of this curve.
+- **Perf/W rises monotonically to the 300 W floor** (+42% it/s/W vs 600 W).
+  Fleet rule measured, not estimated: two 300 W GB202 = 9,282 it/s vs one
+  600 W = 6,522.  For it/s/$ on owned hardware, cap at the board minimum;
+  for single-card latency, run at 600 W and accept the 0.31 exponent.
+- **The Server Edition runs ~8.4% more cycles per iteration than the
+  Workstation at every clock**: fitting t = c + k/f to the sweep gives
+  c ~ 7 us, k ~ 342,000 us*MHz vs the Workstation's 6.0 + 315,842/f.  A
+  multiplicative (per-cycle) penalty is the signature of the ECC-enabled
+  memory path stretching latency-exposed cycles (see NCU findings), making
+  ECC-off the top hardware experiment on this host.
+
+### NCU counters route — the "invisible stall" is found and named
+
+Full-set NCU capture (42 launches of the 7 steady-loop kernels, isolated,
+~2.2 GHz, ECC on).  Per-kernel medians:
+
+| kernel | us | SM% | DRAM% | issue% | CPI | occ theo/ach | regs | limiter |
+|---|---:|---:|---:|---:|---:|---|---:|---|
+| carryFused | 77.6 | 52.5 | 45.3 | 38.6 | 10.7 | 41.7/36.9 | 96 | regs (5 blk) |
+| tailSquareGF61 | 46.9 | 53.1 | 50.6 | 38.4 | 10.9 | 41.7/37.6 | 96 | regs (5 blk) |
+| fftMiddleInGF61 | 34.8 | 26.5 | 61.0 | 17.6 | 34.9 | 66.7/55.9 | 64 | regs (4 blk) |
+| fftMiddleOutGF61 | 32.9 | 28.0 | 64.1 | 18.3 | 33.8 | 66.7/55.9 | 64 | regs (4 blk) |
+| tailSquareGF31 | 27.2 | 58.6 | 43.6 | 41.9 | 11.2 | 50.0/42.7 | 60 | shmem (6 blk) |
+| fftMiddleInGF31 | 16.5 | 29.8 | 64.0 | 20.9 | 33.1 | 83.3/69.6 | 48 | regs (5 blk) |
+| fftMiddleOutGF31 | 16.7 | 29.9 | 63.8 | 21.0 | 33.8 | 100/73.1 | 40 | lg_throttle |
+
+Findings (per-instruction stall sampling):
+
+1. **No kernel is pipe-saturated in isolation.**  The hottest pipe anywhere
+   is ALU-heavy at 52-59%; issue slots are 17-42% busy.
+2. **The dominant stall everywhere is `long_scoreboard`** — unhidden
+   global-memory latency landing on the first `IADD.64`/`IMAD.WIDE.U32`
+   consumers of loaded residue words (33% of carryFused stall samples, 61%
+   of fftMiddleOutGF61's).  Not an exotic pipeline hazard: plain exposed
+   DRAM/L2 latency with too few resident warps to hide it.
+3. **Occupancy is compile-time register-capped**: carryFused/tailSquareGF61
+   at 96 regs -> 5 blocks of 128 threads -> 20 warps/SM; GF61 middles at 64
+   regs -> 32 warps.  The defaults were tuned upstream on 4090/5070Ti
+   (comments in `Gpu.cpp:numCudaRegisters`), without ECC, and are
+   overridable per kernel via `-use REGCF3161/REGTS61/REGMI61/REGMO61/...`.
+4. The GF31 middle-out is the exception: 100% theoretical occupancy with
+   `lg_throttle` 10.4 (LSU queue full) — already latency-limited the other
+   way; reg caps cannot help it.
+5. If latency were fully hidden, the ALU-heavy pipe bound puts carryFused's
+   floor at ~45-50 us at 2.2 GHz (vs 77.6 measured) — an upper bound on the
+   occupancy prize, shaved in production by the power wall (higher
+   issue/cycle -> more W/cycle -> lower f at the cap).
+6. This mechanism also retro-explains the multiplicative Server/ECC
+   penalty: ECC adds memory latency; latency-exposed cycles scale with
+   core clock; hence k grows, not c.
+
 ## Experiment log
 
 ### 2026-08-12: baseline reverification
