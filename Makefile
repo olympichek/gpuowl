@@ -109,6 +109,12 @@ rns-mont-ntt-bench: build-cuda/rns-mont-ntt-bench
 
 rns31-crt-bench: build-cuda/rns31-crt-bench
 
+q24-m61-charged-bench: build-cuda/q24-m61-charged-bench
+
+build-cuda/q24-m61-charged-bench: src/cuda/q24_m61_charged_bench.cu
+	/usr/local/cuda/bin/nvcc -ccbin g++ -O3 -std=c++20 -arch=sm_120 -Isrc \
+	  -o build-cuda/q24-m61-charged-bench src/cuda/q24_m61_charged_bench.cu
+
 riesel-lazy-tile-bench: build-cuda/riesel-lazy-tile-bench
 
 warp-specialized-edge-bench: build-cuda/warp-specialized-edge-bench

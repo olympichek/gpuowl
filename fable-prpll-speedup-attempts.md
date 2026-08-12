@@ -873,6 +873,40 @@ isolated-kernel latency slack is NOT exploitable for co-run kernels —
 only the serial carryFused's slack is real, and its occupancy is
 register-bound (closed).  The counters route is now fully walked.**
 
+### q24-replaces-M31: charged gate reconstructed and MEASURED — rejection confirmed
+
+Audit shortlist item 2 (HIGH-MED) resolved.  The lost overlap bench was
+reconstructed as [`src/cuda/q24_m61_charged_bench.cu`](src/cuda/q24_m61_charged_bench.cu)
+(committed this time) from the ledger's verbatim reducer proof, mirroring
+the surviving near61 harness, with the q65-era alternation protocol and
+full-array host oracles for both q24 kernels.  Fidelity anchors: the
+short-quotient kernel compiles to 19 registers exactly as Sol recorded;
+Sol's free-root advantage reproduces in sign and shape on this box
+(q24+M61 beats generic-M31+M61 by ~2.0 us at chains 2-8, 10.7 at 16;
+compressed from Sol's 300 W numbers by clocks/driver).  New charged arms:
+per-round table-loaded generic qC twiddle product + entry/exit CF weight
+products (candidate), and power-of-two-rotation M31 (production-realistic
+control).  600 W, driver 595.84, all oracles PASS:
+
+| chain 8 co-run | us |
+|---|---:|
+| M31cheap+M61 (realistic control) | 82.6 |
+| M31gen+M61 (Sol's control) | 97.3 |
+| q24+M61 (free roots) | 95.3 |
+| **q24charged+M61** | **132.7** |
+
+The root/weight charge MORE THAN DOUBLES the isolated q24 kernel (21.1 ->
+47.7 us at chain 8); the charged candidate loses by +50.1 us against the
+realistic control and +35.4 us even against Sol's pessimistic one, at
+every chain length.  Production M31's cheap rotations are measured at
+3.5x cheaper than generic products (8.0 vs 27.7 us isolated).
+**Decision: the q24 field swap stays rejected; the audit flag is closed
+by measurement, and Sol's unmeasured analytical charge turns out to have
+UNDERSTATED the cost.**  Calibration for the remaining shortlist: this
+was the strongest flagged candidate, and its measured charge exceeded the
+assertion — the resident-tile and radix-7 reconstructions (days-class)
+should be priced with that prior.
+
 ### Audit shortlist status update (post-inventory)
 
 The three flagged benches (q24 overlap, resident tile, radix-7) were
