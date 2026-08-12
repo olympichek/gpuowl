@@ -1317,3 +1317,77 @@ axes (opcode classes, .reuse density, unroll) to convert the anomaly
 into a causal, deliberately pullable lever.  Combined with the
 two-stage backend (5-12 us), a software-only path to 135 on THIS box is
 arithmetically plausible again: 142.8 - (5..12) - (1..3)% ~ 128-137.
+
+### Two-stage backend BUILT end-to-end — exact, CLOSED negative (+109 us vs production)
+
+The production build went through three shape pivots before landing, each
+forced by a hard constraint the gates could not see:
+
+1. **1K:1:2K (planned)** — impossible without new FFT code: the generic
+   NTT ladder (`fftbase.cl` `for (s=1; s<WG; s*=RADIX)`) only realizes
+   pure RADIX powers, and 2048 = 2^11 is not a power of 4 or 8.  That is
+   the real reason 2048 appears nowhere in gpuowl's width/height lists.
+2. **4K:1:512** — enabled with a ONE-LINE FFTConfig edit (allow MIDDLE=1);
+   everything else (4K-width fused carry at WMUL=1/G_W=512, M=1 middle
+   kernels degenerating to pure twiddle+transpose, tail pairing, trig
+   generation, log2_NWORDS ladders) generalized untouched.  Exact at
+   2k/100k on the first run.  But carryFused-4K = 102.5 us (vs 51.8
+   production): register-bound to 1 block/SM (512 thr x 96 regs), the
+   12-stage dual-field width FFT exposes latency the 20-warp production
+   regime hides.  The serial section eats the entire prize.
+3. **512:1:4K (final)** — carryFused stays production-shaped (54 us
+   measured); 4096-point tail is pure radix-8 (G_H=512).  Exact at
+   2k/100k.  With the M=1 middles still present: 238.9 us (TAIL_KERNELS=0;
+   the TK=1 separate zero-line kernel is a 25.9-us 2-block serial bubble).
+
+**Phase 2 (the actual two-stage pipeline)**: new `-use TWO_STAGE=1` elides
+fftMiddleIn/Out entirely on square passes; tailSquare reads carryFused's
+INPLACE plane directly and writes it back, absorbing the inter-stage
+twiddle W_ND^(w*y) on both sides (device helpers `readTailDirect`/
+`writeTailDirect` in tailsquare.cl; the double-transform convention needs
+the FORWARD twiddle in both directions, mirroring fftMiddleOut's
+`middleMul2(u,y,x)`).  Replay integration reuses the FUSED31 machinery:
+square replays [KMIDIN,KTAILSQUARE,KMIDOUT] launch only the TS tail; mul
+replays keep the 4-kernel path (exactness preserved, muls are rare).
+One landmine cost a debugging session: `-use` keys flow into the GLOBAL
+define string, so gating the kernel edits on `TWO_STAGE` recompiled the
+NORMAL tail with a 5th (unset) trig parameter -> uniform garbage pointer,
+CUDA_ERROR_MISALIGNED_ADDRESS surfacing at unrelated module loads.
+compute-sanitizer pinned it; fix: device macro TS_TAIL, set only via the
+TS kernels' per-kernel defines.
+
+**Result: EXACT end-to-end** (2k=05d6515c416b83e2, 100k=52775eea4730be87,
+1M=52b03a7cc55e677d — all three registry residues; 1M steady 252.8 us)
+with the iteration = carryFused + tailSquare
+per field, 4 plane round-trips, 2 kernels/field — the two-stage structure
+as designed.  **261.1 us vs 238.9 with-middles vs 152.0 production
+(matched unlocked-clock conditions).**  Profile: CF 55.4 + tailTS-M31
+115.8 (M61 hidden on queue 2 and longer).  The direct-IO tail pays ~+55 us
+per field over the transposed tail: full-column access against the
+16-width-interleaved INPLACE layout scatters both reads and writes at
+16-element sector granularity, and a 1-block/SM single-wide tail (16
+GF-regs/thread) has no occupancy to hide it.
+
+**Why the idea loses — the real accounting.**  The gate arithmetic
+("same 21 butterfly stages, 2 fewer round-trips") was correct and is not
+the binding constraint.  The 512x8x512 three-stage wins on REGIME, not
+FLOP count: (a) the M=8 middle kernels amortize the transpose 8-fold —
+8 in-flight loads per thread hide latency that the M=1 transpose (30.5+
+52.0 us vs 13.0+35.5 production) and the fused direct-IO tail (+55/field)
+both expose; (b) SH=512 permits the double-wide 33-KiB tail; SH=4096
+forces single-wide (double-wide = 66 KiB static shared > 48-KiB CUDA cap)
+at double register pressure; (c) W=512 keeps carryFused at 20-warp
+occupancy; both alternate widths degrade the serial kernel.  Every
+component of the two-stage shape lands in a worse hardware regime, and
+the sum (-109 us) dwarfs the traffic saving (~96 MiB/iter ~ 30 us).
+Recoverable by further tuning (twiddle chaining, dynamic-shared
+double-wide tail): bounded ~30-40 us — cannot close the gap.  **The
+transpose kernels earn their traffic: their coalescing service is worth
+more than their bandwidth.  Two-stage CLOSED.  Reopen only on hardware
+with ≥2x register file per SM (double-wide 4K tail + 4K-width carry both
+become resident) or a >=96-KiB static shared allowance.**
+
+Everything is committed and opt-in: shapes 1:4K:1:512 and 1:512:1:4K run
+exact through the normal pipeline; `-use TWO_STAGE=1` engages the
+middle-free bottom half.  The 135-us software path now rests on the
+power-aware codegen track (E1/E2) alone.

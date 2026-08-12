@@ -154,6 +154,8 @@ private:
   Kernel ktailSquareGF31;
   Kernel kFusedMidTail31;
   u32 fused31;
+  Kernel ktailSquareTSGF31;   // TWO_STAGE tailSquare with direct carryFused-layout IO
+  u32 two_stage = 0;   // MIDDLE=1 two-stage bottom half (fftMiddleIn/Out elided on square passes)
   bool replay_square_pass = false;   // FUSED31 applies only to square (not tailMul) bottom halves
   Kernel ktailMulGF31;
   Kernel ktailMulLowGF31;
@@ -188,6 +190,7 @@ private:
   Kernel kfftHinGF61;
   Kernel ktailSquareZeroGF61;
   Kernel ktailSquareGF61;
+  Kernel ktailSquareTSGF61;   // TWO_STAGE tailSquare with direct carryFused-layout IO
   Kernel ktailMulGF61;
   Kernel ktailMulLowGF61;
   Kernel kfftMidOutGF61;

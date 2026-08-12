@@ -250,11 +250,13 @@ FFTConfig::FFTConfig(const string& spec) {
       log("Width must be 256, 512, 1024, or 4096.\n");
       throw "Invalid FFT spec";
     }
-    if (m < 2 || m > 16) {
+    // MIDDLE=1 is the two-stage (no-middle) NTT decomposition, e.g. 1:4K:1:512.
+    if (m < (fft_type == FFT3161 ? 1u : 2u) || m > 16) {
       log("Middle must be between 1 and 16.\n");
       throw "Invalid FFT spec";
     }
-    if (h != 256 && h != 512 && h != 1024) {
+    // HEIGHT=4096 pairs with MIDDLE=1 in the two-stage NTT decomposition (1:512:1:4K).
+    if (h != 256 && h != 512 && h != 1024 && !(h == 4096 && fft_type == FFT3161)) {
       log("Height must be 256, 512, 1024.\n");
       throw "Invalid FFT spec";
     }

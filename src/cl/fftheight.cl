@@ -16,8 +16,9 @@
 #include "trig.cl"
 #include "fftbase.cl"
 
-#if SMALL_HEIGHT != 256 && SMALL_HEIGHT != 512 && SMALL_HEIGHT != 1024
-#error SMALL_HEIGHT must be one of: 256, 512, 1024
+// 4096 is the two-stage (MIDDLE=1) tail: pure radix-8 at G_H=512, NH=8.
+#if SMALL_HEIGHT != 256 && SMALL_HEIGHT != 512 && SMALL_HEIGHT != 1024 && SMALL_HEIGHT != 4096
+#error SMALL_HEIGHT must be one of: 256, 512, 1024, 4096
 #endif
 
 #if !INPLACE

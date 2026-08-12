@@ -39,6 +39,75 @@ u32 get_line_number(u32 base) {
 #endif
 }
 
+#if TS_TAIL
+// Two-stage bottom half (MIDDLE==1, INPLACE==1): tailSquare bypasses the
+// fftMiddleIn/fftMiddleOut transpose kernels entirely.  It reads carryFused's
+// output plane layout directly, applying the inter-stage twiddle W_ND^(w*y)
+// exactly as fftMiddleIn's middleMul2 would, and writes carryFused's input
+// layout back applying the same twiddle (the double-transform convention uses
+// the forward twiddle in both directions -- see fftMiddleOut's middleMul2).
+// Element (w, y) of the carryFused plane lives at
+//   (w/16)*SIZEW + (y%16)*SIZEBLK + SWIZ(y%16, y/16)*16 + (w%16)
+// and the tail's u[i] holds height position y = i*G_H + me of tail line w.
+// The trig tables are the MIDDLE==1 middleMul2 pair: [W_WIDTH^k : WIDTH
+// entries][W_ND^k : SMALL_HEIGHT entries] (see genMiddleTrig).
+#if MIDDLE != 1 || INPLACE != 1
+#error TWO_STAGE requires MIDDLE=1 and INPLACE=1
+#endif
+
+#if NTT_GF31
+void OVERLOAD readTailDirect(CP(GF31) in, GF31 *u, u32 line, u32 me, TrigGF31 trigM) {
+  TrigGF31 trig1 = trigM;
+  TrigGF31 trig2 = trigM + WIDTH;
+  in += (line / 16) * SIZEW32 + (line % 16);
+  for (i32 i = 0; i < NH; ++i) {
+    u32 y = i * G_H + me;
+    GF31 t = FFTLOAD(&in[(y % 16) * SIZEBLK32 + SWIZ32(y % 16, y / 16) * 16]);
+    u32 root = line * y;                  // < ND, fits in u32
+    u[i] = cmul(t, cmul(TFLOAD(&trig2[root % SMALL_HEIGHT]), TFLOAD(&trig1[root / SMALL_HEIGHT])));
+  }
+}
+
+void OVERLOAD writeTailDirect(GF31 *u, P(GF31) out, u32 line, u32 me, TrigGF31 trigM) {
+  TrigGF31 trig1 = trigM;
+  TrigGF31 trig2 = trigM + WIDTH;
+  out += (line / 16) * SIZEW32 + (line % 16);
+  for (i32 i = 0; i < NH; ++i) {
+    u32 y = i * G_H + me;
+    u32 root = line * y;
+    GF31 t = cmul(u[i], cmul(TFLOAD(&trig2[root % SMALL_HEIGHT]), TFLOAD(&trig1[root / SMALL_HEIGHT])));
+    FFTSTORE(&out[(y % 16) * SIZEBLK32 + SWIZ32(y % 16, y / 16) * 16], t);
+  }
+}
+#endif
+
+#if NTT_GF61
+void OVERLOAD readTailDirect(CP(GF61) in, GF61 *u, u32 line, u32 me, TrigGF61 trigM) {
+  TrigGF61 trig1 = trigM;
+  TrigGF61 trig2 = trigM + WIDTH;
+  in += (line / 16) * SIZEW + (line % 16);
+  for (i32 i = 0; i < NH; ++i) {
+    u32 y = i * G_H + me;
+    GF61 t = FFTLOAD(&in[(y % 16) * SIZEBLK + SWIZ(y % 16, y / 16) * 16]);
+    u32 root = line * y;                  // < ND, fits in u32
+    u[i] = cmul(t, cmul(TFLOAD(&trig2[root % SMALL_HEIGHT]), TFLOAD(&trig1[root / SMALL_HEIGHT])));
+  }
+}
+
+void OVERLOAD writeTailDirect(GF61 *u, P(GF61) out, u32 line, u32 me, TrigGF61 trigM) {
+  TrigGF61 trig1 = trigM;
+  TrigGF61 trig2 = trigM + WIDTH;
+  out += (line / 16) * SIZEW + (line % 16);
+  for (i32 i = 0; i < NH; ++i) {
+    u32 y = i * G_H + me;
+    u32 root = line * y;
+    GF61 t = cmul(u[i], cmul(TFLOAD(&trig2[root % SMALL_HEIGHT]), TFLOAD(&trig1[root / SMALL_HEIGHT])));
+    FFTSTORE(&out[(y % 16) * SIZEBLK + SWIZ(y % 16, y / 16) * 16], t);
+  }
+}
+#endif
+#endif
+
 #if FFT_FP64
 
 // Handle the final squaring step on a pair of complex numbers.  Swap real and imaginary results for the inverse FFT.
@@ -688,7 +757,11 @@ KERNEL(G_H) tailSquareZeroGF31(P(T2) out, CP(T2) in, Trig smallTrig) {
 
 #if SINGLE_WIDE
 
-KERNEL(G_H) tailSquareGF31(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
+KERNEL(G_H) tailSquareGF31(P(T2) out, CP(T2) in, u32 base, Trig smallTrig
+#if TS_TAIL
+                           , Trig middleTrig
+#endif
+                           ) {
   local GF31 lds[LDS_BYTES / sizeof(GF31)];
   const u32 H = ND / SMALL_HEIGHT;
 
@@ -707,8 +780,14 @@ KERNEL(G_H) tailSquareGF31(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
 
   dependentLaunchWait();   // Previous kernel was fftMiddleInGF31 that launched dependents before writing GF31 data
 
+#if TS_TAIL
+  TrigGF31 trigM31 = (TrigGF31) (middleTrig + DISTMTRIGGF31);
+  readTailDirect(in31, u, line1, me, trigM31);
+  readTailDirect(in31, v, line2, me, trigM31);
+#else
   readTailFusedLine(in31, u, line1, me);
   readTailFusedLine(in31, v, line2, me);
+#endif
 
   u32 zerohack = ZEROHACK_H * (u32) get_group_id(0) / 131072;
   fft_HEIGHT1(lds + zerohack, u, smallTrig31 + zerohack, 1, me);
@@ -760,8 +839,13 @@ KERNEL(G_H) tailSquareGF31(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
   fft_HEIGHT2(lds, v, smallTrig31, 1, me);
   fft_HEIGHT2(lds, u, smallTrig31, 1, me);
 
+#if TS_TAIL
+  writeTailDirect(v, out31, line2, me, trigM31);
+  writeTailDirect(u, out31, line1, me, trigM31);
+#else
   writeTailFusedLine(v, out31, memline2, me);
   writeTailFusedLine(u, out31, memline1, me);
+#endif
 }
 
 
@@ -1149,7 +1233,11 @@ KERNEL(G_H) tailSquareZeroGF61(P(T2) out, CP(T2) in, Trig smallTrig) {
 
 #if SINGLE_WIDE
 
-KERNEL(G_H) tailSquareGF61(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
+KERNEL(G_H) tailSquareGF61(P(T2) out, CP(T2) in, u32 base, Trig smallTrig
+#if TS_TAIL
+                           , Trig middleTrig
+#endif
+                           ) {
   local GF61 lds[LDS_BYTES / sizeof(GF61)];
   const u32 H = ND / SMALL_HEIGHT;
 
@@ -1168,8 +1256,14 @@ KERNEL(G_H) tailSquareGF61(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
 
   dependentLaunchWait();   // Previous kernel was fftMiddleInGF61 that launched dependents before writing GF61 data
 
+#if TS_TAIL
+  TrigGF61 trigM61 = (TrigGF61) (middleTrig + DISTMTRIGGF61);
+  readTailDirect(in61, u, line1, me, trigM61);
+  readTailDirect(in61, v, line2, me, trigM61);
+#else
   readTailFusedLine(in61, u, line1, me);
   readTailFusedLine(in61, v, line2, me);
+#endif
 
   u32 zerohack = ZEROHACK_H * (u32) get_group_id(0) / 131072;
   fft_HEIGHT1(lds + zerohack, u, smallTrig61 + zerohack, 1, me);
@@ -1225,8 +1319,13 @@ KERNEL(G_H) tailSquareGF61(P(T2) out, CP(T2) in, u32 base, Trig smallTrig) {
   fft_HEIGHT2(lds, v, smallTrig61, 1, me);
   fft_HEIGHT2(lds, u, smallTrig61, 1, me);
 
+#if TS_TAIL
+  writeTailDirect(v, out61, line2, me, trigM61);
+  writeTailDirect(u, out61, line1, me, trigM61);
+#else
   writeTailFusedLine(v, out61, memline2, me);
   writeTailFusedLine(u, out61, memline1, me);
+#endif
 }
 
 

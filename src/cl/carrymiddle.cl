@@ -19,15 +19,11 @@
 #include "weight.cl"
 #include "middle.cl"
 
-#if FFT_TYPE == FFT3161
-
-#if WIDTH != 512 || SMALL_HEIGHT != 512 || MIDDLE != 8 || NW != 8 || !INPLACE
-#error carryMiddle currently supports only in-place 512:8:512 FFT3161
-#endif
-
-#if EXP / NWORDS != 32
-#error carryMiddle packed bridge requires 32 <= bits/word < 33
-#endif
+// The kernel is shape-specific; on other shapes this file compiles to nothing
+// (the CUDA backend concatenates every .cl into one translation unit, so an
+// #error here would break unrelated shapes).  Gpu.cpp separately rejects
+// -use MIDCARRY_FUSED on unsupported shapes.
+#if FFT_TYPE == FFT3161 && WIDTH == 512 && SMALL_HEIGHT == 512 && MIDDLE == 8 && NW == 8 && INPLACE && EXP / NWORDS == 32
 
 #define CM_THREADS 512
 #define CM_SHARED_BYTES (MIDDLE * WIDTH * (sizeof(GF31) + sizeof(GF61)))
