@@ -942,6 +942,34 @@ under INPLACE swizzling, the pair-square (not plain pointwise), and the
 64-KiB/1-block/SM regime — a multi-day kernel project, now with a
 measured motivation instead of a measured rejection.
 
+### Radix-7 q7/M61: unified gate reconstructed — rejection CONFIRMED
+
+Audit shortlist item 6 resolved
+([`src/cuda/q7_m61_radix7_gate_bench.cu`](src/cuda/q7_m61_radix7_gate_bench.cu),
+committed): the core saving and edge increment measured in ONE process
+with q65 alternation (Sol subtracted them across two benchmarks), plus
+the never-measured co-run hideability arm.  q7 Montgomery constants from
+the ledger (the 65-bit REDC carry note reproduced as code); full-array
+q7-chain oracle + 4096-group cyclic-7 convolution oracles both fields.
+600 W / 595.84 medians: core saving S = +49.1 us (my instruments; Sol's
+18.7-20.3 at 300 W), direct-DFT-7 edge E_seq = +107.9, co-run
+E_conc = +95.4.  Decisive findings:
+
+1. **Hideability measured at ~12%** (E_seq -> E_conc recovers 12.5 of
+   107.9 us): the audit's F2 repricing hoped dense register-resident edge
+   ALU would hide in the other stream's idle issue slots — it does not;
+   both edge kernels are ALU-saturated and barely overlap.
+2. Sensitivity bracket: my direct DFT-7 overcharges ~5-7x vs Sol's Rader
+   graph; applying the measured 12% discount to SOL's edge numbers gives
+   E ~ 17.9 vs S ~ 18.7-20.3 — a +1-2 us wash at best, before generic q7
+   weights, wider CRT/carry, and the tight p150 capacity, all candidate-
+   side charges.  In my internally consistent instruments E_conc >> S.
+3. The ~12% co-run absorption figure retro-validates the whole odd-radix
+   edge closure family (radix-31/63/65 edges are denser still).
+
+**Decision: q7/M61 (and by extension the odd-radix family) stays
+rejected; the audit flag is closed by measurement.**
+
 ### Audit shortlist status update (post-inventory)
 
 The three flagged benches (q24 overlap, resident tile, radix-7) were
