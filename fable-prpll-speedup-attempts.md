@@ -334,9 +334,98 @@ GPU still runs at its power wall (SW Power Cap active at 600.0 W, 2210 of
   hypothetical uncapped clock ceiling is worth a further ~27%, but needs
   ~900+ W).  On any >600 W or multi-GPU machine, re-check two workers
   first (-8.1% margin at 600 W, improving with ceiling).
-- An algebraic reduction in total exact work per iteration (Sol's reopen
-  conditions stand unchanged).
+- An algebraic reduction in total exact work per iteration.  Of Sol's three
+  reopen conditions, two are now investigated to closure (see
+  "Standing-gate investigations" below): the <=8-product pair square is
+  unreachable (9 proven practically optimal by structured search) and the
+  odd-DFT edge gates are unchanged by 600 W and remain 4-30x out of reach.
+  The remaining condition (a Tensor formulation with multiple recoverable
+  modular products per accumulator) has no supporting instruction on sm_120.
 - NCU counters on a host that permits them (still ERR_NVGPUCTRPERM here).
+
+## Standing-gate investigations (2026-08-12, 600 W phase)
+
+The two credible remaining algebraic work-removal gates from Sol's registry
+were investigated to completion at the user's direction.
+
+### Gate: sub-15-us ownership-complete odd DFT — closed at 600 W by analysis
+
+Every odd-radix candidate's decisive numbers from Sol's measured record
+(300 W us):
+
+| Candidate | Planes | Best-case saving | Odd-edge cost | Verdict |
+|---|---|---:|---|---|
+| 3M radix-3 (M31+M61+M19) | 3 | core -2.0 vs generic-q | free edge still fails complete budget | closed |
+| 3.5M radix-7 GT | 3 | — | dependency-complete core 162.6 vs 129.6 (+25.4%) | closed before carry |
+| 3.875M radix-31 | 2 | <=30.6 (generous stage bound) | measured 245.5-246.2; needs sub-8 | >=30x gap |
+| 3.9375M radix-63 | 2 | <=38.5 (impossible bound) | measured 142.2-142.6 | 3.7x over the bound |
+| 4.0625M radix-65 | 2 | 11.3-12.5 core win | zero-cost edge already insufficient | closed at zero |
+| 33/32 near-M61 radix-33 | 2 | 4.6 total allowance | 48-60 estimated | >=10x gap |
+
+600 W moves none of these: every odd-edge kernel is core-clock-domain work
+(the radix-31 M61 edge is 502 IMAD + 440 SHFL + 208 warp syncs), and the
+600 W profile showed uniform 1.40-1.49x clock scaling across all production
+kernels including the shuffle/LDS-heavy middles, with no memory wall.  All
+budget ratios are scale-invariant; the sub-8/sub-15-us edge allowances become
+sub-5.7/sub-10.7 us at 600 W clocks while the measured edges shrink
+identically.  The one named rescue (a GPU-mapped 31-point WFTA) has no
+practical construction (flow-graph literature stops at 19; the addition
+network grows super-linearly) and would not reduce the measured bottleneck,
+which is ownership/shuffle traffic, not multiplication count.
+
+Decision: **odd-radix routes stay closed on this hardware; reopen only per
+Sol's original edge-demonstration conditions (scaled to 600 W clocks).**
+
+### Gate: <=8-product M61 tail pair-square — closed as unreachable (9 is optimal)
+
+Registry re-check before work: the "scaled two-multiply rotation audit"
+leaves exactly this gate open; no prior audit had exploited the norm-one
+relation (all tail trigs lie in the order-2^61 norm-one subgroup since
+M61+1 = 2^61, so conj(t) = 1/t and t0^2+t1^2 = 1) as a search dimension.
+
+Method ([`tools/pairsq-search/`](tools/pairsq-search/)): by Strassen
+homogenization, any straight-line program for the four homogeneous quadratic
+targets (adds/shifts/conjugations free, every wide product counted, arbitrary
+precomputed T-constants free) reduces with no more products to k formations
+(kappa x linear) + m bilinears + j scalings (kappa x quadratic), chained,
+with T entering only through the kappas.  The continuous relaxation of every
+shape (free real combo coefficients shared across 12 simultaneous norm-one
+T samples, kappas free per T) was optimized with batched-restart Adam +
+LBFGS polish.  A methodological trap worth recording: at 4 T samples the
+model happily *interpolates* the samples (an apparent (2,6,0) "8-product
+hit" failed the frozen-structure fresh-T test); 12 samples kill
+interpolators.
+
+Results:
+- Flat bilinear rank of the system is **4** (with T-dependent operand
+  coefficients free): -T is always a QR in GF(M61^2), so the pair-square
+  splits into two independent complex squares of z+- = a +- i*t*b.  The
+  honest cost of that route is 3 (form t*b) + 4 (squares) + 3 (unscale d
+  by conj(t)) = 10 — the entire gap between 4 and 10 is T-scale
+  manufacture, which is what the gate is really about.
+- The c-subproblem alone (a^2 - T*b^2) costs exactly **6** (every
+  5-product shape fails; (3,3,0) reaches an exact zero); d alone is the
+  classical 3.  An 8-product joint scheme therefore requires sharing one
+  product across the two subproblems.
+- **No such sharing exists**: all 28 shapes at total 8 fail (best residual
+  2.1e-4, reproducible across 3 independent T-seeds at heavy settings),
+  while the known 9-product schemes are rediscovered to residual 1e-30 in
+  every seed — including an independent rediscovery of the exact
+  (a+b)^2 - a^2 - b^2 spelling already present in the kernel source.
+  The norm-one relation does not rescue 8 (the whole search ran at
+  norm-one T).
+
+Decision: **close the <=8-product gate as unreachable: 9 wide products is
+optimal for the canonical pair-square** (strong numerical evidence —
+continuous infeasibility, not a formal proof).  Both 9-product spellings
+are already implemented (`ENABLE_BETTER_ONEPAIRSQ`,
+`ENABLE_PARALLEL_ONEPAIRSQ`) and measured tied-or-lost against the
+production 10 at 300 W; the production tail pair-square is at its practical
+optimum.  Do not reopen with basis changes, scaled rotations, or norm-one
+identities — all are inside the searched model.  A future reopening needs
+either a formal disproof of this search's negative (an exact 8-scheme it
+somehow missed) or a representation change that removes the canonical
+carry boundary (Sol's original alternative condition, unchanged).
 
 ## Experiment log
 
