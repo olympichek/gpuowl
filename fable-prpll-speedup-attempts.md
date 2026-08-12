@@ -1181,3 +1181,18 @@ power-limited at the 600 W board maximum; saturation model, tune optimum,
 and the two-worker rejection all carry over; NCU still blocked; `-pl`/`-lgc`
 still permission-blocked, so the limit itself cannot be swept from this
 container.
+
+### Toolkit NVRTC 13.2 and the clock-offset endgame (post-closure addendum)
+
+Two further routes toward 135 us after the fusion closure:
+
+1. **NVRTC 13.2 PTX codegen (MEASURED, adoptable): 143.2-143.3 us, exact**
+   (`LD_LIBRARY_PATH=/usr/local/cuda-13.2/lib64`, package cuda-nvrtc-13-2).
+   The 13.0-vs-13.2 toolkit explains ~1.4 us of the +2.9% k-residual vs
+   the Workstation box (same driver JIT, different PTX).  Adopt.
+2. **NVML SM clock offset (V/f shift, undervolt-equivalent): prepared,
+   blocked by permissions** — scratchpad/clkoff.c
+   (nvmlDeviceSetClockOffsets, SM, P0).  Arithmetic: at k~322,000 (with
+   NVRTC 13.2) sustained 2450 MHz gives ~136.6; 2520 gives ~133.0.
+   Offsets +60..+200 with Gerbicz/residue gating per step are the last
+   route to 135 on this box; offsets reset on reboot.
