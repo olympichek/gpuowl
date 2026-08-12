@@ -39,14 +39,26 @@ if [ "${1:-}" = "pack" ]; then
   rm -f "$ZIP"
   # scratch run dirs (.name.XXXX/): logs/telemetry/configs only — no checkpoint
   # state (.prp), proofs, or kernel caches.
+  FILELIST=$(mktemp)
   find . -maxdepth 2 \
       \( -path ./.git -o -name kernel-cache -o -name proof -o -name proof-tmp \
          -o -name '1[0-9]*' \) -prune -o \
       -type f \( \( -name '*.out' -o -name '*.csv' -o -name 'gpuowl*.log' \
          -o -name 'tune.txt' -o -name 'config.txt' -o -name 'clocks.txt' \) -path './.*' \
-         -o -name 'nvidia-smi-q-*.txt' \) -print \
-    | zip -q "$ZIP" -@
-  [ -d _migration ] && zip -qr "$ZIP" _migration
+         -o -name 'nvidia-smi-q-*.txt' \) -print > "$FILELIST"
+  [ -d _migration ] && find _migration -type f >> "$FILELIST"
+  if command -v zip >/dev/null; then
+    zip -q "$ZIP" -@ < "$FILELIST"
+  else
+    python3 - "$ZIP" "$FILELIST" <<'PYEOF'
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED)
+for line in open(sys.argv[2]):
+    z.write(line.rstrip("\n"))
+z.close()
+PYEOF
+  fi
+  rm -f "$FILELIST"
   echo "Packed: $ZIP ($(du -h "$ZIP" | cut -f1))"
   echo "Copy setup.sh + this zip to the new box and run ./setup.sh there."
   exit 0
