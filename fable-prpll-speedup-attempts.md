@@ -766,6 +766,38 @@ board).  All residues exact (2k/…/100k and the 1M `52b03a7cc55e677d`).
   double-checking cover integrity), with expectations calibrated: it is a
   power optimization, not a latency one.
 
+### Driver 580 -> 595.84 experiment: setup and capture (in progress)
+
+The +10.1% k gap's last suspects are driver and board.  This box's apt
+offers exactly **595.84** — the Workstation box's driver — making a
+controlled swap possible.  Mechanism confirmed before the swap: PRPLL
+compiles OpenCL sources via NVRTC to PTX and loads PTX with
+`cuModuleLoadData` (src/cuda/cudawrap.cpp:487,121), so **the driver's JIT
+emits the final SASS of every kernel**; a driver swap changes the code
+generator, the GSP firmware (clock/power arbitration), and power
+management together.  Pre-swap capture under 580.126.09 in
+`.driver580-capture/` (local to this box): JIT-cache cubins for all 19
+kernels, disassembled SASS + instruction counts (carryFused 4664,
+tailSquareGF61 3792, fftMiddleInGF61 1304, ...), NVRTC PTX (control —
+toolkit-owned, driver-independent), GSP/VBIOS/package versions, supported
+clocks.  Post-swap readout: SASS differs + perf moves = codegen; SASS
+same + perf moves = firmware/power; nothing = board/bin (close the gap as
+unactionable).
+
+### Audit shortlist status update (post-inventory)
+
+The three flagged benches (q24 overlap, resident tile, radix-7) were
+**never committed** — they existed only in Sol's working tree and died
+with that rental.  The ledger records their constants, algorithms, and
+protocols verbatim, and `src/cuda/m61_near61_overlap_bench.cu` survives
+as the harness template (compiles clean on CUDA 13.0/sm_120 with
+`-ccbin g++`; nvcc's default host compiler is broken on this box).
+Revised costs: q24 gate ~1-1.5 d reconstruction (LOW-MED risk), resident
+tile 2-4 d (MED-HIGH fidelity risk; re-anchor the isolated 1.02-1.03x
+ratio before adding contention), radix-7 3-4 d (MED-HIGH; resolve the
+tension with the 600 W odd-radix closure first).  **Process rule added:
+experiment benches must be committed, not just described in the ledger.**
+
 ### Quick probes: -lmc and TAIL_TRIGS61 — both closed
 
 - **-lmc 405 (only alternative memory state)**: 404.6 us/iter — memory
