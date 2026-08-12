@@ -831,6 +831,17 @@ tailSquareGF61 only cosmetic IADD3->IADD spellings; carryFused +16 of
 - Fleet/ops rule: **driver major version is a first-class performance
   variable on this workload (~5-6%); pin and record it** (setup.sh
   snapshots it); prefer 595.84+ over 580.x everywhere.
+- Confirmations: **1M steady 144.67 us** @ 2319 MHz / 598.5 W, 1M residue
+  exact — the new production baseline.  Two-worker recheck under 595.84:
+  6,842 aggregate it/s vs 6,912 single (-1.0% vs steady, ~-2% vs
+  100k-scale) — the better memory path helps 1w slightly more than 2w;
+  two workers remain rejected at <=600 W.
+- Day summary: three stacked hardware-layer gains on one box (ECC-off
+  +1.2%, driver +5-6%) took production 153.3 -> 144.7 us steady after
+  ~200 software rejections across three campaigns.  Remaining software
+  lead: the cp.async middle-prefetch MVP (re-anchor its NCU stall profile
+  under 595.84 first — the firmware change shrank the very stalls it
+  targets).
 
 ### Audit shortlist status update (post-inventory)
 
