@@ -1247,3 +1247,22 @@ block-swizzle interleave IS the optimal compromise between the two access
 patterns.  **Approach B closed.  With approaches A and B both measured
 out, the architectural idea space of this codebase on this hardware is
 exhausted end to end.**
+
+### Two-stage 2048x2048 factorization — gate PASSED (new idea, first ever)
+
+[`src/cuda/twostage2048_gate_bench.cu`](src/cuda/twostage2048_gate_bench.cu):
+a 2048-point GF61 row kernel (32-KiB shared, radix 8*8*8*4, 256 lanes x 8
+values) verified exact against a direct host DFT and measured 211.3 us
+per 2M-value pass vs 186.3 for the production-shaped 512-point kernel —
+i.e. 11 stages for the price of 9.23: **7% more efficient per butterfly**,
+with 3 blocks/SM at 32-KiB shared and no spills.  Since a 2048x2048
+two-stage 4M transform costs the same total butterfly stages as the
+current 512x8x512 three-stage (22 vs 21+middle-twiddles) but only 4 plane
+round-trips instead of 6, the structure saves ~one-third of bottom-half
+boundary traffic (~64 MiB/iter both fields) at no arithmetic premium.
+Remaining unknowns for a production backend (weeks-scale): the 2048-wide
+fused carry (register/LDS pressure in carryFused), inter-stage twiddle
+scheme (table vs generated at 2M entries/field), Hermitian pair mapping
+at 2048, and carry/CRT integration.  **First genuinely new structural
+idea to survive its gate in three campaigns; recorded as the successor
+project.**
