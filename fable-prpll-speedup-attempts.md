@@ -720,6 +720,39 @@ PFA33 bound) — their margins survive 3x error, so no action; (iii) the 3M
 hybrid scaffold (185.6 us "budget") is confirmed as the F5 exemplar: a
 false POSITIVE that consumed the campaign's largest wasted effort.
 
+### Locked-clock t(f) ladder (-lgc) — this box's model
+
+100k production runs at locked SM clocks, 600 W limit, all residues exact:
+
+| lock | meas MHz | us/iter | W drawn |
+|---:|---:|---:|---:|
+| 1500 | 1492 | 237.97 | 275 |
+| 1700 | 1695 | 209.47 | 311 |
+| 1900 | 1879 | 191.20 | 367 |
+| 2100 | 2085 | 171.75 | 428 |
+| 2300 | 2272 | 157.53 | 534 |
+
+Fit: **t = 4.98 us + 347,700 us*MHz / f** (max residual 1.2 us; predicts
+the unlocked power-sweep points within ~1.4 us).  Versus the Workstation's
+6.0 + 315,842/f: **k is +10.1%** — the refined estimate of the Server
+Edition's per-cycle handicap (two-point sweep estimate was +8.4%), now the
+quantitative target for the ECC-off experiment (~15 us at 600 W if ECC
+explains all of it; driver 580-vs-595 is the confound the on-box ECC
+toggle isolates).  The locked P(f) points (275->534 W over 1.52x clock)
+also give the V/f curve directly.
+
+### Quick probes: -lmc and TAIL_TRIGS61 — both closed
+
+- **-lmc 405 (only alternative memory state)**: 404.6 us/iter — memory
+  starvation also collapses SM clocks (877 MHz at 150 W).  2.6x slower,
+  residue exact.  No usable memory-power knob exists on this board.
+- **TAIL_TRIGS61=1/2 (generate M61 tail trigs instead of loading)**: +0.97
+  and +1.12 us vs control (3 alternating rounds, exact).  The
+  audit-derived candidate closes NEGATIVE: table loads beat regeneration
+  in the real tail — consistent with the register-cap closure (the tail
+  has no spare registers/ALU for trig chains; its trig loads evidently
+  hit cache well enough).  Shortlist item 4 done.
+
 ### Two-worker break-even map across power points — MEASURED
 
 `-prps 136279841,136279879 -workers 2` (TAIL_KERNELS=2 default), 200k per
