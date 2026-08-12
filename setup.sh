@@ -43,7 +43,7 @@ if [ "${1:-}" = "pack" ]; then
       \( -path ./.git -o -name kernel-cache -o -name proof -o -name proof-tmp \
          -o -name '1[0-9]*' \) -prune -o \
       -type f \( -name '*.out' -o -name '*.csv' -o -name 'gpuowl*.log' \
-         -o -name 'tune.txt' -o -name 'config.txt' \) -path './.*' -print \
+         -o -name 'tune.txt' -o -name 'config.txt' -o -name 'clocks.txt' \) -path './.*' -print \
     | zip -q "$ZIP" -@
   [ -d _migration ] && zip -qr "$ZIP" _migration
   echo "Packed: $ZIP ($(du -h "$ZIP" | cut -f1))"
