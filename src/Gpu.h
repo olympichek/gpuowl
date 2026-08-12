@@ -152,6 +152,9 @@ private:
   Kernel kfftHinGF31;
   Kernel ktailSquareZeroGF31;
   Kernel ktailSquareGF31;
+  Kernel kFusedMidTail31;
+  u32 fused31;
+  bool replay_square_pass = false;   // FUSED31 applies only to square (not tailMul) bottom halves
   Kernel ktailMulGF31;
   Kernel ktailMulLowGF31;
   Kernel kfftMidOutGF31;

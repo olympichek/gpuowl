@@ -482,7 +482,8 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
                               "L1CUDA",
                               "L2_PERSIST",             // CUDA persisting-L2 window for the largest trig table
                               "ASYNC_MID61",            // cp.async tile-looped fftMiddleOutGF61: 1=full staging, 2=half
-                              "ASYNC_TILES"             // Tiles per group for ASYNC_MID61 (default 4)
+                              "ASYNC_TILES",            // Tiles per group for ASYNC_MID61 (default 4)
+                              "FUSED31"                 // Fused middle-in + tail for the M31 plane (pair-resident tile)
                             });
     if (!isValid) {
       log("Warning: unrecognized -use key '%s'\n", k.c_str());
@@ -1386,6 +1387,12 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
                                                !tail_single_wide ? hN / nH :                                           // Double-wide tailSquare with one kernel
                                                !tail_single_kernel ? hN / nH / 2 - SMALL_H / nH :                      // Single-wide tailSquare with two kernels
                                                hN / nH / 2, kernelDefines(K31) + numCudaRegisters(TAIL31)),  // Single-wide tailSquare with one kernel
+  // FUSED31: fused middle-in + tail for the M31 plane; (WIDTH/2+1) pair-resident
+  // blocks of G_H*2 threads, 64-KiB dynamic-shared tile, max shared carveout.
+  K(kFusedMidTail31,       "fusedmidtail31.cl", "fusedMidTail31",
+                                               (WIDTH / 2 + 1) * (SMALL_H / nH * 4),
+                                               kernelDefines(K31), 2 * fft.shape.middle * SMALL_H * 8,
+                                               args.value("FUSED31", 0) ? 100 : 0),
   K(ktailMulGF31,          "tailmul.cl", "tailMulGF31", hN / nH / 2, kernelDefines(K31)),
   K(ktailMulLowGF31,       "tailmul.cl", "tailMulGF31", hN / nH / 2, kernelDefines(K31) + "-DMUL_LOW=1"),
   K(kfftMidOutGF31,        "fftmiddleout.cl", "fftMiddleOutGF31", hN / (BIG_H / SMALL_H), kernelDefines(K31) + numCudaRegisters(MIDOUT31)),
@@ -1658,7 +1665,10 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
     kfftW.setFixedArgs(2, bufTrigW);
   }
 
+  fused31 = args.value("FUSED31", 0);
+
   if (fft.NTT_GF31) {
+    kFusedMidTail31.setFixedArgs(3, bufTrigM, bufTrigH);
     kfftMidInGF31.setFixedArgs(3, bufTrigM);
     kfftHinGF31.setFixedArgs(3, bufTrigH);
     ktailSquareZeroGF31.setFixedArgs(2, bufTrigH);
@@ -1872,6 +1882,27 @@ void Gpu::endBottomHalf() {
 void Gpu::replay() {
   // If there are no recorded kernels to replay, we're done
   if (recorded_kernels.size() == 0) return;
+
+  // FUSED31 substitutes middle-in + tailSquare; mul bottom halves (tailMul)
+  // must run the unfused path.
+  replay_square_pass = false;
+  {
+    bool hasMidIn = false, hasTailSquare = false;
+    for (auto kern : recorded_kernels) {
+      if (kern == KMIDIN) hasMidIn = true;
+      if (kern == KTAILSQUARE) hasTailSquare = true;
+    }
+    replay_square_pass = hasMidIn && hasTailSquare;   // fuse only complete midIn+tail replays
+  }
+  if (fused31) {
+    static int logged = 0;
+    if (logged < 6) {
+      ++logged;
+      std::string seq;
+      for (auto kern : recorded_kernels) seq += std::to_string((int) kern) + " ";
+      log("replay seq (square=%d): %s\n", (int) replay_square_pass, seq.c_str());
+    }
+  }
 
   // Get MULTI_Q and L2_STRIPING settings
   bool multi_q = args.value("MULTI_Q", 0);
@@ -2263,7 +2294,10 @@ void Gpu::replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Qu
     Buffer<double> const *in = in_place ? buf : &buf3;
     Buffer<double> const *out = buf;
     if (cache_group == 1) { kfftMidIn.setQueue(q); kfftMidIn.setKernelsToExecute(kernelsToExecuteX); kfftMidIn(*out, *in, base); }
-    if (cache_group == 2) { kfftMidInGF31.setQueue(q); kfftMidInGF31.setKernelsToExecute(kernelsToExecuteX); kfftMidInGF31(*out, *in, base); }
+    if (cache_group == 2) {
+      if (fused31 && replay_square_pass) { kFusedMidTail31.setQueue(q); kFusedMidTail31(buf3, *in, base); }  // tail output -> scratch (in-place hazard)
+      else { kfftMidInGF31.setQueue(q); kfftMidInGF31.setKernelsToExecute(kernelsToExecuteX); kfftMidInGF31(*out, *in, base); }
+    }
     if (cache_group == 3) { kfftMidInGF61.setQueue(q); kfftMidInGF61.setKernelsToExecute(kernelsToExecuteX); kfftMidInGF61(*out, *in, base); }
     if (cache_group == 4) { kfftMidInR0.setQueue(q); kfftMidInR0.setKernelsToExecute(kernelsToExecuteX); kfftMidInR0(*out, *in, base); }
     if (cache_group == 5) { kfftMidInR1.setQueue(q); kfftMidInR1.setKernelsToExecute(kernelsToExecuteX); kfftMidInR1(*out, *in, base); }
@@ -2273,7 +2307,7 @@ void Gpu::replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Qu
     Buffer<double> const *out = recorded_kernel_args[arg++];
     Buffer<double> const *in = recorded_kernel_args[arg++];
     if (cache_group == 1) { kfftHin.setQueue(q); kfftHin.setKernelsToExecute(kernelsToExecuteX); kfftHin(*out, *in, base); }
-    if (cache_group == 2) { kfftHinGF31.setQueue(q); kfftHinGF31.setKernelsToExecute(kernelsToExecuteX); kfftHinGF31(*out, *in, base); }
+    if (cache_group == 2) { kfftHinGF31.setQueue(q); kfftHinGF31.setKernelsToExecute(kernelsToExecuteX); kfftHinGF31(*out, *((fused31 && replay_square_pass) ? &buf3 : in), base); }
     if (cache_group == 3) { kfftHinGF61.setQueue(q); kfftHinGF61.setKernelsToExecute(kernelsToExecuteX); kfftHinGF61(*out, *in, base); }
     if (cache_group == 4) { kfftHinR0.setQueue(q); kfftHinR0.setKernelsToExecute(kernelsToExecuteX); kfftHinR0(*out, *in, base); }
     if (cache_group == 5) { kfftHinR1.setQueue(q); kfftHinR1.setKernelsToExecute(kernelsToExecuteX); kfftHinR1(*out, *in, base); }
@@ -2286,14 +2320,14 @@ void Gpu::replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Qu
     Buffer<double> const *out = in_place ? buf : &buf3;
     if (!tail_single_kernel && base == 0) {
       if (cache_group == 1) { ktailSquareZero.setQueue(q); ktailSquareZero(*out, *in); }
-      if (cache_group == 2) { ktailSquareZeroGF31.setQueue(q); ktailSquareZeroGF31(*out, *in); }
+      if (cache_group == 2 && !(fused31 && replay_square_pass)) { ktailSquareZeroGF31.setQueue(q); ktailSquareZeroGF31(*out, *in); }
       if (cache_group == 3) { ktailSquareZeroGF61.setQueue(q); ktailSquareZeroGF61(*out, *in); }
       if (cache_group == 4) { ktailSquareZeroR0.setQueue(q); ktailSquareZeroR0(*out, *in); }
       if (cache_group == 5) { ktailSquareZeroR1.setQueue(q); ktailSquareZeroR1(*out, *in); }
       if (kernelsToExecuteX) kernelsToExecuteX--;
     }
     if (cache_group == 1) { ktailSquare.setQueue(q); ktailSquare.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailSquare(*out, *in, base); }
-    if (cache_group == 2) { ktailSquareGF31.setQueue(q); ktailSquareGF31.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailSquareGF31(*out, *in, base); }
+    if (cache_group == 2 && !(fused31 == 1 && replay_square_pass)) { ktailSquareGF31.setQueue(q); ktailSquareGF31.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailSquareGF31(*out, *((fused31 == 2 && replay_square_pass) ? &buf3 : in), base); }
     if (cache_group == 3) { ktailSquareGF61.setQueue(q); ktailSquareGF61.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailSquareGF61(*out, *in, base); }
     if (cache_group == 4) { ktailSquareR0.setQueue(q); ktailSquareR0.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailSquareR0(*out, *in, base); }
     if (cache_group == 5) { ktailSquareR1.setQueue(q); ktailSquareR1.setKernelsToExecute(kernelsToExecuteX, kernelsToExecuteY); ktailSquareR1(*out, *in, base); }
@@ -2331,7 +2365,7 @@ void Gpu::replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Qu
     Buffer<double> const *in = in_place ? buf : &buf3;
     Buffer<double> const *out = buf;
     if (cache_group == 1) { kfftMidOut.setQueue(q); kfftMidOut.setKernelsToExecute(kernelsToExecuteX); kfftMidOut(*out, *in, base); }
-    if (cache_group == 2) { kfftMidOutGF31.setQueue(q); kfftMidOutGF31.setKernelsToExecute(kernelsToExecuteX); kfftMidOutGF31(*out, *in, base); }
+    if (cache_group == 2) { kfftMidOutGF31.setQueue(q); kfftMidOutGF31.setKernelsToExecute(kernelsToExecuteX); kfftMidOutGF31(*out, *((fused31 == 1 && replay_square_pass) ? &buf3 : in), base); }  // FUSED31 tail wrote to scratch
     if (cache_group == 3) { kfftMidOutGF61.setQueue(q); kfftMidOutGF61.setKernelsToExecute(kernelsToExecuteX); kfftMidOutGF61(*out, *in, base); }
     if (cache_group == 4) { kfftMidOutR0.setQueue(q); kfftMidOutR0.setKernelsToExecute(kernelsToExecuteX); kfftMidOutR0(*out, *in, base); }
     if (cache_group == 5) { kfftMidOutR1.setQueue(q); kfftMidOutR1.setKernelsToExecute(kernelsToExecuteX); kfftMidOutR1(*out, *in, base); }

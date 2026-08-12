@@ -970,6 +970,37 @@ E_conc = +95.4.  Decisive findings:
 **Decision: q7/M61 (and by extension the odd-radix family) stays
 rejected; the audit flag is closed by measurement.**
 
+### FUSED31: production M31 middle+tail fusion — BUILT, EXACT, and CLOSED negative
+
+The resident-tile reopening was carried all the way into the production
+kernel set (`-use FUSED31=1`, default off; src/cl/fusedmidtail31.cl plus
+host plumbing in Gpu.cpp/replay).  Design: the Hermitian-pair closure of
+tail lines over width-lines {w, WIDTH-w} fits one 64-KiB pair tile, so
+(WIDTH/2+1) blocks fuse fftMiddleInGF31 + tailSquareGF31(+Zero),
+running the production double-wide pair flow from the resident tile (the
+fftbase LDS machinery auto-slices for concurrent pair-groups; tailutil
+helpers cloned group-safe).  Correctness hazards found and solved on the
+way, recorded for any future fusion attempt: (i) in-place aliasing — the
+fused tail must write to the SCRATCH buffer, with fftMiddleOutGF31/
+fftHinGF31 redirected to read scratch; (ii) replay sequences — mul bottom
+halves and midIn-only replays must stay unfused (fuse only replays
+containing BOTH KMIDIN and KTAILSQUARE); (iii) production TAIL_KERNELS=2
+is the double-wide single-kernel flow with gt_line = group id.  Exact
+2k/100k residues in all modes tested.
+
+Measured (alternating 100k, 600 W, 595.84): control 144.7 us; fused
+170.0 us at 256 threads (178.8 at 128).  `-time`: kFusedMidTail31 = 67-70
+dilated us vs ~45 for the two kernels it replaces.  **Mechanism: the
+INPLACE layout interleaves 16 widths per 256-B segment, so a
+pair-resident tile (2 non-adjacent widths) reads its 64 KiB with ~16x
+sector amplification and cannot coalesce — the contention-proxy's
+CONTIGUOUS tiles do not transfer to this layout.**  Traffic deletion
+(32 MiB) cannot pay for uncoalesced access + 1-block/SM occupancy + pair
+serialization.  Decision: **the resident-fusion route is closed for the
+production INPLACE layout**; reopening requires an inter-kernel layout
+redesign (carryFused-side width de-interleaving) — architecture surgery,
+not a kernel patch.  Code retained as opt-in evidence.
+
 ### Audit shortlist status update (post-inventory)
 
 The three flagged benches (q24 overlap, resident tile, radix-7) were
