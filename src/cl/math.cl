@@ -1525,10 +1525,22 @@ GF61 OVERLOAD csqa(GF61 a, GF61 c) { return csqa(a, c, 2); }
 
 // Complex mul
 GF61 OVERLOAD cmul(GF61 a, GF61 b) {
+#if M61_CMUL4
+  // Schoolbook constant/data multiplication.  It spends one additional wide
+  // product, but all four products are independent; this is an architecture
+  // gate for GPUs where the incumbent three-product Karatsuba dependency
+  // chain, rather than multiplier throughput, limits the tail.
+  Z61 ac = weakMul(a.x, b.x, 2, 2);
+  Z61 bd = weakMul(a.y, b.y, 2, 2);
+  Z61 ad = weakMul(a.x, b.y, 2, 2);
+  Z61 bc = weakMul(a.y, b.x, 2, 2);
+  return U2(modM61(ac + neg(bd, 2)), modM61(ad + bc));
+#else
   u128 k1 = mul64(b.x, a.x + a.y);                            // max value is 2*M61^2+epsilon
   Z61 k1k2 = weakMulAdd(a.x, b.y + neg(b.x, 2), k1, 2, 4);    // max value is 6*M61+epsilon
   Z61 k1k3 = weakMulAdd(a.y, neg(b.y + b.x, 3), k1, 2, 4);    // max value is 6*M61+epsilon
   return U2(modM61(k1k3), modM61(k1k2));
+#endif
 }
 
 // Square a root of unity complex number (the second version may be faster if the compiler optimizes the u128 squaring).

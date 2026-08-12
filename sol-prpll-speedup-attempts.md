@@ -6609,3 +6609,2970 @@ count are substantially more valuable.  Do not implement the missing
 radix-four-by-radix-two mixed path unless a new design removes rather than
 adds fused-edge synchronization; its best plausible behavior lies between
 the rejected binary path and the already faster radix-eight incumbent.
+
+## Critical-field release and clustered width-to-middle boundary
+
+Before changing the production field order, the source history and experiment
+registry were checked for programmatic dependent launch.  Upstream commit
+`23e15f4` already added PDL triggers/waits throughout the middle, tail, and
+carry chain; its commit result was explicitly that PDL did not help.  The
+current `MULTI_Q=1` replay also records a main-stream event before starting the
+next pair of field queues and merges the auxiliary stream before `carryFused`.
+Those event markers are full-completion boundaries between the fused carry and
+the next field kernel.  Merely swapping M31/M61 queue ownership and reversing
+the two post-carry width calls therefore cannot release M61 early: the event,
+not the arithmetic order, remains between producer and consumer.  Stream
+priority was separately measured above and lost about 4 us.  Decision: do not
+repeat PDL or implement a field-order-only scheduler variant.
+
+An untested, narrower architectural boundary remains.  Four existing
+128-thread carry-style CTAs naturally own the eight middle rows of one
+`512x8` tile.  After each CTA finishes two forward width rows, a four-block
+cluster can exchange the resident rows through DSM, execute the radix-eight
+middle transform, and write tail-ready values directly.  This removes the
+full width-output/middle-input global round trip without the rejected
+512-thread, 96-KiB all-field tile: each block retains only two M61 rows (16
+KiB), and the CRT/carry organization need not change.
+
+The gate was added to the existing production-population
+`warp_specialized_edge_bench` rather than creating another arithmetic proxy.
+It compares an exact M61 width kernel followed by the exact middle kernel with
+the same operations in a cluster over all 2,097,152 quadratic values.  Both a
+two-block `256 threads / 32 KiB per block` organization and the original
+four-block `128 threads / 16 KiB per block` carry-style organization are
+included.  Every output agrees before timing and after all timed launches.
+
+The first four-block launch exposed a DSM lifetime requirement rather than an
+arithmetic defect: a block may not exit while a peer is still reading its
+distributed shared segment.  A final cluster barrier after all remote loads
+removed the `unspecified launch failure`.  Compute Sanitizer found no memory
+errors.  Final ptxas resources are 64 registers for the two-block cluster and
+58 for the four-block cluster, with one barrier and no stack or spills.  Their
+separate width controls use 76/80 registers, and the middle kernel uses 54.
+
+Four fresh 51-sample processes measured:
+
+| Exact M61 forward boundary | Median range | Relative to matched separate |
+|---|---:|---:|
+| two-block separate width + middle | about 58 us | 1.000 |
+| two-block DSM fused boundary | 66--67 us | **1.138--1.157** |
+| four-block separate width + middle | about 54 us | 1.000 |
+| four-block DSM fused boundary | about 118 us | **2.192--2.202** |
+
+The two-block version loses 8.0--9.1 us.  Splitting into four blocks restores
+the exact carry-CTA population but makes remote access and two cluster-wide
+barriers dominant, losing roughly 64 us.  Reducing global L2 traffic is not
+enough: the ordinary middle kernel exposes 512 independent columns in one
+compact launch, whereas the cluster couples every group of width CTAs and pays
+DSM synchronization for data already resident in L2.
+
+Decision: **reject clustered width-to-middle fusion before PRPLL integration.**
+The inverse boundary has the same transpose and synchronization requirement,
+and adding the real carry's weighting/readiness chain cannot reverse a loss in
+the favorable field-only forward gate.  Do not combine this result with the
+earlier single-tile DSM pass: that pass removed two boundaries inside a long
+resident transform, while this exact narrow boundary loses to one ordinary
+global handoff.
+
+## Post-cluster architecture audit and eight-block line-pair residency
+
+The registry, current source, old upstream branches, and recent literature were
+checked again before another kernel was written.  This closed several ideas
+that initially looked distinct but do not pass the existing whole-pipeline
+gates:
+
+- Upstream's 2019 `double-carry` branch only replaces integer carry rounding
+  with FP64 rounding.  It does not change the transform and is subsumed by the
+  much stronger exact FP64 backend, FP64-in-M61, and quotient-domain carry
+  failures above.
+- The 2026 GPU Karatsuba--NTT proposal partitions a polynomial into many short
+  subproblems and aggregates cross terms before inverse transforms.  Its own
+  results fall behind ordinary GPU NTT once the decomposition exceeds
+  `2^16`, while this recurrence has millions of live words and cannot tolerate
+  its additional subpolynomial state
+  ([Huang et al. 2026](https://link.springer.com/article/10.1007/s44443-026-00722-6)).
+- A quartic extension over `M17=131071` is algebraically possible for a 3M
+  packed transform: `v2(M17^4-1)=19`, and the exact root-of-two existence test
+  for `N=3*2^20` returns one.  It is nevertheless weaker than the already
+  rejected M19 architecture.  An optimal quartic multiplication needs at least
+  seven M17 base products over `3*2^18/4` extension values, versus three M19
+  products over `3*2^19/2` quadratic values.  After the respective 18 and 19
+  binary stages, the M17 side has about 10.5% *more* base-product work.  It also
+  supplies two fewer CRT bits.  The faster M19 design already measured
+  `137.728 + 38.400 = 176.128 us` before either mandatory width boundary, so a
+  quartic M17 transform cannot meet 180 us and was not implemented.
+- Moving the complete M31 field to Tensor Cores does not fit under M61.  The
+  measured exact quadratic q24 Tensor group costs 36.256 us at the full
+  population using 27 INT8 MMAs.  M31 needs 48 MMAs, projecting over 64 us per
+  radix-16 group and well over 600 us for the roughly ten forward/inverse
+  groups before global exchanges.  This is not the unmeasured concurrent win
+  suggested by the much smaller folded sidecar.
+- Production M61 already implements the reopening condition left by the
+  persistent-limb experiment: its radix-eight routines carry signed redundant
+  multi-M61 ranges through all three butterfly levels and normalize only at the
+  radix boundary.  A radix-`2^31` rewrite would therefore add the measured limb
+  carry graph without deleting an incumbent normalization.
+- Modified scaled split radix saves only about 5.6% of total arithmetic, and
+  its frequency-dependent scales must be reconciled around the pointwise
+  square ([Johnson and Frigo](https://math.mit.edu/~stevenj/papers/JohnsonFr07.pdf)).
+  Even granting the full percentage to all measured M61 work cannot reach the
+  target.  Winograd's theoretical linear-multiplication construction is not a
+  stronger practical alternative: it requires more than quadratic additions,
+  while practical 512-point radix-2/Winograd loses to split radix.  The newer
+  multiplicative-complexity survey states the same excessive-addition boundary
+  explicitly ([Stasiński 2023](https://arxiv.org/abs/2303.02647)).  Production's
+  radix-eight Mersenne rotations already capture the useful small-Winograd
+  identities.
+
+One exact DSM organization remained genuinely untested.  The rejected
+four-block Hermitian resident kernel serialized four 512-point lines in every
+block.  The new `clusterLinePairResidentKernel` in
+[`src/cuda/m61_resident_tile_bench.cu`](src/cuda/m61_resident_tile_bench.cu)
+instead creates an eight-block cluster.  Rank `m` owns middle line `m` from
+both conjugate tiles, exactly preserving the control's one-block-per-line tail
+parallelism.  Each 512-thread block uses two 16-KiB shared buffers; the three
+forward and three inverse radix-eight stages ping-pong through DSM, and the
+complete Hermitian forward-tail/pair-square/inverse-tail work remains local.
+
+The kernel uses 54 registers, 32 KiB dynamic shared memory, one barrier
+resource, and no stack or spills.  Every output agrees with the exact separate
+`middle -> paired tail -> middle` control before timing and after all timed
+applications.  Compute Sanitizer reports zero errors.  Four fresh 21-sample
+processes measured:
+
+| Exact 2,097,152-value Hermitian M61 core | Median range | Relative |
+|---|---:|---:|
+| separate middle / paired tail / middle | **241.248--241.952 us** | 1.000 |
+| eight-block line-pair DSM residency | 507.232--511.616 us | **2.0986--2.1148** |
+
+Preserving tail-line parallelism is not enough.  Eight-block cluster placement,
+six remote middle stages, and eight cluster-wide lifetime/synchronization
+points lose `265.536--269.696 us`.  This is substantially worse than the old
+four-block resident layout and cannot be repaired by production's faster lazy
+M61 arithmetic, because both candidate and control would receive that same
+arithmetic while the cluster-only synchronization remains.
+
+Decision: **reject eight-block line-pair residency before production
+integration.**  Together with the one-, two-, four-, and eight-block results,
+the production Hermitian M61 transform now has a complete DSM scaling no-go:
+smaller clusters serialize lines, while a cluster large enough to preserve
+line ownership makes distributed synchronization dominant.  No exact
+end-to-end speedup has been achieved; the 180-us gate remains open.
+
+## Exact PFA9 lead-bridge boundary: correct, but slower
+
+The radix-nine registry was checked again before attempting another fused
+edge.  The local PrMers/Aevum evaluation tree contains one implementation that
+is materially different from the 296.2-us CUDA prototype: an opt-in PFA9
+"lead bridge."  The ordinary Good--Thomas path performs
+`fftW -> carryA -> carryB -> fftP`; the bridge performs
+`fftW -> carryA -> fftPCarryB`, applying the carry-B corrections lazily while
+the following iteration gathers canonical words into its M31 and M61 width
+transforms.  This is exactly the radix-nine-aware edge fusion left as a possible
+reopening condition above, so it was measured rather than reimplemented from
+scratch.
+
+The upstream-style differential program was first run at exponent 136279841.
+It compares cached and canonical registers after chains of 1, 2, 17, 33, 9,
+and multiply-by-three operations.  All seven captured word arrays agreed and
+the test reported:
+
+```text
+PFA9 FFT3161 LEAD-BRIDGE DIFFERENTIAL TEST PASSED
+```
+
+[`src/aevum_pfa9_bridge_bench.cpp`](src/aevum_pfa9_bridge_bench.cpp) then added
+a matched sustained gate through the Aevum engine API.  Every sample resets the
+same p136 seed, executes 5,000 exact squarings, synchronizes, and finally
+compares the complete canonical word array.  Five samples per variant were run
+in both orders to control for warming and thermal bias:
+
+| p136 exact Aevum PFA9 boundary | Median, bridge-first run | Median, canonical-first run |
+|---|---:|---:|
+| canonical split carry plus ordinary PFA gather | 344.900 us | 345.405 us |
+| carry-B/PFA-gather lead bridge | 380.751 us | 383.562 us |
+| bridge / canonical | **1.1040** | **1.1105** |
+
+The OpenCL absolute times are not compared with the CUDA branch's 296.2 us;
+the relevant result is the same-engine A/B ratio.  Eliminating the separate
+carry-B launch does not offset the larger, irregular gather kernel that must
+load provisional words and carry transfers while keeping both field width
+transforms live.  Reversing the order made the loss slightly larger, and the
+complete output remained exact in both runs.
+
+Decision: **reject porting the PFA9 lead bridge to the CUDA prototype.**  The
+only already-implemented form of the missing radix-nine boundary fusion loses
+10--11%, whereas the exact CUDA prototype would need to remove 116.2 us merely
+to reach the 180-us gate.  The 4.5M radix-nine architecture remains a correct
+296.2-us branch and not a speedup.  Reopen it only for an edge design that
+removes the inverse width, CRT/carry, and forward width work together without
+materializing canonical words; combining carry B with the gather alone has now
+been tested and rejected.
+
+## M61 multiplicative-rank and dependency experiment
+
+The FP32+M61 repair results were re-audited after closing radix nine.  They
+leave no sparse correction valid throughout 140--150M: at p150 the quotient
+error is dense and millions wide, so a generally exact repair needs essentially
+the complete approximately 24-bit correction residue already tested above.
+The exact q24/M61 replacement remains mathematically interesting, but the prior
+full-population gate showed only a 9.5--10.0-us advantage at eight generic
+products while omitting q24's general roots, weights, and CRT.  Replacing M31
+would also replace the cheapest transform field by a general one.  That evidence
+does not justify another complete field integration before a faster q24 root
+primitive exists.
+
+The next source audit instead found an untested arithmetic distinction in the
+production M61 critical field.  Its `GF(M61^2)` complex multiplication uses a
+three-product Karatsuba form whose second and third products depend on the first
+wide product.  A four-product schoolbook form could issue all four products
+independently.  Separately, the dormant nine-product Hermitian pair-square
+identity computes `(a+b)^2-a^2-b^2` through `csqa`, making the third square
+depend on the first two; no version had first issued all three squares
+independently and combined them afterward.
+
+Two exact opt-in gates now cover those possibilities:
+
+- `M61_CMUL4=1` in [`src/cl/math.cl`](src/cl/math.cl) computes `ac`, `bd`,
+  `ad`, and `bc` as four independent wide products, then combines and folds
+  them.  This applies to the real production transform rather than an isolated
+  scalar proxy.
+- `ENABLE_PARALLEL_ONEPAIRSQ=1` in
+  [`src/cl/tailsquare.cl`](src/cl/tailsquare.cl) retains the nine-product
+  pair-square algebra but computes `a^2`, `b^2`, and `(a+b)^2` as independent
+  chains before forming `2ab`.  It trades an extra canonical add/fold for a
+  shorter product-dependency graph.
+
+Both variants reproduced the trusted p136 residue
+`05d6515c416b83e2` at iteration 2,000 and
+`9139db3046e846d4` at iteration 30,000.  Matched fresh 30,000-iteration runs
+measured:
+
+| Exact production M31/M61 path | Final interval | Relative control |
+|---|---:|---:|
+| three-product Karatsuba complex multiply | **198.6 us** | 1.000 |
+| four independent schoolbook products | 216.4 us | **1.090** |
+| ordinary ten-product Hermitian pair square | **199.1 us** | 1.000 |
+| independent-chain nine-product pair square | 200.3 us | **1.006** |
+
+The schoolbook result is decisive: Blackwell cannot hide a 33% increase in
+wide products merely by exposing more instruction-level parallelism.  The
+parallel nine-product result is much closer, but deleting one product still
+does not pay for the extra reductions and combination dependency; it is also
+consistent with the older nine-product implementation's approximately tied
+whole-iteration result.  Neither result depends on a proxy resource model—the
+complete recurrence and fused edge are present.
+
+Decision: **retain both switches only as exact compiler/algebra experiments and
+leave them disabled.**  The production three-product complex multiply and
+ten-product pair square remain faster.  The M61 tail cannot supply the missing
+roughly 18--25 us through a different rank/ILP trade alone; a future tail
+proposal must remove multiple products without serializing their replacements,
+not exchange one product for reductions or add another product for ILP.
+
+## Full-range FP32/M61 quotient audit
+
+The FP32 repair evidence was revisited before selecting another transform
+shape.  The old `RNDVALfloatToInt` intentionally sign-extended only 22 bits,
+so the previously reported multi-million p150 quotient errors mixed actual
+FP32 transform error with an avoidable quotient wrap.  This had not been
+tested with a full signed binary32-exact quotient.  `FP32_WIDE_QUOTIENT=1`
+now uses sign-magnitude extraction after the fused rounding operation, covering
+the complete signed 24-bit integer range while retaining the original FMA
+rounding model.
+
+The exact `FFT323161` oracle remained checkpoint-correct at p150 for 100,000
+iterations.  Its old multi-million diagnostic error collapsed to a global
+maximum of **120** (final-block maximum 109, average block maximum 88.575).
+Widening only local complex multiplies or complex FMAs to FP64 did not improve
+that result: the maxima remained 120--121 and the average block maxima remained
+about 88.67.  The remaining error is therefore transform-wide FP32 roundoff,
+not the final quotient conversion or one local arithmetic primitive.
+
+The error is small in amplitude but dense.  Across 1,998 valid p150 iterations,
+the mean number of erroneous coefficient pairs out of 2,097,152 was:
+
+| Absolute quotient error | Mean pairs/iteration | Maximum |
+|---:|---:|---:|
+| at least 1 | 589,332 | 589,428 |
+| at least 8 | 490,382 | 491,878 |
+| at least 32 | 42,212 | 44,226 |
+| at least 64 | 192.484 | 257 |
+| at least 96 | 0.095 | 4 |
+
+The actual 4M FP32+M61 recurrence with the wide quotient still produced the
+wrong deterministic p150 iteration-2,000 checkpoint
+`bf957d88dc4ec2c5`, although it sustained **169.4 us/iteration** with
+`ROEmax=0.500`.  This is a useful correction to the earlier diagnosis: the
+repair alphabet is only `[-120,120]`, but it is not sparse, and the approximate
+base leaves only 10.6 us to reach the 180-us exact gate.  Widening the quotient
+alone is therefore not an exact speedup.  Any future repair must encode dense
+small errors without paying for another full exposed transform.
+
+## M61-retaining 33/32 Good--Thomas architecture
+
+The experiment registry was checked before implementation.  This proposal is
+not the rejected near-M61 radix-33 field: that experiment replaced M61 with a
+generic prime and lost on reduction cost.  It also is not a repeat of the old
+unimplemented “algebraic no-go.”  The latter assumed one packed quadratic
+transform containing an odd-order root; the later exact radix-nine prototype
+proved the valid construction is independent power-of-two Hermitian channels
+followed by a base-field odd DFT.  No local code had tested that construction
+for radix 33 while retaining M61.
+
+For p136 choose
+
+```text
+N = 33 * 2^17 = 4,325,376 real words
+packed population = 33 * 2^16 = 2,162,688 GF(M61^2) values.
+```
+
+The algebra passes mechanically.  Thirty-three divides `M61-1`; with
+`theta=2^5`, `theta^N=2 (mod M61)`, so Crandall--Fagin weighting remains a
+cheap Mersenne rotation.  Each channel has only sixteen binary stages.  Its
+M61 binary-stage work relative to the production 4M transform is
+
+```text
+(33 * 2^16 * 16) / (2^21 * 21) = 0.785714,
+```
+
+a nominal 21.43% reduction, while coefficient population grows only 3.125%.
+The same family has a credible algebraic capacity path through the required
+range:
+
+| Odd factor | Extrapolated FP32 capacity | Binary-stage ratio | weight/root |
+|---:|---:|---:|---|
+| 33 | 136.94M | 0.7857 | pass |
+| 35 | 145.24M | 0.8333 | pass |
+| 39 | 161.84M | 0.9286 | pass |
+
+The risky point is the odd edge and its ownership, not root existence.  It was
+implemented as an exact production-population gate in
+[`src/cuda/m61_pfa33_edge_bench.cu`](src/cuda/m61_pfa33_edge_bench.cu).
+The length-eleven part uses the 20-scalar-multiply Nussbaumer/Winograd graph
+already present for FP64 in `fft11.cl`; its constants were solved in GF(M61)
+and every forward output was checked against an independent direct DFT.
+Forward plus inverse returns exactly 11 times the input, radix three returns
+exactly three times the input, and the complete Good--Thomas edge returns
+exactly 33 times every input.  Thus this gate does not time a 121-product
+direct DFT or an incorrect flat-channel scaffold.
+
+One thread owning eleven M61 values is spill-free at 92 registers.  Measured
+forward-plus-inverse medians were about 39.5--40.9 us for radix eleven and
+28.7--29.5 us for radix three when each factor is a separate full-memory pair.
+Pure-copy subtraction is not a sound compute estimate here: the arithmetic
+kernels hide memory latency better, sometimes making a grouped copy slower.
+The register-resident one/two/four-pair slope instead places the radix-eleven
+arithmetic at 21.0--21.7 us and radix three at roughly 1.3--2.0 us.
+
+The complete edge cannot keep radix three local with that ownership.  Two
+exact GPU mappings were therefore tested:
+
+- Three threads own the three radix-eleven rows and exchange their radix-three
+  values with warp shuffles.  It is spill-free but uses 124--126 registers;
+  the forward/inverse pair takes **59.8--61.3 us**, and its register-resident
+  incremental pair costs **48.3--49.1 us**.
+- Eleven lanes own the radix-eleven inputs, first perform local radix-three,
+  and distribute the 20 Winograd products across the warp.  This reduces the
+  kernel to 96 registers with no spills, but coefficient routing, shuffles,
+  and divergent recombination dominate: the exact pair takes **447 us** and
+  its chain slope is about **713 us**.
+
+This rejects PFA33 before PRPLL integration.  The measured radix-nine zero-edge
+gate saved only 1.28 us of transform core for a 3.57% binary-stage reduction;
+even a generous linear extrapolation gives radix 33 less than 8 us of core
+savings, while its best ownership-complete odd edge costs about 48--60 us and
+its larger carry population is not free.  Radix 39 would need an at least as
+expensive 3-by-13 edge.  **Do not implement a full PFA33/PFA39 recurrence unless
+a new ownership-complete odd DFT first demonstrates a sub-15-us exact pair at
+the full population.**  The attractive operation-count reduction was real,
+but the cross-channel SIMD/data-ownership cost overwhelms it on this GPU.
+
+## Compensated FP32 and detached-M31 edge audit
+
+The full-range quotient result reopened FP32 repair under materially different
+conditions from the old compensated-Tensor experiment.  The old test used
+ordinary binary32 roots and obtained only a 2.86x accuracy improvement.  The
+new gate first split every root into binary32 high and low components and kept a
+non-renormalized correction alongside the ordinary result.  The experiment
+registry and the earlier compensated section were checked before making this
+change; high/low roots, a loose twofold chain, a production radix-eight chain,
+and an actual FP32/M61 fused-edge differential were all previously untested.
+
+[`src/cuda/fp_compensated_tensor_bench.cu`](src/cuda/fp_compensated_tensor_bench.cu)
+now contains the complete accuracy gates.  At 2,097,152 complex values, one
+ordinary radix-eight group has RMS error `7.6211e-8` and maximum error
+`5.1261e-7`.  A canonical scaled-half correction with high/low roots reaches
+RMS `5.4450e-12`, and the cheaper non-renormalizing form reaches
+`1.2934e-11`.  Seven chained radix-eight groups, matching the production
+transform's 21 binary stages, retain RMS error `4.5050e-8` at an output scale
+whose maximum high component is about 2,861.  Thus the representation supplies
+far more than the approximately eight additional bits suggested by the p150
+`[-120,120]` quotient error.
+
+The cost is decisive.  One loose group measures about 17.2--17.8 us versus
+11.5--11.7 us for ordinary FP32, and seven groups measure about
+118.5--119.4 us versus an approximately 81-us ordinary extrapolation.  A
+three-byte 12-bit residual and a four-value grouped packing were slower still.
+A second implementation kept the correction in native packed `half2`
+arithmetic throughout each butterfly.  It is spill-free at 24 registers, but
+measures about 17.5--17.8 us per group and 117.9--118.2 us for seven groups.
+It recovers only 2--3 bits: single-group RMS is `1.27e-8` and seven-group RMS is
+`1.69e-5`.  Native FP16 conversion and error construction cost as much as the
+FP32 correction graph while losing the required precision.
+
+The production critical-path premise was measured directly.  An exact-safe
+4M FP32/M61 profile gives approximately 50.24 us of FP32 bottom-half kernels
+and 109.79 us of M61 kernels; the extra compensated FP32 bottom work could fit
+under M61.  The fused edge is the boundary that cannot.  The extended
+[`src/cuda/warp_specialized_edge_bench.cu`](src/cuda/warp_specialized_edge_bench.cu)
+executes two complete 512-wide edges around the same scalar bridge over the
+production population:
+
+| Production-population edge pair | Median |
+|---|---:|
+| ordinary FP32 plus M61 | 67--69 us |
+| loose compensated FP32 plus M61 | 99--100 us |
+| compensated FP32 only | 40 us |
+| M61 only | 55 us |
+| compensated FP32 and M61 on concurrent streams | 95 us |
+
+The fused increment is 30.8--32.2 us.  Ptxas reports 103 registers for the
+compensated kernel and 86 for ordinary FP32/M61, with zero stack and zero
+spills in both.  Separate streams do not overlap: 95 us is approximately the
+40+55-us sum and 1.75x the unattainable ideal maximum.  The loss is executed
+arithmetic/resource contention, not a register spill that another cap can fix.
+The fast wide-quotient recurrence has only 10.6 us before the 180-us gate, so
+neither fused nor split compensated FP32 can be integrated.
+
+Two exact-field detachments were then screened against the *real production
+carry arithmetic*, not the lightweight bridge proxy.  `DETACHED_M31_EDGE=1`
+is deliberately an incorrect timing gate: it removes both M31 width transforms
+from `carryFused`, loads already-width-shaped residues, and writes pre-width
+next residues.  It must never be quoted as a correct PRPLL mode.  Its purpose is
+to establish an impossible lower bound before implementing external inverse and
+forward width kernels.
+
+For the 4M FP32+M31+M61 oracle, the exact control measured 265.3 us and the
+zero-cost detached-width scaffold measured 247.4 us.  The complete M31 bottom
+half therefore makes a decoupled three-plane repair hopeless even before the
+two widths are restored.  For the incumbent 4M M31/M61 path, the matched exact
+control reproduced `52316d51aa52e6b7` at 10,000 iterations and measured
+205.1 us.  Deleting both M31 widths gave 186.3 us.  Removing the entire live
+`u31[NW]` vector as well, streaming coalesced scalar M31 residues through the
+actual CRT/carry, gave 186.2--186.4 us.  The scalar form therefore does not hide
+another occupancy win.
+
+Decision: **reject compensated FP32 and detached-M31 width scheduling.**  The
+former needs about three times its complete end-to-end allowance.  The latter
+misses 180 us even with both required transforms made free, so an exact
+external-width implementation can only be slower.  Do not repeat the native
+half residual, concurrent field streams, or quote the 186-us mode as a result;
+it is an explicit correctness-disabled lower bound.
+
+The corrected p150 quotient alphabet also prompted an information audit of a
+new folded correction sidecar.  Eight errors in `[-120,120]` contain about
+63.3 bits per alias bin.  One Goldilocks residue is large enough, but the
+already-measured half-sized direct Goldilocks transform costs 43 us and an
+eighth-fold transform would be larger.  Two 31-bit residues are insufficient;
+three smaller Riesel residues or parity plus two residues execute at least as
+much shortened-transform work as sidecars already measured to expose 14--20 us.
+Also, `2^23-1` is composite, as recorded earlier.  The smaller corrected error
+bound changes the decoder algebra but does not produce a side transform that
+fits the remaining 10.6-us exact-repair budget.
+
+## CUDA 13.3 carryless-multiply correction audit
+
+The experiment registry and source tree were searched for `clmad`, carryless
+multiplication, additive FFTs, and binary-field correction before this gate;
+none had previously been attempted.  This became relevant only with CUDA 13.3,
+which exposes the native 64-by-64-bit carryless multiply-accumulate instruction
+on `sm_80` and newer GPUs.  The installed toolkit is CUDA 13.2, so the 13.3.1
+compiler, NVVM, and disassembler redistributable archives were unpacked under
+`/tmp` for the experiment.  The system CUDA installation was not changed.
+
+[`src/cuda/clmad_bench.cu`](src/cuda/clmad_bench.cu) validates both halves of
+the 128-bit carryless product against an independent host bit-serial oracle and
+times dependent and instruction-level-parallel chains over 2,097,152 threads.
+All 4,096 random validation products pass.  Ptxas reports 10--26 registers,
+zero stack, and zero spills.  CUDA 13.3 `nvdisasm` confirms genuine `CLMAD.LO`
+and `CLMAD.HI` SASS rather than an emulated XOR/shift sequence.
+
+Fresh 31-sample medians on the RTX PRO 6000 Blackwell Max-Q are:
+
+| CLMAD operations per thread | One dependent chain | Eight-way chain |
+|---:|---:|---:|
+| 1 / 8 | 7.616 us | 27.520 us |
+| 2 / 16 | 9.600 us | 50.592 us |
+| 4 / 32 | 15.488 us | 97.728 us |
+| 8 / 64 | 26.208 us | 191.840 us |
+| 16 / 128 | 50.560 us | 380.064 us |
+| 32 / 256 | 95.808 us | 742.816 us |
+
+The long chains sustain approximately 0.70--0.72 trillion CLMAD instructions
+per second.  Thus the hardware primitive itself passes: a future workload that
+actually lives in `GF(2^m)` can use a high-throughput unit that was absent from
+all earlier PTX/SASS audits.  NVIDIA's instruction semantics and availability
+are documented in the [PTX ISA `clmad` section](https://docs.nvidia.com/cuda/parallel-thread-execution/#integer-arithmetic-instructions-clmad),
+and its CUDA 13.3 exposure and Blackwell measurements are described in
+[NVIDIA's carryless-multiplication note](https://developer.nvidia.com/blog/building-faster-cryptography-with-carryless-multiplication-in-nvidia-cuda-13-3/).
+
+It does **not** pass the PRPLL correction algebra.  For every field of
+characteristic two, the canonical map from integer coefficients satisfies
+
+```text
+n -> n mod 2,
+(sum_i a_i*x^i)^2 = sum_i a_i^2*x^(2i).
+```
+
+Consequently every even multiplicity vanishes and all cross terms in a square
+cancel.  Enlarging from `GF(2)` to `GF(2^64)` or `GF(2^128)`, changing additive
+FFT evaluation points, or taking more characteristic-two syndromes does not
+retain the missing carryful integer sums.  Given
+`c = r61 + k*M61`, such a syndrome can reveal at most `k mod 2`, because M61
+is odd.  The production diagonal-square parity path already obtains exactly
+that bit without any transform.  Recovering higher bits would require a
+nonlinear lift to `Z/2^t` (including divided-square/carry operations), not one
+binary-field convolution; native CLMAD does not provide that lift.
+
+Decision: **reject a CLMAD/additive-FFT sidecar for repairing the dense
+FP32/M61 quotient errors.**  This is an algebraic rejection despite excellent
+hardware throughput: the corrected p150 error alphabet `[-120,120]` needs
+roughly eight carryful bits per coefficient, while characteristic-two
+arithmetic preserves only parity.  Retain the benchmark for genuinely binary
+future work, but do not propose a wider binary field, more binary syndromes, or
+Tensor/CLMAD convolution as an exact odd-integer residue.
+
+## Two-field 3.5M M61/Riesel-45 audit
+
+After closing characteristic-two correction, the registry was searched for a
+two-field 3.5M transform, 40--48-bit Riesel fields, and a medium-width
+`k*2^s-1` reducer.  No such architecture had been tested.  This is distinct
+from the rejected two-61-bit 3M design and the M31/q53 4M replacement: the
+longer 3.5M transform lowers the exact coefficient bound enough for a 45-bit
+second field, while retaining only two residue streams.
+
+A deterministic 64-bit prime search scored capacity, seventh-root existence,
+the Crandall--Fagin root-of-two equation, and reducer shape jointly.  The best
+small-multiplier candidate is
+
+```text
+q45 = 63*2^39 - 1 = 34,634,616,274,943
+                    = 2^45 - 2^39 - 1.
+```
+
+Deterministic Miller--Rabin and `openssl prime` both classify it as prime.
+For `N=7*2^19=3,670,016`, `gcd(N,q45^2-1)=N` and
+
+```text
+2^((q45^2-1)/N) mod q45 = 1.
+```
+
+Also `q45 == -1 (mod 7)`, so the quadratic field supplies the seventh root.
+The exact 3.5M Beatty-word bound already proved above is 104.246421 bits at
+p150, while the balanced `M61*q45` range is 104.977280 bits: **0.730859 bit
+of proven p150 headroom**.  The representation therefore passes algebra and
+the full requested 140--150M range gate.
+
+The reducer uses Montgomery radix `R=2^39`, even though `R<q45`.  Writing the
+90-bit product as `high*R+low` gives the exact cancellation
+
+```text
+(product + low*q45) / R = high + 63*low.
+```
+
+The right side is below 52 bits and canonicalizes with a small constant
+quotient and one final subtraction.  This is materially cheaper than generic
+64-bit Montgomery and is the favorable reducer shape required to distinguish
+the candidate from the old q53/q61 results.
+
+The existing architecture-population
+[`src/cuda/m61_near61_overlap_bench.cu`](src/cuda/m61_near61_overlap_bench.cu)
+now includes this exact path.  It compares concurrent production M31/M61 over
+2,097,152 quadratic values with concurrent M61/q45 over the 3.5M population of
+1,835,008 values.  Every tested q45 chain agrees with an independent host
+`unsigned __int128` oracle.  The q45 kernel uses 32 registers, zero stack, and
+zero spills, the same register count as M61.
+
+Three repeated 31-sample processes plus the initial run measured:
+
+| Dependent quadratic products | 3.5M q45/current ratio |
+|---:|---:|
+| 2 / 2 | 1.1988--1.2092 |
+| 4 / 4 | 1.2111--1.2295 |
+| 8 / 8 | 1.2134--1.2158 |
+| 16 / 16 | 1.2421--1.2487 |
+| production 7 / candidate 6 | **1.0852--1.0889** |
+
+The last row is the architecture-shaped comparison: production has seven
+binary radix-eight groups, while each of the seven candidate channels has six.
+It measures 111.038--111.957 us for M31/M61 versus 120.869--121.691 us for
+M61/q45.  Thus even after charging the candidate one fewer dependent product
+group and its 12.5% smaller population, the two wide fields are about 8.5--8.9%
+slower.  The shift/add REDC removes generic Montgomery's worst constant, but it
+cannot reproduce the hidden M31 stream's cheap arithmetic and complementary
+resource use.
+
+Decision: **reject the two-field 3.5M M61/q45 architecture before a radix-seven
+tile or carry integration.**  Its most favorable arithmetic-density gate is
+already slower than production, whereas the complete objective needs a 12.4%
+speedup.  A real transform would additionally add a quadratic q45 radix-seven
+edge, 105-bit CRT/carry, and 14.6% more state.  Retain q45 and its reducer as
+useful prime-selection evidence, but do not repeat it with another `k` unless
+the new base-field multiply first beats M61 rather than trailing a schedule
+that includes M31.
+
+## Folded negacyclic DGT and FP32 input-splitting audits
+
+The registry was checked before pursuing another negacyclic construction.  The
+earlier root-of-minus-two audit only proved that changing the convolution sign
+does not enlarge the eligible-prime set; it did not examine Crandall's folded
+negacyclic representation, whose attractive feature is a simple pointwise
+square instead of the production pair-square graph.  That separate proposal
+fails algebraically for the current fields.
+
+Let `i^2=-1` in the quadratic field and let `lambda^N=-2`.  Since both M31 and
+M61 are `7 (mod 8)`, two has a base-field square root `s`.  Consequently
+
+```text
+(lambda^(N/2))^2 = -2,
+lambda^(N/2) = +/- i*s,
+i*lambda^(N/2) = -/+ s.
+```
+
+The coefficient that is supposed to fold the two real halves into one
+quadratic-field value is therefore itself in the base field.  The two halves
+collapse into one scalar instead of carrying two independent scalars.  Using a
+full-length quadratic transform restores injectivity but doubles the transform
+population and loses the entire proposed benefit.  Decision: **reject the
+simple-square folded negacyclic DGT for M31/M61.**  Its cheap pointwise square
+and half-length packing cannot coexist in these fields.
+
+The full-range FP32 evidence was also checked before considering a high/low
+input split.  A packed forward transform followed by separate high and low
+inverse transforms initially appears capable of buying accuracy for less than
+two complete FP32 recurrences.  It does not fix the dominant error.  If
+`a = B*hi + lo`, the `B^2*hi^2` term retains the same relative FP32 transform
+error after scaling back by `B^2`; splitting the input does not add precision
+to the transform that evaluates that largest term.  Cross and low terms cannot
+reconstruct the discarded bits of `hi^2`.  This is distinct from the measured
+twofold-root correction, which actually propagates an error component through
+every butterfly and was already 30.8--32.2 us too expensive at the fused edge.
+Decision: **reject input splitting alone as an FP32 exactness repair.**
+
+## Shortened two-field q15/M61 and q7/M61 mixed-radix gates
+
+The earlier “Whole-backend FP64 and mixed-radix-15 screens” section rejected a
+3.75M design by a zero-overhead budget argument and the measured cost of the
+then-known generic q31 fields.  It did not benchmark a sub-`2^30` field chosen
+jointly for the exact transform length, Harvey-compatible ranges, and cheap
+32-bit Montgomery arithmetic.  This experiment deliberately reopened only
+that missing risky point, then charged the odd edge once the core passed.  The
+radix-seven follow-up tested the smallest odd edge that could plausibly retain
+the shortened-core gain.
+
+### Binary-core population gate
+
+The search found two new exact arithmetic candidates:
+
+```text
+q15 = 953,679,871 = 7276*2^17 - 1,  N = 15*2^18
+q7  = 4,151,312,383 = 15836*2^18 - 1, N = 7*2^19
+```
+
+Both pass deterministic primality checks, the required scalar odd-root test,
+the quadratic power-of-two subgroup test, and the Crandall--Fagin root-of-two
+equation for their stated lengths.  `q15<2^30` also admits the redundant-range
+Harvey family discussed in the literature survey; this first gate uses the
+more conservative canonical Montgomery form.  For q15 with `R=2^32`,
+`-q^-1=0x38d80001`, `R mod q=480247812`, and `R^-1=211760704`.  For q7,
+`-q^-1=0xf7700001`, `R mod q=143654913`, and `R^-1=4012462336`; its reduction
+explicitly retains the carry from the cancelled 65-bit sum.
+
+[`src/cuda/m31_m61_q15_overlap_bench.cu`](src/cuda/m31_m61_q15_overlap_bench.cu)
+compares architecture populations rather than one isolated multiply.  The 4M
+M31/M61 control applies seven dependent quadratic products over `2^21` packed
+values.  The 3.75M q15/M61 and 3.5M q7/M61 candidates apply six products over
+`15*2^17` and `7*2^18` values respectively; six slightly overcharges q15's
+seventeen binary stages.  Device results agree with independent host
+`unsigned __int128` Montgomery oracles.  Ptxas reports no stack or spills.
+
+Repeated 31-sample medians were:
+
+| Architecture-shaped binary core | Median | Change from control |
+|---|---:|---:|
+| 4M M31/M61 control | 86.50--87.07 us | -- |
+| 3.75M q15/M61 | 63.73--64.89 us | **-21.81 to -22.78 us** |
+| 3.5M q7/M61 | 66.21--67.85 us | **-18.67 to -20.30 us** |
+
+This is a real component speedup, not an end-to-end result.  It establishes
+that fewer binary stages and a cheap 32-bit field can overcome the loss of the
+hidden M31 stream.  It also makes the odd transform edge, not the binary core,
+the decisive next gate.
+
+### Exact radix-15 edge
+
+[`src/cuda/m61_q15_radix15_bench.cu`](src/cuda/m61_q15_radix15_bench.cu)
+implements an exact Good--Thomas 3-by-5 edge in both fields.  Radix three uses
+one scalar constant product; radix five uses a four-product symmetric Winograd
+form.  Forward transform, quadratic-field pointwise square, and inverse
+transform agree with an independent cyclic-square oracle.  Both one-thread
+ownership and a two-groups-per-warp distributed mapping were tested.  They are
+spill-free: the one-thread kernels use about 68 registers for q15 and 87 for
+M61, while the warp form uses 40 and 56 respectively.
+
+At the complete 3.75M population:
+
+| q15/M61 radix-15 edge mapping | Forward + square + inverse | Increment over square |
+|---|---:|---:|
+| One thread owns 15 values | 87.122--87.133 us | **69.862--70.110 us** |
+| Two groups distributed per warp | 129.570--129.592 us | **112.310--112.570 us** |
+
+The square-only control was 17.022--17.259 us.  Even the best exact radix-15 edge costs
+more than three times the approximately 22-us binary-core saving, before CRT,
+carry, generic weights, or full-range capacity integration.  This empirically
+confirms the earlier budget rejection with the most favorable new q15 core.
+
+### Exact radix-seven edge
+
+The q7 field was selected to reduce the odd factor from fifteen to seven while
+retaining about 91.951 balanced CRT bits with M61.  The exact edge gate is
+[`src/cuda/m61_q7_radix7_bench.cu`](src/cuda/m61_q7_radix7_bench.cu).  It
+reuses the already validated Rader/Good--Thomas graph from
+[`src/cuda/m31_m61_m19_radix7_bench.cu`](src/cuda/m31_m61_m19_radix7_bench.cu),
+which is now includable behind `RADIX7_LIBRARY_ONLY`; the original benchmark's
+default behavior is unchanged.  q7 residues and constants remain in
+`R=2^32` Montgomery form.  The first 64 groups pass an independent full cyclic
+square in both q7 and M61.  The q7 kernel uses 66 registers and the M61 kernel
+48, with zero stack and zero spills.
+
+The full-population median was:
+
+```text
+3.5M q7/M61 exact radix-7 square PASS
+radix7/square/inverse: 45.280--45.440 us
+square only:            24.992--25.312 us
+radix-7 increment:      20.128--20.288 us
+```
+
+The 20.128--20.288-us exact odd-edge increment consumes all of the measured
+18.674--20.296-us binary-core saving.  The candidate's 12.5% smaller carry population is only an
+approximately 9-us ideal saving when scaled from the production edge, still
+far short of the 25.5-us complete-iteration reduction required from the
+205.5-us reference.  A real implementation would additionally pay generic
+q7 weights, a wider CRT/carry path, and has at best tight capacity near p150.
+
+Decision: **reject q15/M61 at 3.75M and q7/M61 at 3.5M before PRPLL
+integration.**  Their binary cores are the first shortened two-field component
+tests to beat the production-shaped core by about 20--23 us, but exact odd-radix
+data ownership consumes all or several times that gain.  Do not quote the core
+numbers as recurrence speedups or repeat another odd factor unless its exact,
+full-population forward/inverse edge first demonstrates a substantially
+sub-15-us increment.
+
+## Whole-radix M61 limbs and factor-two q24 correction audit
+
+The fused persistent-limb result above left one explicit reopening condition:
+avoid its remaining cross-limb normalization over an entire radix group rather
+than only one quadratic product.  The production radix-eight graph and final
+SASS were re-audited before writing another kernel.  That condition cannot be
+met by the proposed representation.  A general twiddle product accepts two
+bounded 31-bit limbs and emits signed raw coefficients near 61 bits.  Those raw
+coefficients cannot enter the next 32-by-32-bit product; they must first be
+folded back to bounded limbs.  Within one production radix-eight group there is
+only one such general table-twiddle product on a path.  The remaining radix
+rotations are already Mersenne-special and production already carries redundant
+add/subtract ranges across them.  Delaying the fold therefore removes no chain
+of repeated product normalizations, while a direct radix-eight matrix would
+replace the sparse graph with many more products.
+
+Decision: **do not implement the whole-radix persistent-limb variant.**  The
+source-level reopening condition fails its range/dataflow gate: the one fold
+that remains is exactly the boundary required before the next general product.
+This is not another timing of the separately-normalized limb code.
+
+The corrected p150 FP32/M61 error range suggested a different, previously
+untested folded sidecar.  Earlier folded transforms used M31 at factors eight
+and sixteen and assumed the old small error alphabet.  The later full-range
+audit found dense errors in `[-120,120]`; an eight-alias bin then contains about
+63.3 bits of information and cannot fit in M31.  Folding by only two aliases
+changes the information and performance trade:
+
+```text
+qC = 14,680,063 = 7*2^21-1
+side length = 2^21 real words = 2^20 GF(qC^2) values
+```
+
+The existing independently validated `theta=10048878` satisfies
+`theta^(2^22)=2`.  Across the two aliases the common coefficient cancels and
+their weight ratio is
+
+```text
+r = theta^(2^21) = 10282535 (mod qC),  r^2 = 2 (mod qC).
+```
+
+An exhaustive lattice search through the required square-root range finds the
+shortest nonzero relation `d0+r*d1=0 (mod qC)` at
+
+```text
+(d0,d1)=(-227,2714), infinity norm 2714.
+```
+
+Therefore every pair of quotient errors in `[-1356,1356]^2` has a unique qC
+syndrome.  This is much stronger than merely counting
+`241^2 < qC`: it proves collision freedom for the actual Crandall--Fagin alias
+weights, and gives over eleven times the observed p150 error amplitude.
+
+The performance gate fails before a new side transform is justified.  A fresh
+exact 2M M31-only `52:512:4:512:202` profile gives the closest mature transform
+at the same folded population:
+
+| 2M M31 region | Time |
+|---|---:|
+| inverse width (`fftP`) | 9.8 us |
+| middle in | 8.3 us |
+| tail square | 15.1 us |
+| middle out | 8.0 us |
+| forward width | 8.9 us |
+| **transform total** | **about 50.1 us** |
+
+The run was exact at its safe test exponent; carry kernels are excluded from
+the total.  At the exact qC factor-two population, the existing qC tile again
+passes Montgomery, Harvey, exact-FP32, short-quotient, and `R=2^21` cross-checks.
+Four register-resident radix-eight/square rounds take about 10 us for integer
+qC and 12 us for exact short-quotient FP32.  The earlier architecture-shaped
+chain gives the most optimistic arithmetic ratio: qC FP32 is about
+`22.2/31.2 = 0.71` of M31 at eight products.  Even granting that ratio to the
+entire mature M31 transform projects roughly 35.6 us for the qC sidecar.
+
+That work cannot fit the exact base's schedule.  The wide-quotient FP32/M61
+engine has only 10.6 us before the 180-us gate.  Its main FP32 bottom half is
+about 92 us and its M61 overlap window about 102 us.  Blackwell's FP32 and INT32
+instructions share the same unified issue resources, as recorded in the power
+audit; adding an optimistic 35.6-us qC transform creates roughly 127.6 us of
+work on that side of a 102-us window, or about 25.6 us exposed before fold
+construction, two-alias decoding, and the fused carry changes.  Integer qC
+instead contends directly with the already-critical M61 kernels, while the
+measured q24 Tensor tile is 1.82x slower than sparse SIMT and cannot move this
+work to Tensor Cores cheaply.
+
+Decision: **retain the factor-two decoder proof, but reject its transform
+integration for the 180-us gate.**  It solves the dense p150 information
+problem much more cleanly than factor-eight M31, but the four-times-larger side
+population consumes more than twice the complete exposed-time allowance even
+under favorable measured scaling.  Do not implement it as another generic
+side stream unless a new qC transform engine first demonstrates at most about
+20 us for the complete forward/square/inverse path and avoids the unified
+FP32/INT32 contention.
+
+## Direct fold-by-four scalar-field correction audit
+
+This is distinct from the earlier factor-eight/factor-sixteen folded M31
+syndromes and the factor-two qC audit above.  It asks whether four quotient
+errors can be decoded directly from one scalar NTT field, avoiding both a
+quadratic extension and multiple correction primes.  At p150 the observed
+dense error alphabet is `[-120,120]`, so a four-alias bin has
+
+```text
+241^4 = 3,373,402,561 possible vectors (31.6516 bits).
+```
+
+An exhaustive search first considered every unsigned 32-bit Proth prime
+`q=k*2^s+1` above that count with `s>=20`.  There were 76 primes, but none had
+the required full Crandall--Fagin weight relation
+`theta^(2^22)=2 (mod q)`.  Thus none can express the four aliases with the
+correct transform weights in the base field.
+
+The corresponding unsigned 32-bit Riesel search, `q=k*2^s-1` with `s>=19`,
+found 172 prime/weight-compatible candidates.  Counting states is not enough:
+for every candidate and every base-field fourth root `r` of two, a
+meet-in-the-middle lattice search tested the actual difference box
+`[-240,240]^4` for a collision in
+`d0+r*d1+r^2*d2+r^3*d3 = 0 (mod q)`.  **Every candidate collided.**  The best
+candidate was
+
+```text
+q = 4,047,503,359 = 7720*2^19-1 = 0xf13fffff
+r = 711,891,807
+largest proven symmetric error bound: [-115,115]
+required bound:                      [-120,120]
+```
+
+The next three candidates proved only `[-114,114]`.  Consequently no
+unsigned-32 scalar Riesel field has a deterministic decoder for the measured
+p150 range.
+
+There is also no latent performance win just below the failed correctness
+gate.  A fresh exact mature M31 transform with the same factor-four population
+(`p=8000023`, `FFT=52:512:2:512:202`) measured:
+
+| 1M M31 region | Time |
+|---|---:|
+| inverse width (`fftP`) | 7.7 us |
+| middle in | 6.3 us |
+| tail square | 10.9 us |
+| middle out | 6.7 us |
+| forward width | 6.8 us |
+| **transform total** | **about 38.4 us** |
+
+A generic near-32-bit Riesel transform is slower than M31, while reopening the
+correction architecture requires a complete side transform near or below
+20 us.  Decision: **reject direct scalar fold-by-four correction on both
+exactness and performance grounds.**  Do not repeat this search without either
+a wider scalar arithmetic unit or a demonstrably smaller, rigorously bounded
+p150 error alphabet.
+
+## Batch-native two-exponent carry gate
+
+The earlier batched-M61 experiment shared transform roots and scheduling but
+left each exponent's carry separate.  To test the remaining throughput-specific
+idea, `src/cuda/m31_m61_direct_carry_bench.cu` now contains an exact
+`batch2CarryKernel`.  Exponents separated by the transform word count have the
+same word-size/control pattern.  One CUDA thread therefore owns two independent
+CRT/carry chains and reads their M31/M61 residues from interleaved AoSoA
+records, sharing the coefficient index, word-bit calculation, and loop
+control.
+
+The prototype validates all four million output words and both final carry
+states against two launches of the scalar production-shaped i96 kernel.  Both
+scalar and batch kernels compile for `sm_120` with 40 registers, zero stack,
+and zero spills.  Three timing runs gave:
+
+```text
+scalar i96 carry:             17.376--17.600 us/exponent
+batch-2 carry:               103.392--105.088 us/batch
+batch-2 useful time:          51.696--52.544 us/exponent
+useful throughput vs scalar: 0.333--0.341x
+```
+
+The extra independent chain expands the scheduled instruction window and
+creates a much longer dependency/issue path; lack of spills does not rescue
+it.  Assigning the exponents to separate lanes would reduce per-thread live
+state, but would cease sharing the issued CRT arithmetic and is already bounded
+by the modest 1.107x best result of the earlier batched-M61 middle kernel.  That
+cannot supply the approximately 25.5-us reduction required by the 180-us gate.
+
+Decision: **reject batch-native fused carry and full two-exponent AoSoA
+integration.**  It is exact, but its useful carry throughput is roughly three
+times worse than two independent scalar carries.  Aggregate throughput has not
+produced a speedup over production.
+
+## Full-length scalar-field replacement at 3M
+
+The registry was searched for scalar fields, full-root transforms, and the 3M
+Crandall--Fagin weight before implementation.  Earlier direct-prime work used
+three scalar 32-bit fields at 4M, while every shortened exact architecture used
+quadratic extension fields.  A scalar field is materially different at equal
+state size: `N` scalar residues occupy the same bytes as `N/2` quadratic
+residues, but a general root product needs one base-field multiply instead of
+quadratic Karatsuba's three.  This made a two-field 3M design worth an algebra
+and complete-tile gate:
+
+```text
+GF((2^61-1)^2) over 3*2^19 packed values
+GF(q)          over 3*2^20 scalar values
+```
+
+For `N=3*2^20` and `q=k*N+1`, a scalar NTT exists.  The exact weighted
+convolution also needs `theta^N=2`, equivalent to `2^k=1 (mod q)`.  Restricting
+`gcd(k,N)=1` then gives the direct construction
+`theta=2^(N^-1 mod k)`.  [`src/cuda/scalar_cf_prime_search.cu`](src/cuda/scalar_cf_prime_search.cu)
+implements a segmented host sieve, variable-modulus GPU Montgomery exponent,
+and deterministic 64-bit Miller--Rabin verification.  The GPU result is
+cross-checked against host `unsigned __int128` exponentiation in every search
+chunk.
+
+Scanning the first one billion eligible `k` values below `2^61` found sixteen
+prime/weight-compatible fields.  The closest selected field is
+
+```text
+q     = 2,305,812,246,001,876,993
+      = 2^61 - 30,763,211,816,959
+k     = 732,997,972,489
+theta = 29,110,686,992,428,763
+omega = 448,856,835,758,695,607   (order 3*2^20)
+```
+
+Deterministic Miller--Rabin and `openssl prime` both classify `q` as prime;
+`theta^N=2`, while `omega^N=1`, `omega^(N/2)=-1`, and
+`omega^(N/3)!=1`.  The balanced `M61*q` CRT range is 120.999981 bits, about
+2.83 bits above the existing conservative p150 3M coefficient bound.  This is
+therefore a general 140--150M candidate, not a p136-only empirical range.
+
+The architecture-population root-product gate was added to the existing
+[`src/cuda/m61_near61_overlap_bench.cu`](src/cuda/m61_near61_overlap_bench.cu).
+The scalar field has twenty binary stages while the packed M61 channel has
+nineteen, so its matched comparison uses six M61 and seven scalar products
+against seven products in both production fields.  Every tested output agrees
+with an independent host oracle.  Fresh medians were:
+
+```text
+4M M31+M61 control, 7+7 products: 111.557 us
+3M M61+scalar-q, 6+7 products:     94.816 us
+candidate/control:                  0.8499
+```
+
+This 15.0% component lead passed the primitive gate.  The exact odd edge in
+[`src/cuda/m61_scalar_q3m_radix3_bench.cu`](src/cuda/m61_scalar_q3m_radix3_bench.cu)
+also passes independent cyclic-square validation:
+
+```text
+radix-3 / square / inverse: 20.429 us
+equal-payload square only:  16.379 us
+radix-3 increment:           4.050 us
+```
+
+The complete radix tile reverses the result.  The independent
+[`src/cuda/m61_scalar_q3m_tile_bench.cu`](src/cuda/m61_scalar_q3m_tile_bench.cu)
+executes exact radix-16 forward transforms, pointwise squares, and inverse
+transforms at the full architecture populations.  It compares concurrent
+production M31/M61 streams with concurrent shortened M61/scalar-q streams.
+Direct cyclic-square oracles pass, and the canonical and lazy scalar outputs
+agree over all 3,145,728 values.  The canonical scalar kernel uses 30 registers,
+the M61 kernel 36, and neither spills.  Three fresh process medians gave:
+
+| Exact concurrent radix-16 tile | Median range | Relative to production |
+|---|---:|---:|
+| 4M M31+M61 | 98.173--98.190 us | 1.000 |
+| 3M M61+scalar-q | 107.456--107.808 us | **1.094--1.098** |
+| 3M M61+Harvey-lazy scalar-q | 115.290--115.482 us | **1.174--1.176** |
+
+The lazy variant is valid because `q<2^62`: it carries residues in `[0,2q)`,
+omits the Montgomery final subtraction through the entire radix group, and
+normalizes only after inverse scaling.  It retains 30 registers and no spills,
+but the broader add/sub range graph is slower rather than faster.
+
+The failure explains the misleading product-chain lead.  A scalar plane has
+twice as many independently routed values as a packed quadratic plane.  Its
+lower multiplicative rank does not pay for twice the warp exchanges,
+butterflies, and scalar thread population.  The candidate removes only one of
+roughly twenty binary stages, so a 9.4--9.8% loss per complete tile cannot turn
+into the required 12.4% whole-iteration gain; the separate exact radix-three
+edge and a new 121-bit CRT/carry would add further cost.
+
+Decision: **reject the 3M M61 plus full-length scalar-q architecture before a
+full transform or PRPLL integration.**  Retain the prime search and compatible
+fields as reusable algebra infrastructure, but do not infer transform speed
+from the 94.8-us multiplication-chain proxy.  Reopen scalar fields only if a
+complete exact radix tile beats the concurrent production tile, not merely if
+the modulus multiply or odd edge does.
+
+## M61 circle-FFT real-form replacement
+
+The registry was searched for circle FFTs, Chebyshev/tensor bases, and
+norm-one base-field transforms before implementation; this approach had not
+previously been attempted.  The motivating fact is unusually favorable for
+M61: the norm-one circle group over `GF(2^61-1)` has order
+`M61+1=2^61`.  A full-length scalar circle transform therefore occupies the
+same 32 MiB as the packed half-length `GF(M61^2)` stream.  Its primitive
+butterfly uses one base-field product, whereas a general quadratic twiddle
+uses three.  The algorithm and coefficient-basis audit used the Circle STARK
+paper (<https://eprint.iacr.org/2024/278>) and the official Stwo implementation
+at commit `88e95ba9c37aa81975575a52ccdadd1b93c08f24`
+(<https://github.com/starkware-libs/stwo/tree/88e95ba9c37aa81975575a52ccdadd1b93c08f24>).
+
+The riskiest point is not root existence but representation.  A circle IFFT
+returns coefficients in the tensor basis
+
+```text
+{1,y} * {1,x} * {1,pi(x)} * {1,pi^2(x)} * ...,
+pi(x)=2*x^2-1,
+```
+
+not in PRPLL's ordinary digit basis.  [`src/circle_basis_test.cpp`](src/circle_basis_test.cpp)
+constructs both evaluation matrices independently over M61.  For canonical
+odd-root cosets it proves this complete chain for sizes 4, 8, 16, 32, and 64:
+
+```text
+ordinary digits -> circle tensor coefficients -> circle evaluations
+-> conjugate-pair complex square -> inverse circle transform
+-> ordinary coefficients == direct negacyclic square
+```
+
+If a point stores `s+=Re(A)+Im(A)` and its conjugate stores
+`s-=Re(A)-Im(A)`, the exact square needs only two products per conjugate pair:
+
+```text
+real(A^2) = s+ * s-
+imag(A^2) = (s+ + s-) * (s+ - s-) / 2.
+```
+
+The two lanes can compute one product each and exchange them.  Thus the
+pointwise operation does not erase the scalar arithmetic advantage.
+
+The basis bridge is exact and shift/add-only, but not free.  Its unfactored
+matrix has `2*3^(log2(N)-1)` nonzeros.  It does have a fast recursion:
+`C_N=diag(C_(N/2),C_(N/2))*S_N`, where `S_N` has `3N/2` nonzeros and each
+level requires `N/2` adds/subtracts plus `N/2-1` M61 rotations by one bit.
+The inverse has the same population.  This converts the apparent dense matrix
+into `O(N log N)` work, but adds almost one shuffle/add network beside every
+circle-butterfly level.
+
+[`src/cuda/m61_circle_tile_bench.cu`](src/cuda/m61_circle_tile_bench.cu)
+measures the consequence at the full 4M scalar population.  It uses generic
+nonzero M61 twiddles and exact inverses, which have the same instruction and
+resource shape as circle-coordinate twiddles.  It validates all 4,194,304
+values through the round trips and checks the square and bridged network
+against independent host oracles.  The separate CPU test above proves that
+the actual canonical circle coordinates produce the required negacyclic
+convolution.  Three fresh process medians were:
+
+| Concurrent exact radix-16 tile | Median range | Relative to control |
+|---|---:|---:|
+| 4M M31 + packed M61 quadratic control | 98.158--98.232 us | 1.000 |
+| M31 + bare scalar M61 circle transform | 82.784--82.901 us | 0.8427--0.8446 |
+| M31 + required digit-bridged circle transform | 137.382--138.846 us | **1.3986--1.4139** |
+
+The bare 15.5--15.7% win is therefore another misleading primitive gate.  It
+times multiplication in the circle tensor basis, not multiplication of the
+digit polynomial.  Fusing the exact forward bridge, paired square, and inverse
+bridge into the same register-resident kernel still makes the useful tile
+about 40% slower.  The bridged kernel uses 32 registers with zero stack and
+zero spills, so this is issued shuffle/add/arithmetic work rather than a spill
+artifact.
+
+The comparison is actually generous to the circle path.  The generic
+quadratic control performs fifteen quadratic twiddle products per radix-16
+direction.  Production [`src/cl/fft16.cl`](src/cl/fft16.cl) uses only four
+general `cmul` operations per direction; its two radix-eight cores exploit
+M61 order-four/order-eight rotations and range-delayed adds.  Per 32 digit
+coefficients, the optimized local M61 quadratic transform/square needs about
+56 base products, while two bridged scalar-circle groups need 92 even before
+their additional basis shuffles and adds.
+
+Decision: **reject the M61 circle-FFT replacement before a full PRPLL
+integration.**  The exact algebra works and the bare circle transform is fast,
+but ordinary digit convolution necessarily restores the work that the tensor
+basis seemed to remove.  Do not reopen it based on a circle-transform-only
+benchmark; a future proposal must include the digit-basis bridge and paired
+square in its first timing gate.
+
+## Full polynomial-ring Nussbaumer transform
+
+The registry and source tree were searched for Nussbaumer, Schoenhage,
+polynomial-ring transforms, and rotation-only twiddles before this audit.  The
+existing references are only Nussbaumer/Winograd *small DFT formulae* for
+radices 5, 7, 9, and 11.  A recursive symbolic-root convolution had not been
+attempted.  This section concerns the latter and must not be confused with the
+already-rejected odd-radix edges.
+
+The proposal is algebraically exact over either M31 or M61.  For
+`N=2^n`, choose `m=2^floor(n/2)` and `r=2^ceil(n/2)`, reshape the digit
+polynomial into `m` polynomials in `R[u]/(u^r+1)`, zero-pad to `2m`, and
+perform a length-`2m` polynomial transform.  Its roots are powers of the
+formal `u`, so every twiddle is a coefficient rotation and sign change rather
+than a modular product.  The `2m` pointwise operations are negacyclic
+length-`r` squares and can be handled recursively.  This is the construction
+in Nussbaumer's primary paper, [“Fast polynomial transform algorithms for
+digital convolution”](https://doi.org/10.1109/TASSP.1980.1163372).  The exact
+forward/inverse pseudocode and operation accounting were independently
+checked against [this worked description](https://www.cs.ru.nl/bachelors-theses/2016/Gerben_van_der_Lubbe___4389026___A_New_Hope_for_Nussbaumer.pdf).
+
+The risky point is the *complete recursive work*, not whether the symbolic
+root exists.  Specializing the recurrence to a square saves the second forward
+transform, and the length-two base square uses two products.  With modular
+halves postponed into the final power-of-two normalization, the deliberately
+favorable scalar counts are
+
+```text
+base_squares(N) = 2m * base_squares(r)
+products(N)     = 2m * products(r)
+adds(N)         = 2m * adds(r) + N*(4*log2(m)+3)
+
+base_squares(2) = 1
+products(2)     = 2
+adds(2)         = 3
+```
+
+For one 4M residue field this expands as follows:
+
+| Subproblem length | Number of subproblems | Local scalar additions |
+|---:|---:|---:|
+| `2^22` | 1 | 197,132,288 |
+| `2^11` | 4,096 | 192,937,984 |
+| `2^6` | 262,144 | 251,658,240 |
+| `2^3` | 4,194,304 | 234,881,024 |
+| `2^2` | 16,777,216 | 469,762,048 |
+| length-two leaves | 67,108,864 | 201,326,592 |
+
+The total is **134,217,728 modular products and 1,547,698,176 modular
+adds/subtracts per field**.  Both the M31 and M61 fields are still required for
+the exact CRT range.  The transform also expands each field from `N` to `2N`
+live scalar residues at its first level, before deeper scheduling or
+permutations are considered.
+
+Stopping the recursion at an ordinary NTT does not remove that expansion.
+More importantly, the required large power-of-two roots do not exist in the
+M61 scalar multiplicative group; they live in `GF(M61^2)`.  The leaf transform
+therefore restores the incumbent quadratic complex arithmetic over twice the
+scalar state.  This is not a cheap scalar-NTT hybrid.
+
+[`src/cuda/m61_nussbaumer_add_gate.cu`](src/cuda/m61_nussbaumer_add_gate.cu)
+measures a stronger optimistic lower bound before implementing any data
+permutation.  It executes the exact M61 addition count as eight independent
+register chains over the original 4M population.  It gives the candidate only
+one input read and one output write, omits all 134M leaf products, all expanded
+state, every symbolic rotation/permutation, the entire M31 field, CRT/carry,
+and PRPLL bookkeeping.  The 32-to-48-round slope subtracts initialization and
+the final reduction.  Five fresh process medians gave:
+
+```text
+M61 modular-add throughput:       7.56--7.64 trillion adds/s
+369 adds/original coefficient:    202.6--204.8 us
+```
+
+The 48-round kernel uses 38 registers, zero stack/shared/local memory, and no
+spills.  Final SASS contains the expected 391 `IMNMX` reductions and 814
+64-bit adds for 384 measured modular additions plus setup/final combination;
+the compiler did not algebraically collapse the chains.  Even this
+compute-only M61 lower bound already exceeds both the **180-us target** and
+nearly the complete 205.5-us production iteration.  Adding the omitted M31
+network, 134M M61 products, rotations, state traffic, and carry can only make
+it slower.
+
+Decision: **reject the full recursive Nussbaumer/polynomial-ring transform.**
+It trades twiddle products for far too much recursive population and modular
+addition work on this GPU.  Do not reopen it using a top-level rotation-only
+FFT or symbolic-root microbenchmark; the first gate must include the complete
+recursive operation count.  This result does not reject the small
+Nussbaumer/Winograd DFT formulae already used for odd radices, which have a
+different purpose and cost model.
+
+## Quartic Galois packing and small-extension correction audit
+
+The registry was checked for quartic fields, four-way Frobenius orbits, and
+degree-four DGTs.  The only earlier quartic audit was an M17 component inside a
+shortened multi-field transform; no 31-bit quartic replacement had been
+considered.  A suitable 31-bit prime can indeed have order four modulo the
+required power-of-two root order.  Its scalar polynomial evaluations then fall
+into four-element Frobenius orbits, so a length-4M transform can store one
+`GF(q^4)` element per four spectral points.
+
+This does **not** turn one 31-bit prime into a 124-bit coefficient modulus.
+The input coefficients still map through `Z -> GF(q)`, and inverse evaluation
+returns only the integer coefficient modulo the *base* prime `q`.  Extension
+degree packs Galois-conjugate evaluations; it supplies no extra CRT range.  A
+single quartic field is therefore short by roughly 60 coefficient bits.
+
+Restoring capacity with three independent 31-bit base primes also removes the
+apparent arithmetic win.  Even optimal multiplication in a degree-four field
+has bilinear rank at least seven, versus rank three for a quadratic field.  At
+equal 48-MiB state, three quartic streams over `N/4` values require at least
+
+```text
+3 * (N/4) * 7 * 20
+------------------ = 1.111...
+3 * (N/2) * 3 * 21
+```
+
+times the base products of the already-rejected three-prime quadratic
+transform, before the quartic additions, larger live element, CRT, or carry.
+The latter complete transform was already 0.708 ms before CRT/carry, so a
+strictly higher-rank reformulation cannot approach 180 us.
+
+The same distinction rejects a tempting correction-sidecar variant.  For the
+p150 FP32/M61 error alphabet `[-120,120]`, an eight-alias folded bin has 63.3
+bits of information.  `GF(65537^d)` still gives only one 16-bit coefficient
+residue regardless of `d`; a high extension degree can provide the transform
+roots and pack Frobenius orbits, but cannot identify the correction vector.
+Four independent 16-bit coefficient fields restore the information and four
+complete transforms, with no surviving one-field sidecar.
+
+Decision: **reject quartic packing as either a full-capacity replacement or a
+single-field dense-error sidecar.**  Do not count extension degree as CRT bits.
+Reopen only if a proposal supplies the missing independent base moduli and its
+complete multi-field tile beats the corresponding quadratic representation.
+
+## All-Mersenne M31/M43/M19 field gate
+
+The registry contained M19, the invalid M29 proposal, and the M31/M61
+production fields, but no attempt to replace M61 by two smaller Mersenne fields.
+On paper `M31*M43*M19` would provide almost 93 coefficient bits while retaining
+the 4M geometry, cheap Mersenne folds, and power-of-two norm-one roots.  A
+full-population three-stream radix tile was started only far enough to perform
+the mandatory root construction.
+
+The proposal fails before timing because the assumed middle field is not a
+field:
+
+```text
+M43 = 2^43 - 1
+    = 8,796,093,022,207
+    = 431 * 9,719 * 2,099,863.
+```
+
+Both `factor` and `openssl prime` confirm compositeness, and the independent
+quadratic-field search consequently finds no order-16 field root.  The next
+Mersenne-prime exponent after 31 is 61, so there is no alternative 32--60-bit
+Mersenne field to occupy this slot.
+
+Combining still smaller genuine Mersenne primes is not an equivalent fallback.
+M19's quadratic norm-one group has order only `2^19`, below the 4M packed DGT
+requirement; it already needed three 1M Good--Thomas channels in the earlier 3M
+architecture.  M17 and smaller fields require progressively higher extension
+degrees, and extension degree still does not add CRT bits.  Large odd factors
+to shorten their binary channels repeat the measured radix-7/9/15/33 ownership
+failures.
+
+Decision: **reject M31/M43/M19 at the primality/root gate and remove the invalid
+GPU harness.**  Do not quote composite-ring arithmetic as field-transform
+performance or substitute another `2^s-1` without first verifying that `s` is
+a Mersenne-prime exponent and that the full packed root exists.
+
+## 4M M31 plus scalar 61-bit field gate
+
+The registry was searched for full-length scalar fields before integrating this
+candidate.  The prime/root search and an exact production-population tile were
+new; the later full-pipeline audit found that the already-completed scalar
+Goldilocks engine is a stronger instance of the same whole architecture.  That
+precedent is decisive and prevents repeating another expensive integration.
+
+[`src/cuda/scalar_cf_prime_search.cu`](src/cuda/scalar_cf_prime_search.cu) was
+generalized with `SCALAR_CF_N` and correct `gcd(k,N)` filtering.  Searching the
+top billion eligible cofactors below `2^61` for `N=2^22` found nine valid
+prime/weight combinations.  The closest field to M61 is
+
+```text
+q          = 2,304,969,090,235,629,569
+k          = 549,547,455,367
+q          = k*2^22 + 1
+2^61 - q   = 873,918,978,064,383
+theta      = 1,200,645,765,426,008,003
+omega      = 1,298,449,948,940,206,839
+```
+
+The independently searched `omega` has exact order `2^22`; the corresponding
+Crandall--Fagin weight and inverse were checked in the benchmark.  `M31*q`
+provides essentially the incumbent 92-bit coefficient range, so this is a
+credible exact 4M representation throughout the requested exponent interval.
+Its state remains 48 MiB: 16 MiB for packed M31 plus 32 MiB for a full scalar
+64-bit plane.  Unlike the circle-field proposal, it represents coefficients in
+the ordinary polynomial basis and needs no basis bridge.
+
+[`src/cuda/m61_scalar_q3m_tile_bench.cu`](src/cuda/m61_scalar_q3m_tile_bench.cu)
+was generalized with `SCALAR_4M_M31` while retaining its old 3M mode.  The new
+mode compares the complete concurrent production populations: packed M31 plus
+packed quadratic M61, and packed M31 plus the full scalar field.  Dense
+forward/inverse round trips, cyclic squares, and canonical-versus-lazy results
+all agree with independent host oracles.  The canonical scalar kernel uses 30
+registers, versus 23 for M31 and 36 for M61, with no stack or spills.  A fresh
+exact run measured:
+
+| Concurrent radix-16 forward/square/inverse tile | Median range | Relative range |
+|---|---:|---:|
+| packed M31 + quadratic M61 control | 98.014--98.178 us | 1.0000 |
+| packed M31 + scalar `q`, canonical | **96.797--97.235 us** | **0.9876--0.9904** |
+| packed M31 + scalar `q`, lazy | 104.270--104.432 us | 1.0637--1.0638 |
+
+Thus the canonical scalar field produces a repeatable but small **roughly 1%
+isolated tile speedup**.  The redundant/lazy variant is slower.  This is useful evidence: a
+generic scalar 61-bit plane can narrowly beat the packed quadratic M61 plane in
+a local radix-16 tile when it avoids the scalar-Gold pair coupling.
+
+It does not justify a full integration.  The exact scalar-Gold engine already
+implements the complete architecture this field would require: a full scalar
+4M transform beside packed M31, production `512x8x512` scheduling, scalar
+frequency reversal, exact CRT, weights, fused/split carry, Gerbicz checks, and
+the complete recurrence.  Gold's corresponding exact local tile was much
+faster at 90 us (0.845 of its 106-us control), yet its best correct end-to-end
+result was 249.8 us versus a nearby 202.7-us production control.  Profiling put
+the loss in generic scalar roots and weights: fused width/CRT/carry grew from
+70.5 to 115.6 us and inverse middle from 49.8 to 64.4 us.  The square/tail was
+not the problem.
+
+The new Montgomery field begins with a weaker local tile than Goldilocks and
+retains generic 64-bit root and weight multiplications at every boundary.  It
+offers no mechanism to eliminate the exact scalar frequency permutation or
+the fused carry pressure.  Even granting it the entire 47-us difference
+between the Gold and production full paths would merely return to the 202.7-us
+production floor, still above 180 us.  Its measured 1.2-us tile advantage
+cannot close that structural gap.
+
+A final field-shape screen checked whether this conclusion could be escaped by
+making the weights structurally M61-like.  The original search required
+`gcd(k,N)=1` for `q=k*N+1`; this was generalized behind
+`SCALAR_CF_ALL_K` so fields with `v2(q-1)>22` are also tested by the exact
+condition `2^k=1 mod q`.  Over the same top billion cofactors the complete mode
+found 26 prime/weight hits, including 17 new even-`k` fields.  Factoring each
+`k` and reducing the order of two gave 34--39-bit orders for every hit.  Their
+weight tables therefore remain generic modular constants rather than a short
+cycle of shifts or rotations.
+
+The reducer-compatible subset was exhausted independently.  Every modulus
+
+```text
+q = 2^61 - C,
+0 < C < 2^32,
+q = 1 (mod 2^22)
+```
+
+was subjected to deterministic 64-bit Miller--Rabin and the same exact weight
+test.  There are 102 primes in that sparse-complement class and **zero** weight
+hits.  The particularly cheap family `C=a*2^s-1`, including the prime cases at
+`s=24,26,54` for `a=1`, likewise has no compatible weight.  Thus no scalar
+field close enough to `2^61` for the one/two-fold reduction measured in the
+near-M61 harness can implement this weighted 4M convolution.  Compatible
+fields begin with roughly 50-bit complements and need generic Montgomery
+arithmetic; the earlier pseudo-Mersenne gates already show that wider folding
+graphs do not create a hidden win.
+
+Decision: **retain the generalized prime search and exact tile as component
+evidence, but reject full M31/scalar-`q` integration.**  Do not mistake the
+96.8--97.2-us tile for an end-to-end speedup or repeat the already-exact scalar-Gold
+pipeline with another generic 64-bit prime.  A future scalar-field proposal
+must first explain how it removes the measured generic-root/weight/fused-edge
+cost, not merely present a faster local butterfly.
+
+## Remaining shortened-length audit and radix-13 field gate
+
+After closing the scalar 4M class, every recorded non-power-of-two geometry was
+re-audited before adding another field.  Radices 3, 7, 9, 15, and 33 already
+have exact local edge measurements or complete recurrences; their ownership-
+complete odd edges consume the binary-stage saving.  The next genuinely
+untested point is
+
+```text
+N = 13*2^18 = 3,407,872 real words (3.25 Mi)
+packed population = 13*2^17 = 1,703,936 values per quadratic field.
+```
+
+For p150, the exact Beatty-word argument used by the 3.5M proof gives
+
+```text
+b = 44, R = 53,633
+log2(6 * 2^(2b) * (N+3R)/4) = 110.351958400 bits.
+```
+
+M31/M61 does not have enough range at this length, and M31 does not contain the
+required quadratic radix-13 root.  A two-field M61 plus approximately 51-bit
+Riesel system is the smallest viable representation.  Its attractive first-
+order fact is that each field has only eighteen binary stages, so the M61
+population-stage work is 69.6% of the 4M production M61 stream.  The risky
+point is whether the second wide field erases that saving before radix 13 is
+even charged.
+
+A deterministic search jointly required primality, `13 | q-1`, the packed
+power-of-two root in `q+1`, and
+
+```text
+2^((q^2-1)/(13*2^18)) = 1 (mod q)
+```
+
+for the Crandall--Fagin weight.  It found a 51-bit field with only 0.648 bit of
+balanced p150 headroom, but its 32-bit complement still needs a third fold.
+The stronger arithmetic candidate is
+
+```text
+q = 2^55 - 110,100,481
+  = 36,028,796,908,863,487
+```
+
+which `openssl prime` and deterministic 64-bit Miller--Rabin both classify as
+prime.  It has 4.648 bits of balanced headroom beside M61.  Its 27-bit
+complement satisfies `C^2 < 2^54`: after folding a 110-bit product at bit 55,
+the second `high*C` fold is below `2q`, so one conditional subtraction is the
+complete reduction.  This is a real two-fold reducer, unlike the earlier q53
+three-fold path.
+
+[`src/cuda/q53_m61_bench.cu`](src/cuda/q53_m61_bench.cu) was parameterized
+without changing its default q53 mode, and
+[`src/cuda/m61_q55_radix13_overlap_bench.cu`](src/cuda/m61_q55_radix13_overlap_bench.cu)
+adds the matched architecture-population gate.  The q55 wide reducer agrees
+over all 1,703,936 outputs with a separate radix-`2^27` limb product and with
+an independent host `unsigned __int128` oracle.  At six dependent products,
+the isolated q55 stream is 1.54--1.57x M61.  The wide q55 kernel uses 38
+registers versus 32 for M61; the limb oracle uses 44.  All have zero stack,
+local memory, and spills.
+
+Five fresh process medians for the decisive concurrent comparison were:
+
+| Architecture-shaped binary core | Median range | Relative range |
+|---|---:|---:|
+| 4M M31+M61, seven product groups | 68.483--68.682 us | 1.0000 |
+| 3.25M M61+q55, six product groups | 80.462--80.765 us | **1.1739--1.1761** |
+
+Thus even the root-compatible two-fold field makes the shortened binary core
+about **17.5% slower** than production.  A radix-13 forward/inverse edge,
+Good--Thomas permutation, 116-bit CRT/carry, and generic q55 weights are all
+still omitted.  The existing exact radix-11 edge already costs 21 us for its
+register-resident arithmetic and 48--60 us once ownership is complete, so a
+larger odd edge cannot reverse a negative binary-core gate.
+
+Decision: **reject the 3.25M M61/q55 radix-13 architecture before implementing
+the odd edge or a recurrence.**  Retain the parameterized reducer harness as
+evidence.  Do not reopen radix 13 with the 51- or 53-bit compatible primes:
+they have less favorable fold graphs than the q55 candidate that already lost.
+Together with the exact radix-3/7/9/15/33 results, this closes the remaining
+practical shortened mixed-radix geometry under the current two-field model.
+
+## Power-of-two radix-61 M61 edge audit
+
+One large odd factor is qualitatively different from the rejected generic
+radices.  Because `2` has exact order 61 modulo `M61`, a length-61 DFT in the
+M61 base field can express every odd-edge twiddle as a Mersenne bit rotation.
+Choose
+
+```text
+N = 61*2^16 = 3,997,696 real words
+packed M61 population = 61*2^15 = 1,998,848.
+```
+
+Each channel has only sixteen binary stages.  The packed M61 population-stage
+ratio to production is `0.72619`, and the length is only 4.69% below 4M.  This
+is the first large odd edge for which generic M61 constant multiplication is
+not the risky operation.
+
+Capacity requires a companion field.  At p150, `b=37`, `R=2,085,249`, and the
+exact Beatty-word coefficient bound is **97.874567598 bits**.  M31/M61 is short
+by 6.875 bits and M31 cannot perform the odd edge:
+
+```text
+M31 mod 61   = 58
+M31^2 mod 61 = 9, not 1.
+```
+
+Thus neither the base nor quadratic M31 field contains a 61st root.  The
+smallest plausible replacement is a full scalar field `q=k*N+1`, paired with
+the packed M61 stream.
+
+[`src/cuda/scalar_cf_prime_search.cu`](src/cuda/scalar_cf_prime_search.cu) was
+further generalized with `SCALAR_CF_LIMIT` so this class could be exhausted at
+the relevant widths.  Searching every cofactor, including even cofactors,
+finds no compatible scalar field below `2^40`.  Extending through `2^48` finds
+only two prime/weight fields; the smaller is
+
+```text
+q     = 29,788,220,096,513 = 7,451,347*N + 1
+theta = 18,504,858,123,081
+theta^N = 2 (mod q).
+```
+
+Deterministic Miller--Rabin and `openssl prime` agree that q is prime.  M61*q
+has 104.760 balanced bits, so the representation has 6.885 bits of rigorous
+p150 headroom.  The cost is a complete 3,997,696-value scalar plane with
+generic 45-bit Montgomery roots beside the 1,998,848-value quadratic M61
+plane.
+
+[`src/cuda/m61_scalar_q61_overlap_bench.cu`](src/cuda/m61_scalar_q61_overlap_bench.cu)
+implements the exact population gate.  Its scalar Montgomery constants are
+checked at compile time, and 4,096 GPU chains match independent host
+`unsigned __int128` arithmetic before every timed comparison.  The scalar
+kernel uses 22 registers, M61 uses 32, and M31 uses 20; all are spill-free.
+
+Five fresh paired processes measured:
+
+| Product-group charge | 4M M31+M61 control | radix-61 M61+scalar-q | Relative |
+|---|---:|---:|---:|
+| control 7/7, candidate M61 5 + q 6 | 86.467--86.834 us | 106.382--107.234 us | **1.2288--1.2395** |
+| control 7/7, candidate M61 6 + q 6 | 103.090--105.198 us | 116.478--117.976 us | **1.1100--1.1444** |
+
+The first row deliberately undercharges the sixteen-stage M61 channel with
+only five three-stage product groups; even that optimistic binary core is 23%
+slower.  Charging six groups to both candidate streams remains 11--14% slower.
+No radix-61 DFT, cross-channel permutation, 106-bit CRT/carry, or scalar-q
+weight boundary is present yet.  Although the M61 twiddles are rotations, a
+61-point edge still needs a large rotation/add network and cannot repay an
+already negative binary core.
+
+Decision: **reject the 61*2^16 M61/scalar-q architecture before implementing
+the radix-61 edge.**  The power-of-two root is real, but the independent range
+field dominates.  Do not pair this M61 edge with M31 (the root does not exist)
+or quote the 72.6% M61-only stage count without the mandatory companion plane.
+
+## Carry-to-forward-middle tile streaming audit
+
+Before implementing a persistent consumer or another ready-flag protocol, the
+registry and production source were checked against the earlier programmatic
+dependent launch, multi-queue event, compact `MIDCARRY_FUSED`, reduced-width
+ownership, and CUDA cluster/DSM experiments.  None of those experiments used a
+global ready queue between the incumbent fused carry and the *next iteration's*
+ordinary forward-middle kernels.  The idea was therefore distinct, but its
+exact producer/consumer ownership gives a decisive lower bound before code.
+
+For the production `512:8:512` shape, carry emits logical lines in coefficient
+order.  One `fftMiddleIn` value needs the radix-eight vector
+
+```text
+line = y + m*512,  m = 0..7.
+```
+
+An in-place 256-thread middle workgroup owns 16 consecutive `y` values and 16
+`x` values.  Its earliest possible ready point is therefore after carry has
+completed lines `3584..3599`; no complete middle workgroup can start during the
+first 3,600 of 4,096 carry lines.  All 32 `x` workgroups for one `y` block then
+become ready together, in 32 batches over only the final 496 carry lines.  A
+ready queue can consequently overlap at most `496/4096 = 12.109%` of the
+measured carry interval.
+
+With the measured production regions, the optimistic ceiling is
+
+```text
+carry                         71.0 us
+forward middle               17.2 us
+maximum overlap       71*496/4096 = 8.60 us
+best carry+middle boundary    79.6 us (versus 88.2 us serialized)
+```
+
+This assumes free polling, free release atomics, perfect cross-stream
+scheduling, and no resource or cache contention.  Even deleting the *entire*
+17.2-us forward-middle region would only move the historical 205.5-us exact
+result to 188.3 us, still above the 180-us gate.  The realistic ready-queue
+ceiling is about 196.9 us from that reference (or about 188.8 us from the
+unattributed 197.4-us environmental replay).  It cannot qualify as the required
+architectural speedup.
+
+A staged radix-eight consumer could begin pair work after half the carry, but
+would add partial-state global traffic and synchronization.  More importantly,
+even impossible zero-cost middle work fails the gate, so that variant is also
+bounded without implementation.  Making the radix-eight dimension contiguous
+in carry order would be a different full transform factorization, not a queue
+change; it would have to remove additional arithmetic or memory regions beyond
+middle to merit reopening.
+
+Decision: **do not implement carry-to-middle ready-queue streaming.**  The
+source-ownership audit closes it more strongly than a noisy proxy: production's
+strided radix-eight dependency delays release until the final eighth of carry,
+and the whole consumer is too small to supply the required 25.5-us reduction.
+
+## 3.875M M31/M61 radix-31 edge gate
+
+The registry and source were searched for `radix31`, `31-way`, Rader-31, and
+Good--Thomas-31 before implementation.  The only source hits named
+`radix31()` were eight-point routines named for the **M31 field**, not a
+31-point transform.  This architecture had not previously been attempted.
+
+The candidate length is
+
+```text
+N = 31*2^17 = 4,063,232 real words (3.875 Mi)
+packed population = 31*2^16 = 2,031,616 values per quadratic field.
+```
+
+Each of the 31 channels would have sixteen binary stages instead of the
+production transform's twenty-one.  Its first-order population-stage ratio is
+
+```text
+(31*2^16*16) / (2^21*21) = 0.738095,
+```
+
+so the attraction is a 26.19% reduction in binary-stage work without changing
+the exceptionally fast M31/M61 CRT.  Capacity at p140--150 still requires an
+exact coefficient oracle before integration: the conservative Beatty bound
+grows by 2.14 bits relative to 4M at p150, although production's observed
+coefficient margin suggests that it may fit.  The odd edge was the riskier and
+cheaper gate, so it was measured first.
+
+Both fields contain a 31st root.  M31 is the best possible case: `2` has exact
+order 31, making all DFT constants 31-bit rotations.  M61 has an order-31 root,
+but an exhaustive search of every nontrivial root found no representation as a
+two- or three-term signed sum of powers of two; the smallest signed root has
+32 set bits.  It therefore needs generic M61 products.
+
+[`src/cuda/m31_m61_radix31_edge_bench.cu`](src/cuda/m31_m61_radix31_edge_bench.cu)
+implements an exact, optimistic group-major edge.  One warp owns one
+31-element vector.  The M61 DFT uses Rader's permutation and a length-30
+`2*3*5` Good--Thomas transform for its fixed cyclic convolution.  M31 cannot
+reuse that convolution NTT because `5` does not divide `M31-1`; instead it uses
+the direct root-two DFT with rotations and additions only.  Forward DFT,
+quadratic square, and inverse DFT remain in one kernel, so the gate charges
+only one global read/write of the 3.875M state and no layout conversion.
+
+Correctness checks include an M61 forward/inverse length-30 round trip and
+direct cyclic-square oracles for eight random 31-vectors in both fields.  The
+M31 path returns the expected scale 31.  The unnormalized Rader path returns
+`30^3*31 = 837000`; that differing field scale would be absorbed by CRT
+constants if the architecture passed.  All checks pass.
+
+Three fresh processes measured:
+
+| Region | Minimum--maximum median |
+|---|---:|
+| M31 forward/square/inverse edge | 72.768--72.960 us |
+| M31 square only | 7.808--8.704 us |
+| M61 forward/square/inverse edge | 199.392--199.776 us |
+| M61 square only | 13.728--13.824 us |
+| concurrent M31+M61 edge | **266.880--267.520 us** |
+| concurrent square only | 21.312--21.344 us |
+| incremental odd edge | **245.536--246.208 us** |
+
+The M31 kernel uses 20 registers and the M61 kernel 54, both with zero stack,
+local memory, or spills.  Thus this is not another register-spill failure.
+The unrolled M61 kernel's SASS contains roughly 4,068 static instructions,
+including 502 `IMAD`, 440 `SHFL`, and 208 warp synchronizations.  Keeping the
+small-transform loops rolled reduced it to 48 registers but made the
+incremental edge still worse at 286.56 us; instruction-cache size is not the
+main problem.
+
+This result is far outside the possible budget.  Applying the 26.19% ratio to
+the entire measured 116.704-us production transform core gives an intentionally
+generous upper bound of only 30.6 us saved; fixed work means the real saving is
+smaller.  The optimistic odd edge costs about 246 us before the channel
+transpose, carry changes, or any p150 correction.  It is more than twice the
+whole production transform core and would need over a thirty-fold reduction to
+fit the roughly 5--8-us edge allowance left by the 180-us target.
+
+Classical Winograd/Mersenne-transform literature does not supply such a rescue.
+Reed and Truong's finite-field construction confirms that Mersenne transforms
+can trade products for addition networks
+([NASA report](https://ntrs.nasa.gov/api/citations/19780003189/downloads/19780003189.pdf)),
+but the practical WFTA survey explicitly warns that beyond the short primes,
+higher-order residue polynomials make the addition network excessive
+([WFTA discussion](https://eng.libretexts.org/Bookshelves/Electrical_Engineering/Signal_Processing_and_Modeling/Fast_Fourier_Transforms_%28Burrus%29/06%3A_Winograd%27s_Short_DFT_Algorithms/6.02%3A_Winograd_Fourier_Transform_Algorithm_%28WFTA%29)).
+Its practical operation table stops at 19 rather than providing a 31-point
+flow graph.  A concrete GPU-mapped 31-point WFTA could be gated in the future,
+but it must first demonstrate a credible sub-8-us full-population edge; merely
+reducing the Rader multiplication count by a small factor cannot qualify.
+
+Decision: **reject this direct-M31/Rader-M61 radix-31 architecture and do not
+integrate it into PRPLL.**  Keep the exact harness as a correctness and
+resource reference.  Do not repeat it with plane-major traffic (which can only
+be slower), a rolled PFA loop, or an unproved claim that M31's root-two edge
+makes the dense M61 edge free.
+
+## 4.0625M q27/M61 radix-65 architecture gate
+
+The preceding shortened-length audit concentrated on lengths below 4M.  A new
+search noticed a distinct near-integer-digit geometry:
+
+```text
+N = 65*2^16 = 4,259,840 real words (4.0625 Mi)
+packed population = 65*2^15 = 2,129,920 values per quadratic field
+136279841 / N = 31.991774...
+```
+
+This is only 1.5625% larger than production but splits the power-of-two work
+into 65 channels of fifteen binary stages.  A joint prime/root/weight search
+found the small field
+
+```text
+q65 = 105,971,711 = 0x0650ffff
+q65 + 1 = 3234*2^15
+65 | q65-1
+2^((q65^2-1)/N) = 1 (mod q65).
+```
+
+Deterministic 64-bit Miller--Rabin and `openssl prime` agree that q65 is prime.
+M61 also satisfies both the radix-65 and exact Crandall--Fagin weight tests.
+Thus both fields have the required packed power-of-two root, base-field
+five/thirteenth roots, and transform weight.  The balanced CRT has 86.659 bits.
+That misses the deliberately conservative p150 Beatty bound, but it is 2.85
+bits wider than the q24/M61 range that empirically passed 100,000 exact p150
+iterations.  Capacity was credible enough for an early performance gate, not
+yet sufficient for integration.
+
+The existing shortened-core harness
+[`src/cuda/m31_m61_q15_overlap_bench.cu`](src/cuda/m31_m61_q15_overlap_bench.cu)
+now includes q65.  It uses exact canonical `R=2^32` Montgomery arithmetic with
+
+```text
+-q65^-1 mod 2^32 = 0x06510001
+R mod q65          = 56,098,856
+R^-1 mod q65       = 2,614,689.
+```
+
+The GPU output of five dependent quadratic products agrees with an independent
+host `unsigned __int128` Montgomery oracle for 4,096 random values.  The q65
+kernel uses 18 registers, M61 uses 32, and neither spills.  The production
+control charges seven product groups for 21 binary stages; q65/M61 charges five
+for exactly fifteen stages.
+
+An important measurement issue was found while doing this gate.  Measuring
+each architecture in one long sequential batch changes the board's sustained
+power/clock state enough to move q65/M61 from 81.8 to 89.1 us depending on its
+position.  The decisive comparison therefore alternates production and q65
+samples, reverses their order on odd samples, warms both, and takes independent
+31-sample medians.  Three fresh processes measured:
+
+| Paired binary-core proxy | Production M31/M61 | q65/M61 | Candidate/control | Saving |
+|---|---:|---:|---:|---:|
+| run 1 | 97.515 us | 86.202 us | 0.88398 | 11.314 us |
+| run 2 | 98.170 us | 85.883 us | 0.87485 | 12.286 us |
+| run 3 | 98.006 us | 85.536 us | 0.87276 | 12.470 us |
+
+The binary core is a real 11.3--12.5-us component win.  It is nevertheless a
+strong architectural no-go for the 180-us target.  Even assigning **zero cost**
+to the required forward/inverse radix-65 edge leaves less than half the
+25.5-us saving required from the 205.5-us reference.  The candidate also has
+1.5625% more carry/state traffic, generic q65 weights, an 87-bit CRT, and a
+real `5*13` odd edge; every omitted term is nonnegative.  Near-uniform 32-bit
+digits apply only around p136 and do not remove weighting/carry for the required
+140--150M interval.
+
+Decision: **reject q65/M61 before implementing the radix-65 edge.**  Retain the
+prime and paired-timing method as useful evidence.  Do not quote the binary
+core win as an end-to-end projection or spend time on a `5*13` edge unless a
+different design first removes at least another 13--15 us from carry or another
+mandatory region.
+
+## 3.9375M M31/M61 radix-63 edge gate
+
+The registry and source were searched for radix 63, `7*9`, and a mixed
+radix-7/radix-9 edge before implementation.  The individual radix-7 and
+radix-9 experiments existed, but no radix-63 M31/M61 edge or this transform
+length had been attempted.  This candidate retains the mature M31/M61 fields
+and CRT while shortening the binary channels:
+
+```text
+N = 63*2^16 = 4,128,768 real words (3.9375 Mi)
+packed population = 63*2^15 = 2,064,384 values per quadratic field
+binary stages per channel = 15
+(63*2^15*15) / (2^21*21) = 0.703125
+```
+
+The nominal binary population-stage work is therefore 29.6875% lower than
+production, while the state and carry population is only 1.5625% smaller.
+Both fields pass the required algebraic checks: `63 | M31-1`,
+`63 | M61-1`, their quadratic fields contain the packed power-of-two roots,
+and
+
+```text
+2^((q^2-1)/N) = 1 (mod q), q in {M31, M61}.
+```
+
+The deliberately conservative Beatty coefficient bound at p136 is 90.594
+bits, leaving only about 0.406 bits under the balanced M31*M61 range.  The same
+bound exceeds the range by about 1.46, 4.00, and 6.56 bits at p140, p145, and
+p150 respectively.  As with production, this bound is conservative; an exact
+coefficient oracle would be mandatory before claiming general capacity.  The
+odd edge was both riskier and cheaper to gate first.
+
+[`src/cuda/m31_m61_radix63_edge_bench.cu`](src/cuda/m31_m61_radix63_edge_bench.cu)
+implements an exact ownership-complete `7*9` Good--Thomas edge.  Four
+63-element groups share a 256-thread block.  Nine row owners run the already
+proved Rader radix-7 primitive and seven column owners run a factored `3*3`
+radix-9 primitive, with shared memory providing the transpose.  Forward
+radix 7, forward radix 9, quadratic square, inverse radix 9, and inverse
+radix 7 stay in one kernel, so the gate charges one global read/write and no
+external layout conversion.
+
+Four dense random 63-vectors in each field agree with an independent direct
+two-dimensional cyclic-convolution oracle.  The expected unnormalized scale
+is `6^3*7*9 = 13,608`; all checks pass.  The M31 kernel uses 40 registers and
+2,016 bytes of shared memory; M61 uses 56 registers and 4,032 bytes.  Neither
+has a stack frame, local memory, or spills.  Final SASS contains about 1,864
+instructions for M31 and 2,848 for M61, including respectively 108 and 357
+`IMAD`, 177 `ISETP`, 34 shared loads, 34 shared stores, and six barriers.
+
+Three fresh paired processes, alternating the complete edge with concurrent
+square-only controls, measured:
+
+| Region | Minimum--maximum median |
+|---|---:|
+| concurrent M31+M61 forward/square/inverse edge | 158.502--158.848 us |
+| concurrent M31+M61 square only | 16.269--16.384 us |
+| incremental radix-63 odd edge | **142.208--142.579 us** |
+
+An earlier pilot measured 145.792 us incremental, consistent with a modest
+power/clock-state shift and immaterial to the decision.  Applying the 29.6875%
+stage reduction to the *entire* approximately 129.6-us production transform
+core grants an intentionally impossible upper bound of only 38.475 us saved;
+fixed work makes the real saving smaller.  The exact optimistic odd edge costs
+3.70 times even that bound before a channel transpose, carry changes, or any
+p140--150 range correction.  No end-to-end implementation can approach the
+180-us gate from this decomposition.
+
+Decision: **reject the M31/M61 `63*2^16` architecture before PRPLL
+integration.**  Keep the exact harness as evidence that composing individually
+reasonable radix-7 and radix-9 edges does not amortize their ownership and
+generic M61 products.  Do not repeat it with plane-major traffic, separate
+edge kernels, or a claim based only on the 29.7% binary-stage reduction.
+
+## Near-power-of-two scalar-field exhaustion
+
+The registry was searched again for Goldilocks, near-power, pseudo-Mersenne,
+and scalar-field replacements before doing another prime search.  Previous
+work had measured individual Goldilocks variants and generic 55--61-bit scalar
+fields, but had not exhausted the whole near-`2^b` class whose NTT weights
+might also be powers of two.
+
+For every `b=55..64`, enumerate
+
+```text
+q = 2^b - C,
+C = a*2^22 - 1,
+0 < C < 2^40.
+```
+
+The shape enforces `q = 1 (mod 2^22)`, so a full 4M scalar transform exists in
+the base field.  Every candidate was screened with deterministic 64-bit
+Miller--Rabin.  Prime candidates were then required to make the PRPLL weight
+itself a power-of-two-subgroup element:
+
+```text
+2^((q-1)/2^22) = 1 (mod q).
+```
+
+There are no hits for `b=55..63`.  The sole hit at `b=64` is
+
+```text
+C = 2^32-1
+q = 2^64-2^32+1,
+```
+
+the Goldilocks prime.  Repeating the search first with the stricter
+`C<2^32` bound and then across the complete `C<2^40` range produced the same
+unique result.  This is important negative evidence: there is no overlooked
+55--63-bit analogue that combines cheap near-power reduction, a 4M scalar
+root, and power-of-two Crandall--Fagin weights.
+
+Decision: **close this scalar-prime family.**  Goldilocks is the only member
+with all three structural properties, and its complete scalar engine already
+measured 249.8 us.  Do not repeat near-`2^b` prime searches without relaxing a
+specific condition and accounting for the resulting generic weights or
+reduction cost.
+
+## Finite-field Hartley representation over M61
+
+The registry and source were searched for Hartley, FFHT, `cas`, and base-field
+projections before implementation.  The earlier circle-FFT experiment is
+related but not the same representation: a circle inverse returns tensor-basis
+coefficients and needed the expensive digit-basis bridge.  A finite-field
+Hartley transform is a direct base-field projection of the ordinary DFT and
+returns ordinary coefficient vectors, so it avoids that particular failure.
+
+For a norm-one order-16 root `z=a+i*b` in `GF(M61^2)`, define
+
+```text
+cas(k) = Re(z^k) + Im(z^k).
+H[k] = sum_n x[n]*cas(k*n).
+```
+
+Because `M61 = 3 (mod 4)` and the root lies in the norm-one subgroup, every
+`cas(k)` is in M61 and `H(H(x))=16*x`.  Cyclic squaring also remains scalar. If
+`h=H[k]` and `hm=H[-k]`, two products per frequency pair suffice:
+
+```text
+u = h*hm
+v = (h+hm)*(h-hm)/2
+H'[k]  = u+v
+H'[-k] = u-v.
+```
+
+The construction follows Hong and Vetterli's base-field-transform result
+(DOI `10.1109/18.259646`) and the FFHT/Hadamard decomposition of de Oliveira
+et al. (<https://arxiv.org/abs/1502.00277>).  The latter reports 2 and 10
+general products for exact 8- and 16-point Hartley transforms, respectively,
+but also cautions that additive complexity is implementation-dependent.
+
+[`src/cuda/m61_hartley_tile_bench.cu`](src/cuda/m61_hartley_tile_bench.cu)
+implements two exact full-population gates:
+
+1. a regular radix-two DHT16 using 20 M61 products per transform; and
+2. a hybrid using the paper's multiplicatively minimal two-product DHT8,
+   reducing the DHT16 count to 16 products.
+
+Both operate on all 4,194,304 scalar values while the control uses the same
+32-MiB 2,097,152-element quadratic plane.  The GPU round trip passes for every
+value.  Forward spectra agree with an independent dense host Hartley matrix,
+and 4,096 random 16-value groups agree with a direct cyclic-square oracle.  No
+coefficient-basis conversion is omitted.
+
+Three fresh processes measured:
+
+| Concurrent exact radix-16 tile | Median range | Relative to generic control |
+|---|---:|---:|
+| M31 + generic quadratic M61 control | 98.082--98.091 us | 1.000 |
+| M31 + regular radix-two Hartley | **95.894--95.958 us** | 0.9776--0.9783 |
+| M31 + minimal-DHT8 Hartley | 132.771--133.029 us | **1.3536--1.3563** |
+
+The regular kernel uses 40 registers, no stack, and no spills.  Its SASS has
+about 430 instructions, 83 `IMAD`, 16 `ISETP`, and 36 shuffles.  The
+lower-multiplication hybrid grows to 48 registers, about 538 instructions,
+63 `IMAD`, 41 `ISETP`, and 88 shuffles.  The 38% regression despite fewer
+modular products is the same lesson as the fused Riesel and large-radix gates:
+algebraic multiplicative rank is not GPU issued-work rank when the factorization
+adds a large cross-lane network.
+
+Most importantly, the 2.2% table result is **not a speedup over production**.
+The CUDA control is the deliberately generic radix-two quadratic tile inherited
+from the RNS harness: it performs fifteen general quadratic twiddles per
+direction.  Production [`src/cl/fft16.cl`](src/cl/fft16.cl) performs only four
+general `cmul` operations per direction and obtains the remaining order-4/8
+work through M61 rotations and range-delayed butterflies.  The earlier circle
+audit counted about 56 base products per 32 ordinary digits for that optimized
+production transform/square tile.  Regular Hartley needs
+`2*(20+20+16)=112`; even an ideal two-group 10-product DHT16 needs
+`2*(10+10+16)=72`, before charging the denser shuffle/add graph that already
+lost badly in the measured hybrid.
+
+Decision: **reject a full Hartley PRPLL integration.**  It is algebraically
+clean and beats a generic quadratic scaffold, but it does not beat gpuowl's
+specialized M61 architecture.  Do not quote 95.9 us as a production speedup or
+reopen the idea based only on the two-product spectral square.  A future
+Hartley proposal would first need a complete tile with production-equivalent
+M61 rotations and fewer shuffles that beats the specialized 56-product local
+budget, not merely the generic CUDA control.
+
+## Single 86-bit scalar field with exact 4M CF weights
+
+Before implementation, the registry was searched again for scalar-field,
+near-power, Goldilocks, and pseudo-Mersenne attempts.  The earlier exhaustive
+55--64-bit search intentionally stopped at native two-limb arithmetic.  It did
+not test whether one wider field could replace the complete M31/M61 CRT pair.
+This is materially different from the rejected generic 55--61-bit scalar
+controls: the proposed balanced range is about 85 bits and therefore has a
+credible p140--150 capacity, while one 4M array of three 32-bit limbs retains
+the current architecture's 48-MiB payload.
+
+[`src/near_power_scalar_search.cpp`](src/near_power_scalar_search.cpp) first
+searched
+
+```text
+q = 2^b - C,
+C = a*2^22 - 1,
+q prime,
+2^((q-1)/2^22) = 1 (mod q).
+```
+
+OpenSSL BIGNUM found no candidates for `b=80..100` with `C<2^32`, then no
+candidates in 5,505,003 values with `C<2^40`.  The wider three-limb GPU search
+in
+[`src/cuda/scalar_cf96_prime_search.cu`](src/cuda/scalar_cf96_prime_search.cu)
+screened `b=84..92`, `C<2^48`.  Its three-limb Montgomery exponentiation was
+cross-checked limb-for-limb against OpenSSL, and every reported hit was then
+checked independently for primality.  The smallest useful hit was
+
+```text
+a = 9742306
+C = 40862193025023 = a*2^22-1
+q = 2^86-C = 77371252455295404988170241
+```
+
+OpenSSL reports `q` prime and independently gives
+`2^((q-1)/2^22) mod q = 1`.  Thus this is not a root-existence scaffold: it
+has the full 4M base-field root and exact power-of-two Crandall--Fagin weight.
+Its balanced half-range is about 85 bits, roughly 1.2 bits wider than the
+empirically passing q24*M61 p150 capacity experiment.  Other search hits at
+89 and 91 bits were retained in the search output but were not needed for the
+cheapest arithmetic gate.
+
+[`src/cuda/q86_scalar_tile_bench.cu`](src/cuda/q86_scalar_tile_bench.cu)
+implements the complete population gate.  Values use three 32-bit limbs.  A
+five-product radix-`2^29` Toom-3 multiply is followed by exact folds using
+`2^86 = C (mod q)`; forward DIF16, the pointwise square, inverse DIT16, and
+inverse scaling execute over all 4,194,304 scalar values.  Correctness is not
+inferred from the same reducer:
+
+- 262,144 random and boundary products agree with an independent bit-serial
+  128-bit host oracle;
+- the forward/inverse round trip passes for every 4M value; and
+- 4,096 random groups agree with an independent direct cyclic-square oracle.
+
+The kernel uses 35 registers and has no stack, local memory, or spills, so its
+failure is not an occupancy artifact.  Final Blackwell SASS has about 1,728
+instructions, including 181 `IMAD`, 188 `ISETP`, 191 `SHF`, 142 `LOP3`, and
+50 `SEL`.  A fresh complete run measured:
+
+| Exact full-population radix-16 tile | Median |
+|---|---:|
+| concurrent generic M31 + quadratic M61 control | 100.814 us |
+| 4M q86 scalar field | **426.530 us** |
+
+The scalar candidate is 4.23 times slower even than the deliberately generic
+control; production's specialized M31/M61 tile has a still lower arithmetic
+budget.  The initial five-product estimate counted only Toom evaluation.  It
+missed the multi-limb interpolation, packing, three exact reduction folds,
+canonicalization, and the fact that a scalar 4M representation routes twice
+as many transform elements as either 2M quadratic field.  The unchanged
+48-MiB payload provides no bandwidth saving to amortize that work.
+
+Decision: **reject the single 86--91-bit scalar-field architecture.**  The
+complete q86 gate misses by too large a factor for reduction scheduling or
+inline PTX to change the architectural result.  Do not repeat this idea from
+a five-multiply Toom count, with a Montgomery reducer, or with one of the
+wider search hits unless hardware provides a genuinely native approximately
+90-bit modular multiply.  The prime-search tools remain useful negative
+evidence and a reproducible way to revisit the field class on different
+hardware.
+
+## Reopened double-single FP32 plane: accuracy pass, overlap failure
+
+The compensated-FP32 registry was re-audited after the later corrected
+FP32/M61 profile showed about 50.24 us of FP32 bottom-half work beside about
+109.79 us of M61 work.  That profile made one earlier rejection worth
+reopening: a roughly two-times-more-expensive FP32 transform might nominally
+fit inside the M61 overlap window.  This is not the already rejected TF32
+Tensor DFT or the old half-residual result.  The new gate retains each complex
+value as a binary32 high part plus a scaled binary16 low part, includes the
+low part of every root, and propagates an error-free-transform correction
+through all radix groups.
+
+[`src/cuda/fp_compensated_tensor_bench.cu`](src/cuda/fp_compensated_tensor_bench.cu)
+now contains both a full-binary32 residual and the half-backed canonical
+residual across seven radix-eight groups, matching 21 binary stages at the
+complete 2,097,152-complex-value population.  A long-double host DFT chain is
+the accuracy reference.  Representative results were:
+
+| Seven radix-eight groups | RMS error | Maximum complex error | Median |
+|---|---:|---:|---:|
+| ordinary FP32 | `1.135e-4` | `5.789e-4` | 64.864 us |
+| canonical binary16 residual | `9.398e-9` | `5.905e-8` | 140.864 us |
+| full binary32 residual | `4.808e-12` | `2.860e-11` | 166.080 us |
+
+The half-backed form improves representative transform error by roughly four
+orders of magnitude and uses 25 registers with no stack or spills.  It easily
+exceeds the approximately 240-fold improvement suggested by the corrected
+p150 FP32/M61 quotient maximum of 120.  Thus accuracy and residual storage
+precision are no longer the risky points; the earlier 2.86x single-tile
+accuracy result understated what root-low propagation across the complete
+chain can do.
+
+The decisive concurrency test is
+[`src/cuda/fp_compensated_overlap_bench.cu`](src/cuda/fp_compensated_overlap_bench.cu).
+It runs the exact same full-population FP32 chains concurrently with a
+production-population M61 quadratic chain calibrated to the measured 104-us
+critical window.  Three fresh processes measured:
+
+| Region | Median range |
+|---|---:|
+| M61 20-product critical chain alone | 103.744--103.939 us |
+| ordinary FP32 seven-group chain alone | 62.413--62.566 us |
+| half-compensated chain alone | 142.090--142.189 us |
+| M61 + ordinary FP32 makespan | 178.934--181.398 us |
+| M61 + half-compensated makespan | **277.165--277.411 us** |
+| compensation's exposed makespan cost | **96.013--98.378 us** |
+
+The concurrent ordinary result also reproduces the production engine's broad
+timing scale, making this a more relevant gate than multiplying an isolated
+kernel ratio by a profile region.  Blackwell does not provide an independent
+FP32 issue/power budget under the M61 stream: even the ordinary pair runs
+longer than the sum-free maximum, and the compensated pair is slower than the
+sum of its isolated medians.  The proposed work therefore cannot hide in the
+nominal 60-us arithmetic gap.
+
+Decision: **reject production integration of double-single or high+half FP32.**
+It solves the p140--150 accuracy problem but would project near 270--280 us
+before charging compensated fused edges, carry changes, and the extra 8-MiB
+residual state.  Do not reopen it from the isolated 50-vs-110-us profile or
+the excellent `9.4e-9` error alone.  A future compensated design must move its
+correction work to a genuinely independent hardware pipeline; adding more
+SIMT FP32/FMAs shares the incumbent's already power-limited issue budget.
+
+## Vendor cuFFT exact-convolution lower bound
+
+The registry contained no cuFFT experiment, so a clean-room vendor-library
+gate was added before designing another custom floating transform.
+[`src/cuda/cufft_convolution_gate.cu`](src/cuda/cufft_convolution_gate.cu)
+times a complete real forward FFT, in-place spectral square and inverse FFT at
+both 4M and 8M real coefficients.  The inverse scale is folded into the square
+kernel.  Carry, digit splitting, error correction and PRPLL weighting are
+deliberately omitted, making these optimistic lower bounds rather than claimed
+recurrence timings.
+
+A fresh rebuild and 31-sample run measured:
+
+| Vendor FFT cycle | Median |
+|---|---:|
+| 4M FP32 R2C / square / C2R | **75.178 us** |
+| 8M FP32 R2C / square / C2R | **140.870 us** |
+| 4M FP64 D2Z / square / Z2D | **739.549 us** |
+| 8M FP64 D2Z / square / Z2D | **1562.342 us** |
+
+The exact FP64 route fails the 180-us gate by more than four times before
+carry.  FP32 is fast, but it is not an exact-convolution implementation: at
+p140--150 the 4M representation produces roughly 87--92-bit convolution
+coefficients, while even an 8M representation still produces roughly
+56--59-bit coefficients.  A 24-bit mantissa cannot recover those integers
+without digit splitting or an exact repair field.  Two 4M FP32 cycles already
+cost about 150 us before the transforms needed for all split cross-products,
+carry, weighting and data conversion; the previously measured compensated and
+M61-repair paths are the direct complete-population evidence that the missing
+precision work does not fit in the remaining budget.  The 75-us result also
+does not improve the existing approximately 50--65-us custom ordinary-FP32
+component gates.
+
+Decision: **reject cuFFT as a direct exact PRPLL engine on this GPU.**  Retain
+the benchmark as a vendor-quality lower bound and as evidence that FP32
+transform throughput itself is not the unsolved part.  Reopen only with a
+proved integer-recovery construction whose complete number of vendor FFTs,
+packing, carry and correction has a demonstrated sub-180-us lower bound; do
+not quote the 75.2-us inexact cycle as a PRPLL speedup.
+
+## Stage-selective compensated FP32
+
+The full compensated-FP32 rejection left one narrower question unanswered:
+whether most of the required accuracy came from only one or two of the seven
+radix-eight groups.  If so, a mixed ordinary/compensated transform might retain
+the four-order-of-magnitude accuracy gain without paying for the complete
+twofold chain.  The registry contained local FP64-operation and full-chain
+compensation tests, but no prefix, suffix, or arbitrary per-group schedule.
+
+[`src/cuda/fp_selective_compensation_bench.cu`](src/cuda/fp_selective_compensation_bench.cu)
+enumerates all 128 ordinary/compensated masks over the full 2,097,152-complex
+population.  It uses the validated canonical high-plus-scaled-half kernels and
+high/low roots.  When a schedule returns to ordinary FP32, the next radix
+kernel explicitly adds the residual before its butterflies; the benchmark
+therefore neither discards the low part nor omits a representation transition.
+Every output is compared with the same long-double seven-pass reference.
+
+Two fresh builds/runs agreed on the decisive cases:
+
+| Compensated groups | Best representative mask | RMS error | Maximum error | Median |
+|---:|---:|---:|---:|---:|
+| 0 of 7 | `0x00` | `1.1423e-4` | `5.4842e-4` | 64.8--65.0 us |
+| 6 of 7 | `0x7e` | `3.9544e-5` | `2.1918e-4` | 138.0--138.5 us |
+| 7 of 7 | `0x7f` | `9.4655e-9` | `4.9937e-8` | 150.3--150.8 us |
+
+The other six-of-seven masks have RMS `4.686e-5` through `4.784e-5`; moving
+the uncompensated group does not reveal a cheap critical stage.  The best
+partial schedule improves RMS by only 2.9x, whereas the corrected p150
+quotient evidence calls for roughly 240x.  The four-order-of-magnitude jump
+occurs only when **every** radix group propagates its rounding residual.  One
+ordinary group injects an error floor that later compensated groups cannot
+reconstruct.
+
+Decision: **reject stage-selective FP32 compensation.**  It fails accuracy
+before production integration or M61 overlap: six expensive groups are still
+about two orders of magnitude short of the estimated exact-recovery need and
+already cost roughly 138 us in isolation.  This supplies the missing evidence
+behind the earlier caution about selective compensation.  Do not reopen it by
+choosing a different prefix/suffix; all masks were enumerated.  A future mixed-
+precision proposal must change the error representation or arithmetic of every
+group, not merely compensate a selected subset.
+
+## Carryful byte-ring correction with packed SIMD
+
+The native-CLMAD audit rejected characteristic-two correction because a field
+of characteristic two preserves only the parity of an integer square.  A
+different untried ring avoids that algebraic loss.  Let `c` be an exact
+weighted convolution coefficient, `r` its canonical M61 residue, and `k` the
+M61 quotient:
+
+```text
+c = r + k*M61,
+M61 = 2^61-1 = -1 (mod 256),
+k = r-c (mod 256).
+```
+
+Consequently an exact convolution in `Z/256Z`, combined with the FP32 quotient
+estimate, would identify every correction in `[-120,120]` uniquely.  Unlike a
+`GF(2^m)` syndrome, this ring retains all eight carryful bits.  This makes it a
+valid reconstruction invariant, although a fast weighted convolution remains
+necessary.
+
+The cheapest general transform considered was a recursive Nussbaumer square.
+The already checked square-specialized operation recurrence requires
+1,547,698,176 ring additions, or 369 per original 4M coefficient, plus
+134,217,728 leaf products.  The earlier M61 lower bound did not test byte SIMD.
+[`src/cuda/z256_nussbaumer_gate.cu`](src/cuda/z256_nussbaumer_gate.cu) therefore
+implements and validates two full-addition-count lower bounds:
+
+1. four byte residues per `u32` through CUDA's `__vadd4`; and
+2. seven byte residues in guarded nine-bit lanes of one `u64`, where a modular
+   packed addition is one wide add followed by one lane mask.
+
+All 4,096 validation words agree lane-for-lane with independent host addition.
+The kernels use one input read and one output write and deliberately omit every
+rotation, permutation, expanded intermediate, leaf product, correction decode,
+and fused-edge change.  Two fresh processes measured:
+
+| Addition-only implementation | Projected complete Nussbaumer adds |
+|---|---:|
+| `__vadd4`, four coefficients/word | 43.36--43.63 us |
+| guarded nine-bit lanes, seven coefficients/word | **23.893 us** |
+
+The guarded kernel uses 38 registers with no stack, local memory, or spills.
+SASS inspection also explains why the intrinsic loses: `__vadd4` expands into
+a logic/add network on `sm_120`, whereas the guarded representation uses the
+ordinary wide-add/mask path.
+
+Even the strengthened 23.9-us compute-only bound exceeds the wide-quotient
+FP32/M61 recurrence's entire 10.6-us allowance by 13.3 us.  The omitted work is
+large and nonnegative.  There is an additional exact-transform obstacle:
+Crandall--Fagin weighting needs an invertible `N`th root of two, but two is a
+nonunit in `Z/256Z`.  A formal-root transform is not invertible in this ring;
+the straightforward correct fallback is a zero-padded linear convolution and
+explicit weighted fold, which doubles the top-level length rather than making
+the lower bound cheaper.
+
+Decision: **reject a `Z/256Z` Nussbaumer correction sidecar for the 180-us
+gate.**  The reconstruction idea is algebraically more informative than
+CLMAD, and guarded packing more than halves the first SIMD gate, but the
+addition network alone already consumes over twice the full repair budget.
+Do not reopen it using `__vadd4`, a characteristic-two extension, or an
+unweighted cyclic convolution.  A future byte-ring proposal would need both a
+sub-10-us complete carryful convolution and an explicit valid treatment of the
+nonuniform Crandall--Fagin weights.
+
+## Parity-conditioned factor-four correction field
+
+The earlier direct fold-by-four search treated each p150 quotient error as one
+of all 241 integers in `[-120,120]`.  It did not condition the decoder on the
+exact square parity that had been developed for the older folded-M31 path.
+This is a meaningful algebraic distinction: for a fixed parity each error has
+only 120 or 121 possibilities, and the difference of two parity-compatible
+errors is even.  Dividing a collision relation by two reduces the lattice box
+from `[-240,240]^4` to `[-120,120]^4`.
+
+A deterministic search over prime Riesel fields with the required root and
+full Crandall--Fagin weight relation found a particularly favorable candidate:
+
+```text
+q = 540,016,639 = 515*2^20-1 = 0x202fffff
+r = 351,858,921
+r^4 mod q = 2
+2^((q^2-1)/gcd(2^22,q^2-1)) mod q = 1
+```
+
+`openssl prime` independently reports q prime.  A meet-in-the-middle search
+over `(d0,d1)` and `(d2,d3)` proves that
+
+```text
+d0 + r*d1 + r^2*d2 + r^3*d3 = 0 (mod q)
+```
+
+has no nonzero solution in `[-123,123]^4`.  The first collision appears at
+infinity norm 124, with `(24,7,124,-69)`.  Thus a four-alias decoder supplied
+with each error's parity is injective throughout the empirically observed p150
+range `[-120,120]`, with three counts of lattice margin.  The field is below
+`2^30`, so it also unlocks Harvey's redundant `[0,2q)` Montgomery range.  This
+repairs the correctness failure of the earlier factor-four candidates; it does
+not make parity free or turn the side transform into an end-to-end result.
+
+Two increasingly complete GPU gates were then applied.  First,
+[`src/cuda/q4_parity_tile_bench.cu`](src/cuda/q4_parity_tile_bench.cu) keeps all
+524,288 `GF(q^2)` values in register-resident radix-eight groups.  It charges
+all 38 forward/inverse binary stages plus one square, but grants free global
+transposes, free root-table traffic, and free parity/fold/decode:
+
+| Register-resident full arithmetic count | Median |
+|---|---:|
+| canonical Montgomery | 9.888 us |
+| Harvey `[0,2q)` | **9.728 us** |
+
+That gate passes by less than one microsecond against the fast FP32/M61
+engine's complete 10.6-us repair allowance, so the previous campaign lesson
+required a real transform before drawing a conclusion.
+
+[`src/cuda/q4_full_ntt_lower_bound.cu`](src/cuda/q4_full_ntt_lower_bound.cu)
+implements that next gate: a complete cache-tiled `2^19` quadratic-field
+forward transform, pointwise square, inverse transform and normalization.  It
+includes all root-table reads and global tiled passes.  Every one of the
+524,288 random values passes a full forward/inverse identity check.  The
+pointwise operation is still a simple quadratic square, cheaper than the
+Hermitian pair-square needed for the final packed real convolution, so the
+measurement remains optimistic:
+
+| Complete optimistic quadratic cycle | Median range |
+|---|---:|
+| canonical Montgomery | 68.35--68.38 us |
+| Harvey `[0,2q)` | **66.34--66.98 us** |
+
+The kernels use only 12--28 registers, 3 KiB shared memory, and no stack,
+local memory, or spills.  The 6.8x reversal from the arithmetic gate is
+therefore the real root/layout/global-pass cost, not a register cliff.  For
+comparison, the mature M31 transform at the same one-million-real-word factor
+four population already measured about 38.4 us, and the smaller 27.4-us
+factor-eight M31 sidecar became 41 us under M61 contention and exposed
+9--19 us end to end.  This generic q cycle starts 2.4x above that smaller
+sidecar before charging its more expensive real pair square.
+
+Parity also cannot repair the budget.  Existing exact implementations add
+roughly 19--34 us when parity is prepared or consumed through the production
+layout; a new packed parity spelling would have to make that nearly free while
+also hiding a 66-us q transform.  The historical 169.4-us inexact base leaves
+only 10.6 us for **all** of the transform, parity, fold, decoder, carry changes,
+and contention.
+
+Decision: **reject parity-conditioned factor-four integration for the 180-us
+gate.**  Retain q and the `[-123,123]` proof as new algebraic evidence: parity
+does fix the old decoder collision.  It does not fix the architectural cost.
+Do not quote the 9.73-us register chain as a side-transform timing or repeat
+the full transform with another parity-compatible q unless a complete
+quadratic engine first demonstrates a roughly sixfold reduction and includes
+the Hermitian pair square.
+
+## All-stage FP32 error-source decomposition
+
+Stage-selective compensation proved that one ordinary radix group destroys the
+full-chain accuracy gain, but it did not answer a different question: whether
+every group could retain only *one class* of rounding error.  The earlier
+FP64-local-operation controls suggested that complex multiplication alone was
+not dominant; no prior experiment propagated addition-only and product-only
+residuals through the full seven-group chain.
+
+[`src/cuda/fp_error_source_bench.cu`](src/cuda/fp_error_source_bench.cu)
+implements this split over all 2,097,152 complex values.  Every mode carries a
+binary32 residual and includes high/low roots throughout all seven radix-eight
+groups.  Independent switches capture:
+
+- `TwoSum` rounding from butterfly additions/subtractions; and
+- the error-free-product/FMA residual of the ordinary complex multiply.
+
+The residual is never dropped at a stage boundary, so this is not a repeat of
+the 128 stage-mask sweep.  All modes use the same ordinary high result and are
+compared with the same long-double seven-pass reference.  Two runs agreed:
+
+| Residual contents | RMS error | Maximum error | Median |
+|---|---:|---:|---:|
+| propagation/root-low only | `1.0747e-4` | `6.1152e-4` | 132.16--132.19 us |
+| capture additions only | `3.3737e-5` | `2.4600e-4` | 142.37--142.46 us |
+| capture products only | `1.0355e-4` | `5.8064e-4` | 136.26--136.29 us |
+| capture both in this noncanonical graph | `1.6730e-5` | `1.0307e-4` | 146.85--146.94 us |
+
+Product rounding alone improves RMS by only about 1.04x.  Addition capture is
+the larger source but improves by only about 3.2x, still nearly two orders of
+magnitude short of the roughly 240x p150 requirement.  The final row is not a
+replacement for the previously validated canonical compensated transform: it
+omits renormalization and second-order cross terms, intentionally isolating
+the first-order source accounting.  Its limited 6.4x result shows those
+interactions are essential to the canonical path's four-order-of-magnitude
+gain.
+
+All four kernels are spill-free at 20--24 registers.  Their 132--147-us times
+therefore reflect the extra residual loads/stores and arithmetic rather than a
+resource cliff.  The addition-only mode is already slower than the complete
+M61 overlap window while failing accuracy badly; an overlap integration cannot
+make it exact.
+
+Decision: **reject operation-class-selective FP32 compensation.**  Neither
+product nor butterfly error is a cheap sufficient statistic for the missing
+mantissa.  Accuracy requires their coupled, renormalized propagation at every
+stage, which is the full compensated architecture already measured near
+277 us with M61.  Do not reopen the route by compensating only additions,
+only products, or only root representation.
+
+## M61 pair-square spectral-preweight audit
+
+The exact M61 tail was re-audited before attempting another lower-rank square.
+The production Hermitian pair first recovers two quadratic-field values `a`
+and `b`, then computes
+
+```text
+c = a^2 - T*b^2
+d = 2*a*b
+```
+
+where `T=t^2` varies with the spectrum coordinate.  Counting base-M61 wide
+products, the two complex squares cost four, multiplication of `b^2` by `T`
+costs three, and the cross product costs three: ten total.  Both already
+implemented nine-product alternatives were checked in the registry before
+this audit.  The dependent `(a+b)^2-a^2-b^2` version tied or lost after its
+longer dependency/spill path, and the independent-three-square version was
+exact but measured 200.3 us versus a 199.1-us control.  Neither should be
+reimplemented.
+
+The apparently stronger basis change `B=t*b`, `D=t*d` reduces the central
+formula to
+
+```text
+c = a^2 - B^2
+D = 2*a*B
+```
+
+which is only seven base products if conversion into and out of that basis is
+free.  It is not free in the current real-word DGT.  `t` is the coordinate-
+dependent half-root whose square is the existing tail trig.  Multiplying `b`
+by `t` and later recovering `d=D/t` costs two generic quadratic-field
+multiplications, six base products, making the local spelling thirteen rather
+than ten products.  Keeping the scaled basis through the inverse transform
+does not remove the conversion: the carry boundary requires the canonical
+natural real-word coefficients, and the half-root phase is not an integral
+cyclic shift that can be implemented by an index permutation.
+
+Two existing architectural experiments cover the only plausible ways to make
+that conversion part of the transform rather than an explicit tail multiply:
+
+- `GOLD_PAIR=1` carries separate even/odd scalar transforms and performs the
+  analogous three-scalar-product coupling.  It is exact end to end, but M61
+  has no long base-field power-of-two root, so the implementation needs the
+  Goldilocks field.  Generic Gold roots/weights raised the exact rate to
+  249.8 us even though its tail itself was slightly faster than M61.
+- The folded negacyclic DGT tried to encode the half-root phase inside a
+  half-length quadratic transform.  For M31 and M61, `sqrt(2)` is already in
+  the base field, so the fold coefficient collapses into the base field and
+  loses injectivity.  Restoring a full-length transform loses the proposed
+  population reduction.
+
+Decision: **do not implement the seven-product spectral-preweight spelling.**
+Its attractive count excludes the basis conversions, and absorbing those
+conversions is respectively the already-rejected scalar-pair or noninjective
+folded-DGT architecture.  A genuinely new M61 tail proposal must either prove
+an at-most-eight-product formula in the existing canonical DGT basis, including
+the dynamic `T`, or remove the canonical carry boundary as part of an exact
+end-to-end representation.
+
+## Factor-four M31 syndrome lifted by one selected parity bit
+
+The parity-conditioned generic-q factor-four result was re-audited for the
+special M31 field before trying another q.  This is not the old parity-free
+factor-four search, which necessarily failed because `241^4 > M31`, and it is
+not the packed-parity path that corrects every full-length coefficient.  The
+new code attaches just one exact parity bit to each four-alias syndrome bin.
+
+[`src/folded_syndrome_test.cpp`](src/folded_syndrome_test.cpp) now derives the
+actual normalized Crandall--Fagin weight patterns for exponents 136279841,
+140000011, 145000003, and 150000001.  Ceiling carries produce eight patterns:
+
+```text
+0,7,15,23    0,8,15,23    0,8,16,23    0,8,16,24
+0,23,15,7    0,23,15,8    0,23,16,8    0,24,16,8
+```
+
+For each pattern the test exhaustively searches the difference lattice
+`[-240,240]^4` modulo M31.  Constraining the difference at a pattern-selected
+alias to be even leaves no nonzero relation.  Exactly one parity selector works
+for each pattern; the selected aliases are respectively `1,2,3,0,3,2,1,0` in
+the order above.  Therefore the M31 residue plus one bit uniquely identifies
+every error vector in `[-120,120]^4`.  This supplies the missing rigorous p150
+decoder and uses four times fewer parity bits than per-coefficient parity.
+
+The performance premise was then tested through a new opt-in `FOLD_FACTOR=4`
+mode.  The main carry forms two four-way M31 folds from the even and odd members
+of its existing eight-alias register set and writes them directly in the 1M
+side transform's input layout.  The side queue runs a complete
+`512x2x512` M31 forward/square/inverse cycle.  The main safe-exponent residue
+remained exact; the side result is deliberately not yet consumed because the
+performance gate fails first.
+
+Matched 10k runs measured:
+
+| p=120000007 FP32+M61 path | Time |
+|---|---:|
+| raw control | 172.7--172.8 us |
+| complete factor-four M31 side transform | 198.2 us |
+| side transform with both width edges granted zero cost | **192.8 us** |
+
+The last row is an intentionally incorrect timing lower bound, exposed as
+`FOLD_ZERO_WIDTH=1`: it primes the side buffer once, then omits both side width
+transforms while continuing all middle/tail work on dense valid residues.  It
+is not a recurrence result.  It strengthens the rejection because even free
+edge fusion leaves about 20 us exposed, twice the 10.6-us allowance of the
+169.4-us full-range p150 FP32+M61 base, before producing the selected parity bit
+or decoding/correcting carry.
+
+An Nsight trace of the complete factor-four mode measured side-kernel medians
+of 14.50 us for `foldP`, 8.06 us for middle-in, 25.92 us for the M31 tail,
+7.62 us for middle-out, and 8.10 us for the final width.  The 64.2-us side chain
+overlaps the main transform but contends with its M61 integer work; deleting
+22.6 us of width kernels recovered only 5.4 us end to end.  This is the same
+resource boundary seen by the smaller N/8 sidecar, now with a stronger
+impossible lower bound.
+
+Decision: **retain the decoder proof but reject factor-four M31 integration for
+the 180-us gate.**  One selected parity bit fixes the generic-q design's
+information problem and M31 fixes its arithmetic quality, but the mandatory
+middle/tail work alone exposes too much time.  Do not repeat this using full
+packed parity, another stream priority, or promised width fusion; zero-cost
+width edges already miss the target.
+
+## Block-scaled Q31 estimator beside M61
+
+The registry was searched for fixed-point FFTs, Q31 transforms, block floating
+point, and scaled integer butterflies before implementation.  Existing integer
+work used modular q31 fields; existing approximate work used FP32 or a stored
+FP32 residual.  No path had tested a nonmodular signed fixed-point estimator in
+place of the FP32 plane.  This is a materially different attempt to eliminate
+FP32's p150 quotient error without adding a correction modulus.
+
+[`src/cuda/q31_fixed_fft_bench.cu`](src/cuda/q31_fixed_fft_bench.cu) implements
+seven full-population radix-eight groups, matching the 21 binary stages of the
+4M packed transform.  A block exponent schedule of `2,1,2,1,2,1,2` binary
+shifts approximately tracks the square-root growth of representative dense
+data.  This is optimistic: a production engine would also need overflow
+detection and an occasional conservative replay.  Two arithmetic forms were
+measured:
+
+- a fast form uses four signed high-half `IMAD` products per complex twiddle,
+  deliberately discarding the next product bit; and
+- a precise form forms four complete signed 64-bit products, combines them,
+  and rounds once at the selected Q31 boundary.
+
+Both forms were compared with the same long-double normalized transform and an
+FP32 graph using the identical scaling schedule.  At 2,097,152 complex values:
+
+| Seven radix-eight groups | RMS error | Maximum error | Median |
+|---|---:|---:|---:|
+| FP32 | `2.019e-8` | `8.222e-8` | 64.83 us |
+| fast Q31 high-half | `4.002e-9` | `1.129e-8` | 66.69 us |
+| precise Q31 wide product | `1.320e-9` | `4.321e-9` | 79.07 us |
+
+Thus the fast form buys only 5.04x RMS accuracy and the wide form 15.29x.  The
+current full-range evidence has p150 FP32/M61 quotient errors through roughly
+`[-120,120]`; neither result demonstrates the approximately twentyfold maximum-
+error reduction needed even to reach a factor-eight M31 alphabet near
+`[-6,6]`.  More importantly, the precise result still omits the pointwise
+square, Crandall--Fagin weights, inverse/forward width edges, and reconstruction.
+
+[`src/cuda/q31_fixed_overlap_bench.cu`](src/cuda/q31_fixed_overlap_bench.cu)
+then runs those exact Q31 kernels beside the same production-population,
+20-product M61 critical-chain proxy used for the compensated-FP32 gate.  All
+kernels are spill-free; fast Q31 uses 14 registers and precise Q31 uses 18.
+The dependency-closed medians were:
+
+| Resource gate | Median |
+|---|---:|
+| M61 critical chain alone | 103.70--104.26 us |
+| fast Q31 alone | 66.32--66.33 us |
+| precise Q31 alone | 78.38--78.49 us |
+| M61 plus fast Q31 | **173.38--174.31 us** |
+| M61 plus precise Q31 | **206.12--207.06 us** |
+
+The fast candidate leaves at most 5.69--6.62 us under the complete 180-us goal for all
+omitted transform work and carry while still failing the accuracy requirement.
+The precise candidate exceeds the complete goal inside this favorable middle-
+arithmetic proxy alone.  Integer fixed point also contends directly with M61's
+integer pipeline; it is not a resource-complementary replacement for FP32.
+
+Decision: **reject a block-scaled Q31/M61 integration.**  It is a useful
+demonstration that mantissa-free integer addition does not automatically supply
+31 effective convolution bits: maintaining range consumes a shared block
+exponent, and the accurate twiddle path reintroduces wide integer products.  Do
+not repeat the fast high-half graph based only on its near-FP32 isolated time or
+the wide graph based only on its 15x accuracy.  A future fixed-point proposal
+must demonstrate both the real p150 quotient bound and a dependency-complete
+M61 makespan below the already optimistic values above, not merely add more
+mantissa limbs or a replay mechanism.
+
+## Scaled two-multiply M61 tail rotation audit
+
+The registry was searched for scaled rotations, shear/lifting factorizations,
+absorbed twiddles, scaled pair squares, and the earlier spectral-preweight
+proposal before changing the production tail.  The only related implementation
+was the already-rejected half-root basis `B=t*b`, whose apparent seven-product
+pair square becomes thirteen products after entering and leaving that basis.
+
+A seemingly narrower spelling also fails once its scales are carried through
+the complete Hermitian pair.  Write the dynamic tail root as `T=u+i*v`.  For
+`u != 0`, setting `r=v/u` gives
+
+```text
+(x-r*y) + i*(r*x+y) = T*(x+i*y)/u.
+```
+
+This normalized rotation uses two base-field products instead of the three in
+`cmul`, but it returns a value scaled by `1/u`.  In the production formula
+
+```text
+c = a^2 - T*b^2
+d = 2*a*b,
+```
+
+scaling only `T*b^2` is invalid because it can no longer be subtracted from
+canonical `a^2`.  Forming `c/u` requires scaling both coordinates of `a^2` by
+the generic field element `1/u`, immediately spending the two products that
+the normalized rotation saved.  Leaving both `c` and `d` in different dynamic
+scales is not free either: the following `fft_HEIGHT2` starts with a radix-eight
+butterfly that mixes frequency coordinates before its first tabulated twiddle.
+The per-coordinate `u` factors therefore cannot be absorbed into one existing
+post-butterfly multiply.  Pre-scaling `a` or `b` to align the two outputs
+requires the same coordinate-dependent half-root conversion and reciprocal
+conversion counted in the spectral-preweight audit.
+
+Decision: **reject the scaled two-multiply rotation algebraically.**  It does
+not produce a lower-product canonical tail, and implementing it would repeat
+the recorded basis-conversion mistake.  Reopen only for a formula whose input
+and output scales are identical across every mixed inverse butterfly and whose
+complete canonical cost is at most eight base-M61 products.
+
+## Composite `M31*M19` channel for a 3M transform
+
+Before implementation, the registry was checked against the single composite
+`M31*M61` ring, the separate 3M `M31+M61+M19` architecture, and the earlier
+q-pair composite search.  None tested combining only the two small Mersenne
+channels.  The candidate has the unusually sparse shape
+
+```text
+Q = (2^31-1)(2^19-1)
+  = 1,125,897,758,834,689
+  = 2^50 - (2^31 + 2^19 - 1).
+```
+
+One canonical Q scalar occupies 64 bits, exactly the same eight bytes as its
+separate M31 and M19 residues.  The reducer folds a 100-bit product at bit 50,
+multiplies the upper half by the sparse 32-bit complement, folds the resulting
+82-bit value again, and canonicalizes.  The intended architecture would pair
+this one composite quadratic channel with M61 at the 3M geometry, replacing
+three field streams by two without increasing the 48-MiB state.
+
+[`src/cuda/m31_m19_composite_bench.cu`](src/cuda/m31_m19_composite_bench.cu)
+and `make m31-m19-composite-bench` implement the exact arithmetic-density gate
+over all 1,572,864 packed values.  Every output after chains of 1, 2, 4, 8, 16,
+and 32 quadratic products agrees independently modulo both M31 and M19.  Two
+composite forms were measured:
+
+- canonical Karatsuba reduces all three scalar products; and
+- delayed Karatsuba retains three signed 100-bit products and reduces only the
+  final real and imaginary coordinates, matching the optimization principle
+  used by production M61.
+
+Three fresh 31-sample processes gave the transform-density result:
+
+| Eight dependent quadratic products | Median range | Relative to separate |
+|---|---:|---:|
+| Separate specialized M31+M19 | 40.352--40.448 us | 1.000 |
+| Composite Q, canonical folds | 64.992--65.120 us | **1.608--1.614** |
+| Composite Q, delayed final folds | 71.232--72.288 us | **1.761--1.791** |
+
+All kernels are spill-free: separate uses 35 registers, canonical Q uses 36,
+and delayed Q uses 34.  Static SASS contains 9 `IMAD` instructions in the
+separate kernel versus 36 in canonical Q and 43 in delayed Q.  The loss is the
+executed wide-product/fold graph, not state bytes, register pressure, or an
+avoidable canonical reduction.  Delaying the folds is slower because signed
+100-bit combination costs more than the deleted reduction.
+
+There is also a scope failure independent of timing.  This architecture has
+exactly the same 110-bit CRT range as the prior 3M M31+M61+M19 design.  Its
+recorded capacity proof covers p136 with only 0.854 bit of margin and explicitly
+does not cover p140--150 at 3M, whereas the current goal requires that whole
+range.
+
+Decision: **reject the composite M31*M19 transform before roots or PRPLL
+integration.**  Even its strongest exact arithmetic form is about 61% slower
+than retaining the two specialized small fields, and it cannot meet the upper
+exponent capacity requirement.  Do not repeat it through a radix-three tile or
+two-stream scheduler; reopen only if hardware supplies a genuinely cheaper
+50-bit composite multiply and a larger exact modulus product covers p150.
+## Width/middle factorization swap around the M31/M61 carry
+
+Before implementation, the registry was searched for `width/middle`, swapped
+factorizations, radix-eight carry kernels, `carryMiddle`, and the carry-to-middle
+readiness audit.  The existing compact `carryMiddle` experiment fuses an entire
+`512*8` tile in a 512-thread, 96-KiB block; the readiness audit retains the
+existing transform factorization.  The untested distinction here was to change
+the *mathematical factor order*: put the 512-point field transforms outside the
+mixed M31/M61 carry and make the carry own only the final inverse and first
+forward radix-eight transforms.
+
+The first production-population gate in
+[`src/cuda/warp_specialized_edge_bench.cu`](src/cuda/warp_specialized_edge_bench.cu)
+looked unusually strong.  It executes exact M31/M61 Garner reconstruction, a
+signed 96-bit coefficient, multiplication by three, paired 32/33-bit digit
+extraction, and maps the digits back into both fields.  Across all 2,097,152
+quadratic values, the separable no-twiddle schedules agreed bit for bit:
+
+```text
+current placement + local CRT/carry   170--172 us
+swapped placement + local CRT/carry   143--145 us
+apparent saving                        27 us
+```
+
+That equality was not sufficient evidence for a full NTT.  It proved only that
+two transforms on independent matrix axes commute around the pointwise bridge.
+The production transform's Cooley--Tukey rotations make the axes nonseparable.
+
+### Exact index audit and strengthened gate
+
+In the incumbent `512:8:512` factorization, natural quadratic-coefficient order
+is
+
+```text
+n = y + 512*m + 4096*x.
+```
+
+Putting radix eight first requires a genuinely different digit order,
+
+```text
+n = y + 512*w + 262144*r,
+```
+
+not a different physical spelling of the old middle rows.  For each transform
+direction, the incumbent radix-eight middle stage needs eight pre-rotations and
+seven post-rotations per eight-value vector.  In the swapped order, eight of
+those rotations move to the 512-point field edge and seven remain adjacent to
+the carry-owned radix-eight transform.  Across inverse plus forward boundaries,
+both schedules therefore require exactly 30 general quadratic-field constant
+multiplies per eight values:
+
+```text
+incumbent:  2 * (8 + 7)       = 30
+swapped:    2 * 8 + 7 + 7     = 30.
+```
+
+The original 143--145-us swap charged none of them.  The benchmark now includes
+that matched count with actual general `GF(M31^2)` and `GF(M61^2)` complex
+multiplication and resident twiddle-table dependencies.  It deliberately uses
+arbitrary valid field constants: this is a performance/resource gate, not a
+claim that the final production permutation has been implemented.  It remains
+optimistic because it grants direct roots and omits the real decomposed-root
+synthesis, layout conversion, global stairway correction, and end-to-end NTT
+integration.
+
+Five fresh processes measured:
+
+| Dependency-complete boundary proxy | Process median range | Median of process medians |
+|---|---:|---:|
+| incumbent placement + matched CT rotations | 184--190 us | **184 us** |
+| swapped placement + matched CT rotations | 188--192 us | **191 us** |
+
+The first three pairs consistently lost 7--8 us; the last two thermally varied
+to near a tie, but no process showed a repeatable swap advantage.  Generated
+resources explain why this is not a spill artifact:
+
+| Kernel | Registers/thread | Spill/stack |
+|---|---:|---:|
+| carry-owned radix eight, no CT rotations | 78 | 0 |
+| carry-owned radix eight with CT rotations | 86 | 0 |
+| incumbent width/CRT/carry proxy | 90 | 0 |
+| separate M61 middle with rotations | 66 | 0 |
+| separate M61 width edge with outer rotations | 78 | 0 |
+
+The 27-us lead came entirely from moving a cheap, twiddle-free radix eight into
+the carry while moving the expensive width transform out.  In the actual
+factorization, the radix-eight carry inherits seven rotations per field on both
+sides of the nonlinear bridge.  Keeping that work in independent single-field
+kernels is at least as fast and usually faster on this GPU.
+
+Decision: **reject production integration of the width/middle factorization
+swap.**  The strengthened gate is already slower while granting it free root
+synthesis and all permutation/carry-stairway costs.  Do not quote the earlier
+143--145-us separable scaffold as a PRPLL candidate or repeat the swap without
+an algebraic way to remove, rather than relocate, the mandatory Cooley--Tukey
+rotations.
+
+## Full M61 middle-twiddle planes
+
+The registry was searched for production `middleMul2`, precomputed/full roots,
+`MIDDLE_CHAIN`, and middle-twiddle tables before implementation.  Direct-prime
+Montgomery transforms had compared full tables with generated roots, and the
+batch-native M61 gate shared the production root-power chain across exponents.
+No experiment had replaced the root-power chain in the incumbent M61 middle
+kernels with a complete, coalesced production root plane.
+
+Production `middleMul2` applies eight data rotations per radix-eight vector but
+also constructs them with one base complex multiply and seven dependent
+root-progression multiplies.  A table containing all eight rotations occupies
+32 MiB for one traversal orientation.  The extended exact gate in
+[`src/cuda/m61_middle_batch_bench.cu`](src/cuda/m61_middle_batch_bench.cu)
+removes those eight construction multiplies while retaining the eight data
+multiplies, radix eight, all seven `middleMul` rotations, and the complete
+2,097,152-value population.  Every output matches the generated-root kernel.
+
+At 256 threads, three fresh processes measured:
+
+```text
+generated root chain   27.936--28.000 us
+coalesced full roots   25.792--25.856 us
+isolated improvement    7.6--8.3% (about 2.1 us/kernel)
+```
+
+At 64 and 128 threads, the gain fell to roughly 0.2--0.7 us.  The full-root
+kernel uses 60 registers versus 66 for the generated form; neither has stack or
+spills.  Thus the 256-thread result is a real compute-for-L2 component trade,
+not an occupancy accident.  Applied optimistically to both production middle
+directions, it promised only about 4 us, but it was retained as a possible
+component to combine with a larger architectural saving.
+
+### Exact production integration and reversal
+
+`FULL_MIDDLE_ROOTS61=1` appends exact roots generated from the same primitive
+`GF(M61^2)` root used by PRPLL and switches only the M61 `middleMul2` calls.
+Middle-in and middle-out traverse the logical `512x512` coordinate matrix in
+opposite orientations.  One row-major table cannot coalesce both, so the exact
+implementation supplies two physical 32-MiB spellings:
+
+```text
+middle-in:   [radix branch][height][width]
+middle-out:  [radix branch][width][height]
+```
+
+Both orderings of matched 30,000-iteration p136 runs reproduced
+`05d6515c416b83e2` at iteration 2,000 and `9139db3046e846d4` at iteration
+30,000:
+
+| Order | Generated-root control | Two full-root planes |
+|---|---:|---:|
+| control then trial | **198.7 us** | 200.4 us |
+| trial then control | **199.2 us** | 200.6 us |
+
+The full-root mode is reproducibly 1.4--1.7 us slower, or about 0.7--0.9%.
+The isolated 32-MiB plane fits beside one M61 data plane; the production engine
+also keeps M31 data and the opposite-orientation root plane live.  Alternating
+the two middle directions therefore turns the saved root arithmetic into a
+larger L2 working set and extra traffic, exposing more time in the complete
+iteration than the local kernels recover.
+
+Decision: **leave full M61 middle roots disabled and reject them for the
+180-us gate.**  Keep the exact opt-in mode and standalone gate as evidence, but
+do not infer a 4-us recurrence improvement from the 256-thread microbenchmark.
+This is another case where a cache-resident component table becomes harmful
+after the other field, transform state, and opposite traversal are included.
+
+## Carry-aware lifting from FP32 plus one exact M61 residue
+
+The registry was searched for integer/coefficient lifting, carry consistency,
+carry closure, and ambiguous M61 multiples before implementation.  The existing
+wide-quotient FP32/M61 engine already performs the local version of this idea:
+for every coefficient it uses FP32 to choose an integer multiple of M61 and
+adds the exact M61 residue.  What had not been written down explicitly was
+whether the *cross-coefficient carry recurrence* could resolve an incorrect
+choice and thereby remove the M31 correction plane.
+
+It cannot.  Let the exact coefficient be represented by a candidate lift
+
+```text
+c[j] = r[j] + k[j] * M61,
+```
+
+where `r[j]` is known and the p150 FP32 evidence leaves `k[j]` uncertain by up
+to about 120.  For a mixed-radix digit base `B[j]`, carry normalization is
+
+```text
+c[j] + h[j] = d[j] + B[j] * h[j+1].
+```
+
+Given any `k[j]` and incoming carry, Euclidean division always supplies a
+valid canonical `d[j]` and the next carry.  The cyclic Mersenne wrap likewise
+normalizes every complete candidate vector; it does not provide a known target
+residue against which to select one.  Changing `k[j]` changes the represented
+PRPLL state by
+
+```text
+M61 * sum_j delta_k[j] * product_(i<j) B[i],
+```
+
+which is generally nonzero modulo `2^p-1`.  The resulting digit stream is not
+an invalid spelling of the same state but the valid spelling of a different
+state.  Advancing another iteration supplies no oracle: it merely squares the
+chosen wrong state.  This is why the exact M31 residue, parity-conditioned
+side field, or another independent modulus can identify quotient errors while
+carry bounds alone cannot.
+
+Decision: **reject carry-aware single-M61 lifting at the algebra gate.**  No
+kernel was implemented.  The apparent sequential constraint in carry is a
+normalization operation, not an extra congruence.  Do not reopen FP32+M61 by
+claiming that digit range, carry magnitude, cyclic closure, or a later
+iteration can select among the dense `[-120,120]` quotient candidates; a new
+proposal must add independent exact information or change the representation
+so the ambiguity never arises.
+
+## Binary Tensor-Core M61 multiplication
+
+The registry was searched for binary MMA, `b1`, `AND.POPC`, and bit-convolution
+before implementation.  The prior Tensor gate used eight-bit Toeplitz products;
+the CLMAD gate used carryless XOR multiplication.  Neither tested the exact
+binary Tensor instruction, whose AND followed by population count can form
+ordinary carryful integer-product columns.
+
+[`src/cuda/m61_tensor_bit_bench.cu`](src/cuda/m61_tensor_bit_bench.cu) implements
+the stronger Mersenne-specific form.  Eight residues are the rows of an
+`8x128` binary matrix.  Because `2^61 == 1 (mod M61)`, eight
+`mma.m8n8k128.b1.b1.and.popc` operations form the 61 columns of the *cyclic*
+bit convolution directly rather than materializing all 121 ordinary product
+columns.  The timed path includes natural `u64` input, packed root matrices,
+all MMA operations, 61-column shared traffic, exact two-word assembly,
+Mersenne reduction, and stores.  Three such base products implement the same
+quadratic Karatsuba root multiply as production.  All 2,097,152 base and
+quadratic results match the scalar GPU path and an independent host
+`unsigned __int128` reference.
+
+Three fresh processes measured:
+
+| Full-population exact operation | Scalar M61 | Binary Tensor | Tensor/scalar |
+|---|---:|---:|---:|
+| one base-field product | 9.50--9.54 us | 388.35--388.51 us | 40.7--40.9x |
+| one quadratic root product | 15.65--15.84 us | 1147.01--1148.16 us | 72.7--73.4x |
+
+The Tensor kernels use 29 and 35 registers with no stack or spills.  Final
+SASS lowers the binary PTX form to `IMMA.16832.U8.U8` sequences on `sm_120`;
+more importantly, regardless of that encoding, each useful scalar result still
+requires writing and serially combining 61 population-count columns.  The
+earlier byte-Toeplitz gate needed only 15 columns and was already 4.5x slower;
+binary packing multiplies that reconstruction boundary and loses by over an
+order of magnitude more.
+
+Decision: **reject binary Tensor M61 before an NTT integration.**  A persistent
+bit-sliced input layout could delete a few input moves but cannot delete the
+61 exact output columns or their carries.  Do not reopen this as a carryless
+bit-field transform: XOR products fail the integer ring, while AND/POPC plus
+carry is the complete exact operation measured here.

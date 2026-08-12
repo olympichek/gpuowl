@@ -977,17 +977,29 @@ void OVERLOAD onePairSq(GF61* pa, GF61* pb, GF61 t_squared, const u32 t_squared_
   GF61 a2, b2, b2t2, ab, addin, c, d;
 
 // This code should be faster (saves at least one wide mul) but the CUDA compiler makes poorer decisions regarding register usage resulting in local memory usage
-#if ENABLE_BETTER_ONEPAIRSQ
+#if ENABLE_BETTER_ONEPAIRSQ || ENABLE_PARALLEL_ONEPAIRSQ
   X2qconjb(&a, &b);                             // X2(a, conjugate(b)).  a.x range is 0..2+, a.y range is -1-..1+, b.x range is -1-..1+, b.y range is 0..2+
   a.y += 2*M61;                                 // a range is  0..2+ / 1-..3+
   b.x += 2*M61;                                 // b range is 1-..3+ / 0..2+
 
   ab = addq(a, b);                              // Compute 2ab as (a + b)^2 - a^2 - b^2.  ab range is 1-..5+
+#if ENABLE_PARALLEL_ONEPAIRSQ
+  // Keep all three complex squares independent.  The older nine-product
+  // identity folds -a^2-b^2 into the third square with csqa(), which deletes
+  // one reduction but serializes the otherwise independent wide products.
+  // Canonicalizing after the products preserves that ILP and gives the same
+  // d = 2ab result before the common twiddle/output path below.
+  GF61 sum2 = csq(ab, 6);
+  a2 = modM61(csqq(a, 3, 4));
+  b2 = csq(b, 4, 3);
+  d = sub(sub(sum2, a2), b2);
+#else
   a2 = csqq(a, 3, 4);                           // a2 = a^2, a2 range is 0..2+
   b2 = csq(b, 4, 3);                            // b2 = b^2, b2 range is 0..1+
 
   addin = neg(addq(a2, b2), 4);                 // add this into the csq of a+b, addin range is 0..4
   d = csqa(ab, addin, 6);                       // d = 2ab, range is 0..1+
+#endif
 
   b2t2 = cmul(b2, t_squared);                   // b2t2 = b^2 * t_squared, b2t2 range is 0..1+
 

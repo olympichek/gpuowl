@@ -127,6 +127,32 @@ i32 RNDVALfloatToInt(float d) {
 //#endif
   return w;
 }
+
+// Round an FP32 estimate of a multiple of M61 to a signed integer.  The
+// historical RNDVALfloatToInt path deliberately retains only 22 signed bits.
+// For the FP32+M61 hybrid near its upper useful range the quotient itself can
+// require all 24 exactly representable signed-integer bits.  Round the
+// magnitude with one fused add of 2^23, which keeps the result in [2^23,2^24)
+// where binary32 has unit spacing, then restore the sign.  Unlike a separate
+// multiply followed by cvt.rni this preserves the exact-product rounding
+// supplied by the FMA.
+i32 roundM61Quotient(float work, float* signedRoundoff) {
+#if FP32_WIDE_QUOTIENT
+  const float invM61 = 4.3368086899420177360298112034798e-19f;
+  const float roundBase = 8388608.0f;  // 2^23
+  float roundedMagnitude = fma(fabs(work), invM61, roundBase);
+  i32 magnitude = as_int(roundedMagnitude) - as_int(roundBase);
+  i32 quotient = as_uint(work) & 0x80000000u ? -magnitude : magnitude;
+  *signedRoundoff = fma(work, invM61, -(float) quotient);
+  return quotient;
+#else
+  float rounded = fma(work, 4.3368086899420177360298112034798e-19f, RNDVAL);
+  i32 quotient = RNDVALfloatToInt(rounded);
+  *signedRoundoff = fma(work, 4.3368086899420177360298112034798e-19f,
+                        RNDVAL - rounded);
+  return quotient;
+#endif
+}
 #endif
 
 // map abs(carry) to floats, with 2^32 corresponding to 1.0
@@ -483,11 +509,10 @@ i96 weightAndCarryOne(float uF2, Z61 u61, float F2_invWeight, u32 m61_invWeight,
   // The final result mod M61 must be n61.  Use FP32 data to calculate how many multiples of M61 need to be added to n61.
   float n61f = (float)hi32(n61) * -4294967296.0f;                             // Estimate -n61 as a float.
   uF2 = fma(uF2, F2_invWeight, n61f);                                         // This should be close to an integer multiple of M61
-  float uF2int = fma(uF2, 4.3368086899420177360298112034798e-19f, RNDVAL);    // Divide by M61 and round to int
-  i32 nF2 = RNDVALfloatToInt(uF2int);
+  float signedRoundoff;
+  i32 nF2 = roundM61Quotient(uF2, &signedRoundoff);
 
   // Optionally calculate roundoff error
-  float signedRoundoff = fma(uF2, 4.3368086899420177360298112034798e-19f, RNDVAL - uF2int);
   float roundoff = fabs(signedRoundoff);
   *maxROE = max(*maxROE, roundoff);
 
@@ -729,8 +754,8 @@ i128 weightAndCarryOne(float uF2, Z31 u31, Z61 u61, float F2_invWeight, u32 m31_
   u64 originalN61 = get_Z61(u61);
   float m61Estimate = (float)hi32(originalN61) * -4294967296.0f;
   float m61Work = fma(uF2, F2_invWeight, m61Estimate);
-  float m61Int = fma(m61Work, 4.3368086899420177360298112034798e-19f, RNDVAL);
-  i32 estimatedM61Quotient = RNDVALfloatToInt(m61Int);
+  float diagSignedRoundoff;
+  i32 estimatedM61Quotient = roundM61Quotient(m61Work, &diagSignedRoundoff);
 #endif
   // Use chinese remainder theorem to create a 92-bit result.  Loosely copied from Yves Gallot's mersenne2 program.
   u32 n31 = get_Z31(u31);
@@ -804,7 +829,6 @@ i128 weightAndCarryOne(float uF2, Z31 u31, Z61 u61, float F2_invWeight, u32 m31_
   Z31 diagEstimatedMod31 = add(modM31((i64) estimatedM61Quotient * ((1LL << 30) - 1)), diagOriginalM61Mod31);
   Z31 diagErrorMod31 = mul(sub(diagEstimatedMod31, n31), M31 - 2);
   i32 diagError = diagErrorMod31 > M31 / 2 ? (i32) (diagErrorMod31 - M31) : (i32) diagErrorMod31;
-  float diagSignedRoundoff = fma(m61Work, 4.3368086899420177360298112034798e-19f, RNDVAL - m61Int);
   bool oddMismatch = estimatedParity != expectedParity;
   i32 proposedDelta = diagSignedRoundoff < 0 ? -1 : 1;
   bool wrongDirection = oddMismatch && proposedDelta != -diagError;

@@ -116,6 +116,8 @@ private:
   bool foldValidate;
   bool foldTransformEnabled;
   bool foldValidated{};
+  int detachedM31{};    // Exact external M31 width kernels around a detached carryFused
+                        // 1 = both widths detached, 2 = inverse width only
   u32 wantROE{};
 
   // clDefines initializes these options while constructing compiler.  Keep
@@ -154,6 +156,7 @@ private:
   Kernel ktailMulLowGF31;
   Kernel kfftMidOutGF31;
   Kernel kfftWGF31;
+  Kernel kfftWOut31;    // Forward width for the detached M31 edge
 
   /* Independent 32-bit Riesel-prime planes (FFT31R2) */
   Kernel kfftMidInR0;
@@ -273,12 +276,15 @@ private:
   Buffer<double> buf1;
   Buffer<double> buf2;
   Buffer<double> buf3;
+  // Flat GF31 staging buffer for the detached M31 width edge: fftWGF31 writes
+  // it, the detached carryFused reads then rewrites it, fftWOut31 consumes it.
+  Buffer<double> bufDetach31;
 
   unsigned statsBits;
   TimeInfo* timeBufVect;
   ZAvg zAvg;
 
-  enum BOTTOM_HALF_KERNELS {KMIDIN, KFFTHIN, KTAILSQUARE, KTAILMUL, KTAILMULLOW, KMIDOUT, KFFTW};
+  enum BOTTOM_HALF_KERNELS {KMIDIN, KFFTHIN, KTAILSQUARE, KTAILMUL, KTAILMULLOW, KMIDOUT, KFFTW, KDETACHA, KDETACHB};
   vector<enum BOTTOM_HALF_KERNELS> recorded_kernels;
   vector<Buffer<double> *> recorded_kernel_args;
 

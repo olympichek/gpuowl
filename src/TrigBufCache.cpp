@@ -866,6 +866,44 @@ static vector<ulong2> genMiddleTrigGF61(u32 smallH, u32 middle, u32 width) {
   return tab;
 }
 
+// Two coalesced physical spellings of every middleMul2 data rotation.  The
+// middle-in and middle-out kernels traverse the 512x512 coordinate matrix in
+// opposite orientations, so one row-major plane cannot coalesce both.  The
+// first half is [middle][height][width] for middle-in; the second is
+// [middle][width][height] for middle-out.
+static vector<ulong2> genFullMiddleTrigGF61(u32 smallH, u32 middle,
+                                            u32 width) {
+  vector<ulong2> tab;
+  tab.reserve(size_t(2) * middle * width * smallH);
+  GF61 const root = GF61::root_one(width * middle * smallH);
+  auto append = [&](GF61 const& value) {
+    tab.push_back({value.s0().get(), value.s1().get()});
+  };
+
+  for (u32 k = 0; k != middle; ++k) {
+    for (u32 y = 0; y != smallH; ++y) {
+      GF61 const step = root.pow(y + smallH * k);
+      GF61 value{Z61(1), Z61(0)};
+      for (u32 x = 0; x != width; ++x) {
+        append(value);
+        value = value.mul(step);
+      }
+    }
+  }
+
+  for (u32 k = 0; k != middle; ++k) {
+    for (u32 x = 0; x != width; ++x) {
+      GF61 value = root.pow(u64(x) * smallH * k);
+      GF61 const step = root.pow(x);
+      for (u32 y = 0; y != smallH; ++y) {
+        append(value);
+        value = value.mul(step);
+      }
+    }
+  }
+  return tab;
+}
+
 
 /**************************************************************************/
 /*  Two independent scalar Goldilocks transforms stored as one ulong2     */
@@ -1420,6 +1458,12 @@ static vector<double2> genMiddleTrig(Args *args, FFTConfig fft, u32 smallH,
                            args->value("RIESEL_LAZY", 0)) :
        genMiddleTrigGF61(smallH, transformMiddle, width));
     tab3.resize(MIDDLETRIG_GF61_SIZE(width, middle, smallH));
+    if (args->value("FULL_MIDDLE_ROOTS61", 0) &&
+        fft.shape.fft_type == FFT3161) {
+      vector<ulong2> full = genFullMiddleTrigGF61(smallH, transformMiddle,
+                                                  width);
+      tab3.insert(tab3.end(), full.begin(), full.end());
+    }
     // Append tab3 to tab
     tabsize = tab.size();
     tab.resize(tabsize + tab3.size());
@@ -1513,7 +1557,7 @@ TrigPtr TrigBufCache::smallTrigCombo(Args *args, FFTConfig fft, u32 width, u32 m
 TrigPtr TrigBufCache::middleTrig(Args *args, FFTConfig fft, u32 SMALL_H, u32 MIDDLE, u32 width) {
   std::scoped_lock const lock{mut};
   auto& m = middle;
-  u32 const key_part = make_key_part(fft.FFT_FP64, 0, fft.NTT_GF31, 0, fft.FFT_FP32, 0, fft.NTT_GF61, 0, 0) + (fft.NTT_RIESEL << 20) + (args->value("RIESEL_LAZY", 0) << 21) + (args->value("GOOD_THOMAS3", 0) << 22) + (args->value("M19_FIELD", 0) << 23) + (args->value("GOOD_THOMAS7", 0) << 24) + (args->value("GOOD_THOMAS9", 0) << 25);
+  u32 const key_part = make_key_part(fft.FFT_FP64, 0, fft.NTT_GF31, 0, fft.FFT_FP32, 0, fft.NTT_GF61, 0, 0) + (fft.NTT_RIESEL << 20) + (args->value("RIESEL_LAZY", 0) << 21) + (args->value("GOOD_THOMAS3", 0) << 22) + (args->value("M19_FIELD", 0) << 23) + (args->value("GOOD_THOMAS7", 0) << 24) + (args->value("GOOD_THOMAS9", 0) << 25) + (args->value("FULL_MIDDLE_ROOTS61", 0) << 26);
   decay_t<decltype(m)>::key_type const key{SMALL_H, MIDDLE, width, key_part};
 
   TrigPtr p{};

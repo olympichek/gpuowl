@@ -239,7 +239,11 @@ KERNEL(OUT_WG) fftMiddleOutGF61(P(T2) out, CP(T2) in, u32 base, Trig trig) {
 
   fft_MIDDLE_OUT(u);
 
+#if FULL_MIDDLE_ROOTS61
+  middleMul2FullOut(u, y, x, trig61);
+#else
   middleMul2(u, y, x, trig61);
+#endif
 
   dependentLaunch();       // Next kernel will be carryfused which must dependentLaunchWait before reading data
 
@@ -504,7 +508,11 @@ KERNEL(256) fftMiddleOutGF61(P(T2) out, P(T2) in, u32 base, Trig trig) {
 
   fft_MIDDLE_OUT(u);
 
+#if FULL_MIDDLE_ROOTS61
+  middleMul2FullOut(u, y, x, trig61);
+#else
   middleMul2(u, y, x, trig61);
+#endif
 
   dependentLaunch();       // Next kernel will be carryfused which must dependentLaunchWait before reading data
 

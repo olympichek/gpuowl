@@ -1791,7 +1791,12 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
   u64 fold_combo = comboFracBits(word_index) +
                    make_u64(word_index * fold_shift_step, 0xFFFFFFFF);
   fold_combo = make_u64(hi32(fold_combo) % 31, lo32(fold_combo));
+#if FOLD_FACTOR == 4
+  GF31 folded0 = U2((Z31)0, (Z31)0);
+  GF31 folded1 = U2((Z31)0, (Z31)0);
+#else
   GF31 folded = U2((Z31)0, (Z31)0);
+#endif
 #endif
   for (i32 i = 0; i < NW; ++i) {
     // Calculate inverse weights
@@ -1810,9 +1815,15 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
     fold_combo += fold_combo_step;
     if (hi32(fold_combo) > 31) fold_combo -= 31ULL << 32;
     u32 fold_shift1 = hi32(fold_combo);
-    folded = add(folded,
-                 U2(shl(make_Z31(wu[i].x), fold_shift0),
-                    shl(make_Z31(wu[i].y), fold_shift1)));
+    GF31 const foldValue =
+      U2(shl(make_Z31(wu[i].x), fold_shift0),
+         shl(make_Z31(wu[i].y), fold_shift1));
+#if FOLD_FACTOR == 4
+    if (i & 1) folded1 = add(folded1, foldValue);
+    else       folded0 = add(folded0, foldValue);
+#else
+    folded = add(folded, foldValue);
+#endif
 #if FOLD_SYNDROME_VALIDATE
     foldWords[(lowMe + i * G_W) * H + line] = wu[i];
 #endif
@@ -1850,7 +1861,15 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 #if FOLD_SYNDROME
 #if FOLD_TRANSFORM
   const u32 fold_pair = lowMe * H + line;
-#if FOLD_FACTOR == 16
+#if FOLD_FACTOR == 4
+  // The main carry owns eight aliases spaced N/8 words apart.  A factor-four
+  // fold produces two bins: even i and odd i.  Reinterpret both natural
+  // indices in the side transform's 512x2x512 geometry and transpose directly
+  // into the forward-width input layout.
+  const u32 fold_pair1 = fold_pair + NWORDS / 16;
+  foldOut[(fold_pair & 1023u) * 512u + (fold_pair >> 10)] = folded0;
+  foldOut[(fold_pair1 & 1023u) * 512u + (fold_pair1 >> 10)] = folded1;
+#elif FOLD_FACTOR == 16
   // Preserve the natural N/8 partial-fold order.  The side stream combines
   // pairs into N/16 and transposes them after this critical carry has exited.
   foldOut[fold_pair] = folded;
@@ -1890,11 +1909,20 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 #if GOLD_PAIR
                               , BigTab THREAD_WEIGHTS
 #endif
-                              , P(uint) bufROE) {
+                              , P(uint) bufROE
+#if DETACHED_M31_EDGE
+                              // Exact external M31 width transforms: fftWGF31 writes this
+                              // buffer flat before this kernel, and fftWOut31 consumes the
+                              // flat pre-width residues this kernel writes back to it.
+                              , P(T2) detach
+#endif
+                              ) {
   local GF61 lds61[WMUL * LDS_BYTES / sizeof(GF61)];
   local GF31 *lds31 = (local GF31 *) lds61;
 
+#if !DETACHED_M31_EDGE || DETACHED_M31_EDGE == 2
   GF31 u31[NW];
+#endif
   GF61 u61[NW];
 
   u32 gr = get_group_id(0);
@@ -1926,13 +1954,21 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 // which causes a terrible reduction in occupancy.
   u32 zerohack = ZEROHACK_W * (u32) get_group_id(0) / 131072;
 
+#if !DETACHED_M31_EDGE
   readCarryFusedLine(in31, u31, line, lowMe);
   fft_WIDTH1(lds31 + zerohack, u31, smallTrig31 + zerohack, WMUL, lowMe);
+#endif
 
   dependentLaunchWait();   // Previous kernel was fftMiddleOutGF61
 
   readCarryFusedLine(in61, u61, line, lowMe);
   fft_WIDTH1(lds61 + zerohack, u61, smallTrig61 + zerohack, WMUL, lowMe);
+
+#if DETACHED_M31_EDGE
+  // Exact external-width designs supply this already transformed line.  This
+  // opt-in timing gate deliberately skips that producer until the actual
+  // carry saving is large enough to justify the scheduler integration.
+#endif
 
   Word2 wu[NW];
 
@@ -2030,7 +2066,16 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
     // Apply the inverse weights, optionally compute roundoff error, and convert to integer.  Also apply MUL3 here.
     // Then propagate carries through two words (the first carry does not have to be accurately calculated because it will
     // be accurately calculated by carryFinal later on).  The second carry must be accurate for output to the carry shuttle.
-    wu[i] = weightAndCarryPairSloppy(SWAP_XY(u31[i]),
+#if DETACHED_M31_EDGE
+    GF31 const detached31 = ((CP(GF31)) detach)[(line * NW + i) * G_W + lowMe];
+#endif
+    wu[i] = weightAndCarryPairSloppy(SWAP_XY(
+#if DETACHED_M31_EDGE
+                      detached31
+#else
+                      u31[i]
+#endif
+                      ),
 #if GOLD_PAIR
                       u61[i],
 #else
@@ -2191,7 +2236,13 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
     // Generate big-word/little-word flag, propagate final carry
     bool biglit0 = frac_bits <= FRAC_BPW_HI;
     wu[i] = carryFinal(wu[i], carry[i], biglit0);
-    u31[i] = U2(shl(make_Z31(wu[i].x), m31_weight_shift0), shl(make_Z31(wu[i].y), m31_weight_shift1));
+    GF31 const next31 = U2(shl(make_Z31(wu[i].x), m31_weight_shift0),
+                           shl(make_Z31(wu[i].y), m31_weight_shift1));
+#if DETACHED_M31_EDGE == 1
+    ((P(GF31)) detach)[(line * NW + i) * G_W + lowMe] = next31;
+#else
+    u31[i] = next31;
+#endif
 #if GOLD_PAIR
     u32 goldOddExponent = goldFwdExponent;
     Z61 const goldFwdWeight1 = advanceGoldForward(
@@ -2220,8 +2271,10 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 #endif
   }
 
+#if !DETACHED_M31_EDGE || DETACHED_M31_EDGE == 2
   fft_WIDTH2(lds31, u31, smallTrig31, WMUL, lowMe);
   writeCarryFusedLine(u31, out31, line, lowMe);
+#endif
 
   dependentLaunch();   // Next kernel will be fftMiddleInGF31
 
@@ -2592,13 +2645,23 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
   readCarryFusedLine(inF2, uF2, line, lowMe);
   fft_WIDTH1(ldsF2 + zerohack, uF2, smallTrigF2 + zerohack, WMUL, lowMe);
 
+#if !DETACHED_M31_EDGE
   readCarryFusedLine(in31, u31, line, lowMe);
   fft_WIDTH1(lds31 + zerohack, u31, smallTrig31 + zerohack, WMUL, lowMe);
+#endif
 
   dependentLaunchWait();   // Previous kernel was fftMiddleOutGF61
 
   readCarryFusedLine(in61, u61, line, lowMe);
   fft_WIDTH1(lds61 + zerohack, u61, smallTrig61 + zerohack, WMUL, lowMe);
+
+#if DETACHED_M31_EDGE
+  // Timing gate for a decoupled exact side transform.  The completed design
+  // supplies this line from an early standalone inverse-width kernel.  Until
+  // that scheduler is attached, the values are deliberately not a correct
+  // transform and this opt-in mode is performance evidence only.
+  readCarryFusedLine(in31, u31, line, lowMe);
+#endif
 
   Word2 wu[NW];
   u32 me_frac_bits = fracBits(lowMe * H * 2);
@@ -2865,7 +2928,9 @@ KERNEL(G_W * WMUL) carryFused(P(T2) out, CP(T2) in, u32 posROE, P(i64) carryShut
 
   dependentLaunch();   // Next kernel will be fftMiddleInFP32
 
+#if !DETACHED_M31_EDGE
   fft_WIDTH2(lds31, u31, smallTrig31, WMUL, lowMe);
+#endif
   writeCarryFusedLine(u31, out31, line, lowMe);
 
   fft_WIDTH2(lds61, u61, smallTrig61, WMUL, lowMe);

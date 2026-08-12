@@ -421,9 +421,11 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
                               "PARITY_LAZY",            // Load expected parity only for residual-risk candidates
                               "FOLD_SYNDROME",          // Sparse-error folded M31 sidecar; 2 enables diagnostic validation
                               "FOLD_TRANSFORM",         // Run the 512K cyclic M31 square on the folded sidecar
-                              "FOLD_FACTOR",            // 8: parity-free 512K fold; 16: parity-assisted 256K fold
+                              "FOLD_FACTOR",            // 4: lifted 1M fold; 8: parity-free 512K; 16: parity-assisted 256K
                               "FOLD_SHAPE",             // 0: 256:4:256, 1: 256:2:512, 2: 512:2:256
+                              "FOLD_ZERO_WIDTH",        // Timing lower bound: omit both side width edges after priming
                               "QUOTIENT_STATS",
+                              "FP32_WIDE_QUOTIENT",      // Sign-magnitude rounding for the full FP32/M61 quotient range
                               "FP32_CMUL64",
                               "FP32_CFMA64",
                               "COEFF_RANGE_STATS",
@@ -455,6 +457,10 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
                               "TABMUL_CHAIN32",
                               "TABMUL_CHAIN61",
                               "ENABLE_BETTER_ONEPAIRSQ", // Alternate M61 pair-square identity in tailsquare.cl
+                              "ENABLE_PARALLEL_ONEPAIRSQ", // Nine-product pair square with independent square chains
+                              "M61_CMUL4",               // Four independent products instead of Karatsuba GF61 multiply
+                              "FULL_MIDDLE_ROOTS61",     // Two coalesced 32-MiB M61 middleMul2 root planes
+                              "DETACHED_M31_EDGE",       // FFT3161: exact external M31 width kernels; FFT323161: timing-only scaffold
                               "MODM31",
                               "LOADS","STORES",
                               "NOREG",                  // CUDA - experimental
@@ -1188,11 +1194,13 @@ class FoldTransform {
   Buffer<double> data;
   EventHolder inputRead;
   bool pending{};
+  bool zeroWidth{};
+  bool primed{};
 
   static u32 foldFactor(Args* args) {
     u32 const factor = args->value("FOLD_FACTOR", 8);
-    if (factor != 8 && factor != 16) {
-      throw runtime_error("FOLD_FACTOR must be 8 or 16");
+    if (factor != 4 && factor != 8 && factor != 16) {
+      throw runtime_error("FOLD_FACTOR must be 4, 8, or 16");
     }
     return factor;
   }
@@ -1206,6 +1214,12 @@ class FoldTransform {
   }
 
   static string fftSpec(Args* args) {
+    if (foldFactor(args) == 4) {
+      if (args->value("FOLD_SHAPE", 0) != 0) {
+        throw runtime_error("FOLD_FACTOR=4 currently requires FOLD_SHAPE=0");
+      }
+      return "52:512:2:512:202";
+    }
     if (foldFactor(args) == 16) {
       if (args->value("FOLD_SHAPE", 0) != 0) {
         throw runtime_error("FOLD_FACTOR=16 currently requires FOLD_SHAPE=0");
@@ -1262,7 +1276,8 @@ public:
                                      height, nh, tailSingleWide)},
     compact{profile.make("foldCompactData"), &queue, factor == 16 ? sideN : 1},
     data{profile.make("foldData"), &queue,
-         TOTAL_DATA_SIZE(fft, width, middle, height, inPlace, padSize)}
+         TOTAL_DATA_SIZE(fft, width, middle, height, inPlace, padSize)},
+    zeroWidth{shared.args->value("FOLD_ZERO_WIDTH", 0) != 0}
   {
 #if CUDA_BACKEND
     // The main M61 path owns the critical integer pipeline.  Let the compact
@@ -1299,13 +1314,17 @@ public:
       inputRead = queue.createSyncEvent();
       kP(data, compact);
     } else {
-      kP(data, input);
+      // Prime the private buffer once so the lower-bound mode still exercises
+      // dense, valid residues.  Subsequent iterations deliberately grant both
+      // width transforms zero cost; this is not a correct side recurrence.
+      if (!zeroWidth || !primed) kP(data, input);
       inputRead = queue.createSyncEvent();
     }
     kMidIn(data, data, 0);
     kTail(data, data, 0);
     kMidOut(data, data, 0);
-    kW(data, data);
+    if (!zeroWidth) kW(data, data);
+    primed = true;
     pending = true;
   }
 
@@ -1369,6 +1388,7 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   K(ktailMulLowGF31,       "tailmul.cl", "tailMulGF31", hN / nH / 2, kernelDefines(K31) + "-DMUL_LOW=1"),
   K(kfftMidOutGF31,        "fftmiddleout.cl", "fftMiddleOutGF31", hN / (BIG_H / SMALL_H), kernelDefines(K31) + numCudaRegisters(MIDOUT31)),
   K(kfftWGF31,             "fftw.cl", "fftWGF31", hN / nW, kernelDefines(K31)),
+  K(kfftWOut31,            "fftw.cl", "fftWOut31", hN / nW, kernelDefines(K31)),
 
   K(kfftMidInR0,           "fftmiddlein.cl", "fftMiddleInGF31", hN / (BIG_H / SMALL_H), kernelDefines(K31) + "-DRIESEL_FIELD=1 " + numCudaRegisters(MIDIN31)),
   K(kfftHinR0,             "ffthin.cl", "fftHinGF31", hN / nH, kernelDefines(K31) + "-DRIESEL_FIELD=1 "),
@@ -1486,7 +1506,11 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   BUF(bufParityExpected, parityPrepared || parityPacked ? (parityPacked ? hN / 32 : hN) : 1),
   parityIn{&bufParityA},
   parityOut{&bufParityB},
-  BUF(bufFolded, foldSyndrome ? N / 8 : 1),
+  // Factor four emits twice as many packed GF31 values as the original
+  // factor-eight fold.  Factor sixteen still uses the N/8 partial fold and
+  // compacts it on the side queue.
+  BUF(bufFolded, foldSyndrome ?
+      N / (args.value("FOLD_FACTOR", 8) == 4 ? 4 : 8) : 1),
   BUF(bufFoldWords, foldValidate ? N : 1),
   BUF(bufFoldMismatches, 1),
 
@@ -1499,6 +1523,9 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   BUF(buf1, TOTAL_DATA_SIZE(fft, WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size)),
   BUF(buf2, TOTAL_DATA_SIZE(fft, WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size)),
   BUF(buf3, TOTAL_DATA_SIZE(fft, WIDTH, fft.shape.middle, SMALL_H, in_place, pad_size)),
+  // One flat GF31 value per coefficient pair for the detached M31 width edge.
+  BUF(bufDetach31, (fft.shape.fft_type == FFT3161 && args.value("DETACHED_M31_EDGE", 0))
+                   ? size_t(WIDTH) * BIG_H : 16),
 #undef BUF
 
   statsBits{u32(args.value("STATS", 0))},
@@ -1553,7 +1580,7 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
   if (args.value("FOLD_FACTOR", 8) == 16 && (!foldTransformEnabled || !parityPacked)) {
     throw std::runtime_error("FOLD_FACTOR=16 requires FOLD_TRANSFORM=1 and PARITY_PACKED=1");
   }
-  if (args.value("FOLD_FACTOR", 8) == 16 && foldValidate) {
+  if (args.value("FOLD_FACTOR", 8) != 8 && foldValidate) {
     throw std::runtime_error("FOLD_SYNDROME=2 validation currently supports only FOLD_FACTOR=8");
   }
   if (args.value("PARITY_PREPARED", 0) && !parityCorrect) {
@@ -1596,6 +1623,28 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
                          "Using two-phase split-carry diagnostic\n");
   }
 
+  // Exact detached M31 width edge: the M31 inverse width runs as fftWGF31
+  // before carryFused and the forward width runs as fftWOut31 after it, both
+  // scheduled inside the M31 bottom half so they hide under the longer M61
+  // chain.  The FFT323161 spelling of DETACHED_M31_EDGE remains the recorded
+  // correctness-disabled timing scaffold; only FFT3161 has the exact producer
+  // and consumer.
+  detachedM31 = fft.shape.fft_type == FFT3161 ? args.value("DETACHED_M31_EDGE", 0) : 0;
+  if (detachedM31) {
+    if (detachedM31 != 1 && detachedM31 != 2) {
+      throw std::runtime_error("DETACHED_M31_EDGE on FFT3161 must be 1 (both widths) or 2 (inverse only)");
+    }
+    if (!in_place || useLongCarry || useMiddleCarry || useSplitCarry ||
+        args.value("GOLD_PAIR", 0) || args.value("L2_STRIPING", 0) ||
+        args.value("GRAPHS", 0)) {
+      throw std::runtime_error(
+        "DETACHED_M31_EDGE on FFT3161 requires in-place, short fused carry, "
+        "no GOLD_PAIR, no L2_STRIPING, and no GRAPHS");
+    }
+    log(detachedM31 == 1 ? "Using exact detached M31 width edge\n"
+                         : "Using exact detached M31 inverse width\n");
+  }
+
   if (fft.FFT_FP64 || fft.FFT_FP32) {
     kfftMidIn.setFixedArgs(3, bufTrigM);
     kfftHin.setFixedArgs(3, bufTrigH);
@@ -1616,6 +1665,7 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
     ktailMulGF31.setFixedArgs(4, bufTrigH);
     kfftMidOutGF31.setFixedArgs(3, bufTrigM);
     kfftWGF31.setFixedArgs(2, bufTrigW);
+    if (detachedM31) kfftWOut31.setFixedArgs(2, bufTrigW);
   }
 
   if (fft.NTT_GF61) {
@@ -1692,6 +1742,11 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
     u32 const statsArg = useGoldWeights ? 7 : 6;
     for (Kernel* k : {&kCarryFusedROE, &kCarryFusedMulROE}) { k->setFixedArgs(statsArg, bufROE); }
     for (Kernel* k : {&kCarryFused, &kCarryFusedMul, &kCarryFusedLL}) { k->setFixedArgs(statsArg, bufStatsCarry); }
+    if (detachedM31) {
+      for (Kernel* k : {&kCarryFused, &kCarryFusedROE, &kCarryFusedMul, &kCarryFusedMulROE, &kCarryFusedLL}) {
+        k->setFixedArgs(statsArg + 1, bufDetach31);
+      }
+    }
   }
 
   if (foldSyndrome) {
@@ -2289,12 +2344,27 @@ void Gpu::replay_one(enum BOTTOM_HALF_KERNELS kern, int cache_group, int arg, Qu
     if (cache_group == 4) { kfftWR0.setQueue(q); kfftWR0(*out, *in); }
     if (cache_group == 5) { kfftWR1.setQueue(q); kfftWR1(*out, *in); }
   }
+
+  // Detached M31 width edge.  Both kernels belong to the GF31 cache group, so
+  // in MULTI_Q mode they land on the main queue where the M31 bottom half runs:
+  // the inverse width (KDETACHA) executes after fftMiddleOutGF31 and overlaps
+  // the longer M61 chain; the forward width (KDETACHB) executes right after the
+  // fused carry that produced its flat input, before the next fftMiddleInGF31.
+  if (kern == KDETACHA) {
+    Buffer<double> const *in = recorded_kernel_args[arg++];
+    if (cache_group == 2) { kfftWGF31.setQueue(q); kfftWGF31(bufDetach31, *in); }
+  }
+
+  if (kern == KDETACHB) {
+    Buffer<double> const *out = recorded_kernel_args[arg++];
+    if (cache_group == 2) { kfftWOut31.setQueue(q); kfftWOut31(*out, bufDetach31); }
+  }
 }
 
 // Advance the index into the array of kernel arguments
 int Gpu::replay_next_arg(enum BOTTOM_HALF_KERNELS kern, int arg) {
 
-  if (kern == KMIDIN || kern == KTAILSQUARE || kern == KMIDOUT) {
+  if (kern == KMIDIN || kern == KTAILSQUARE || kern == KMIDOUT || kern == KDETACHA || kern == KDETACHB) {
     return arg + 1;
   }
 
@@ -2449,6 +2519,10 @@ void Gpu::carryLL(Buffer<Word>& out, Buffer<double>& in) {
 }
 
 void Gpu::carryFused(Buffer<double>& buf) {
+  // Detached M31 edge: replay the exact M31 inverse width at the end of the
+  // M31 bottom half, where it hides under the longer M61 chain and fills
+  // bufDetach31 for the detached fused carry below.
+  if (detachedM31) { recorded_kernels.push_back(KDETACHA); recorded_kernel_args.push_back(&buf); }
   // This kernel always ends the "bottom half".  Replay the recorded kernel calls.
   endBottomHalf();
   // Only foldP reads bufFolded.  Do not serialize the whole shortened
@@ -2484,9 +2558,14 @@ void Gpu::carryFused(Buffer<double>& buf) {
                      : kCarryFused(*out, *in, updateCarryPos(1 << 0));
   }
   if (foldTransformEnabled) foldTransform->launch(queue, bufFolded);
+  // Detached M31 edge: the fused carry wrote flat pre-width M31 residues to
+  // bufDetach31.  Replay the forward width first in the next M31 bottom half,
+  // ahead of fftMiddleInGF31 which consumes its output.
+  if (detachedM31 == 1) { recorded_kernels.push_back(KDETACHB); recorded_kernel_args.push_back(&buf); }
 }
 
 void Gpu::carryFusedMul(Buffer<double>& buf) {
+  if (detachedM31) { recorded_kernels.push_back(KDETACHA); recorded_kernel_args.push_back(&buf); }
   // This kernel always ends the "bottom half".  Replay the recorded kernel calls.
   endBottomHalf();
   // Like fftP, if not in place write the output to the scratch buffer
@@ -2495,9 +2574,11 @@ void Gpu::carryFusedMul(Buffer<double>& buf) {
   assert(roePos <= ROE_SIZE);
   roePos < wantROE ? kCarryFusedMulROE(*out, *in, roePos++)
                    : kCarryFusedMul(*out, *in, updateCarryPos(1 << 1));
+  if (detachedM31 == 1) { recorded_kernels.push_back(KDETACHB); recorded_kernel_args.push_back(&buf); }
 }
 
 void Gpu::carryFusedLL(Buffer<double>& buf) {
+  if (detachedM31) { recorded_kernels.push_back(KDETACHA); recorded_kernel_args.push_back(&buf); }
   // This kernel always ends the "bottom half".  Replay the recorded kernel calls.
   endBottomHalf();
   // Like fftP, if not in place write the output to the scratch buffer
@@ -2513,6 +2594,7 @@ void Gpu::carryFusedLL(Buffer<double>& buf) {
   } else {
     kCarryFusedLL(*out, *in, updateCarryPos(1 << 0));
   }
+  if (detachedM31 == 1) { recorded_kernels.push_back(KDETACHB); recorded_kernel_args.push_back(&buf); }
 }
 
 void Gpu::carryMiddle(Buffer<Word>& packed, Buffer<double>& buf) {

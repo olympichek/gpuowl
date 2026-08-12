@@ -40,6 +40,20 @@ endif()
 
 target_include_directories(prpll PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
+add_executable(rns31-test
+  RNS31.cpp
+  rns31_test.cpp
+  )
+
+add_test(NAME rns31-reference COMMAND rns31-test)
+
+add_executable(carry-transfer-test
+  CarryTransfer.cpp
+  carry_transfer_test.cpp
+  )
+
+add_test(NAME carry-transfer-reference COMMAND carry-transfer-test)
+
 add_custom_command(
   OUTPUT version.inc
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}

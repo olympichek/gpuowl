@@ -218,7 +218,11 @@ KERNEL(IN_WG) fftMiddleInGF61(P(T2) out, CP(T2) in, u32 base, Trig trig) {
 
   readMiddleInLine(u, in61, y, x);
 
+#if FULL_MIDDLE_ROOTS61
+  middleMul2FullIn(u, x, y, trig61);
+#else
   middleMul2(u, x, y, trig61);
+#endif
 
   fft_MIDDLE_IN(u);
 
@@ -504,7 +508,11 @@ KERNEL(256) fftMiddleInGF61(P(T2) out, P(T2) in, u32 base, Trig trig) {
 
   readMiddleInLine(u, in61, y, x);
 
+#if FULL_MIDDLE_ROOTS61
+  middleMul2FullIn(u, x, y, trig61);
+#else
   middleMul2(u, x, y, trig61);
+#endif
 
   fft_MIDDLE_IN(u);
 

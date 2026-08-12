@@ -1118,6 +1118,32 @@ void OVERLOAD middleMul2(GF61 *u, u32 x, u32 y, TrigGF61 trig) {
   }
 }
 
+#if FULL_MIDDLE_ROOTS61
+
+#define MIDDLE_TRIG_GF61_BASE (SMALL_HEIGHT * (MIDDLE - 1) + WIDTH + SMALL_HEIGHT)
+#define FULL_MIDDLE_GF61_PLANE (MIDDLE * WIDTH * SMALL_HEIGHT)
+
+void middleMul2FullIn(GF61 *u, u32 x, u32 y, TrigGF61 trig) {
+  TrigGF61 full = trig + MIDDLE_TRIG_GF61_BASE;
+  for (u32 k = 0; k != MIDDLE; ++k) {
+    u32 const index = (k * SMALL_HEIGHT + y) * WIDTH + x;
+    u[k] = cmul(u[k], TFLOAD(&full[index]));
+  }
+}
+
+void middleMul2FullOut(GF61 *u, u32 x, u32 y, TrigGF61 trig) {
+  TrigGF61 full = trig + MIDDLE_TRIG_GF61_BASE + FULL_MIDDLE_GF61_PLANE;
+  for (u32 k = 0; k != MIDDLE; ++k) {
+    u32 const index = (k * WIDTH + x) * SMALL_HEIGHT + y;
+    u[k] = cmul(u[k], TFLOAD(&full[index]));
+  }
+}
+
+#undef FULL_MIDDLE_GF61_PLANE
+#undef MIDDLE_TRIG_GF61_BASE
+
+#endif
+
 // Do a partial transpose during fftMiddleIn/Out
 void OVERLOAD middleShuffle(local Z61 *lds, GF61 *u, u32 workgroupSize, u32 blockSize) {
   u32 me = get_local_id(0);

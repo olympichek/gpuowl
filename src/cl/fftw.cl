@@ -79,6 +79,30 @@ KERNEL(G_W) fftWGF31(P(T2) out, CP(T2) in, Trig smallTrig) {
   write(G_W, NW, u, out31, 0);
 }
 
+#if DETACHED_M31_EDGE
+
+// The forward half of the detached M31 width edge.  The detached carryFused
+// writes weighted pre-width GF31 residues flat (one WIDTH-sized block per
+// line); this kernel applies the forward width transform and produces the
+// standard carry-fused line layout expected by fftMiddleInGF31.
+KERNEL(G_W) fftWOut31(P(T2) out, CP(T2) in, Trig smallTrig) {
+  local GF31 lds[LDS_BYTES / sizeof(GF31)];
+
+  CP(GF31) in31 = (CP(GF31)) in;    // Flat detach buffer, no field offset
+  P(GF31) out31 = (P(GF31)) (out + DISTGF31);
+  TrigGF31 smallTrig31 = (TrigGF31) (smallTrig + DISTWTRIGGF31);
+
+  GF31 u[NW];
+  u32 g = get_group_id(0);
+  u32 me = get_local_id(0);
+
+  read(G_W, NW, u, in31 + WIDTH * g, 0);
+  fft_WIDTH2(lds, u, smallTrig31, 1, me);
+  writeCarryFusedLine(u, out31, g, me);
+}
+
+#endif
+
 #endif
 
 

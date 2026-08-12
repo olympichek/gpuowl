@@ -287,6 +287,9 @@ typedef ulong2 GF61;        // A complex value using two Z61s.  For a GF(M61^2) 
 #ifndef GOOD_THOMAS9
 #define GOOD_THOMAS9    0
 #endif
+#ifndef DETACHED_M31_EDGE
+#define DETACHED_M31_EDGE 0
+#endif
 #if RIESEL_FIELD == 1
 #undef DISTGF31
 #undef DISTWTRIGGF31
