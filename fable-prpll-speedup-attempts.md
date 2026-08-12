@@ -1286,3 +1286,34 @@ chained powers (middleMul pattern), (4) new shape plumbing
 (FFTConfig/Gpu.cpp) behind a -use/shape flag, (5) exact 2k/100k gates
 then A/B vs 142.8.  Estimated prize: deletes 2 of 6 boundary round trips
 (~96 MiB/iter both fields) + 4 kernel launches -> 5-12 us/iter.
+
+### Power-aware codegen: literature survey (web agent, 2026-08-12)
+
+Full survey in the session transcript.  Essence: (1) NOBODY has published
+instruction-selection-level power optimization on a modern NVIDIA ISA —
+the field tunes caps/clocks/configs around fixed binaries; our observed
+JIT-version perf-at-cap deltas sit in unpublished territory, directly
+validated by Yoshida et al. 2024 (identical source, different toolchains
+-> measurable power/energy differences, SASS-diff-explainable;
+S016781912400019X).  (2) Mechanisms confirmed real: ~40% power swings
+from operand toggle rates alone (arXiv:2409.18324; CUTLASS benchmarking
+guidelines concede it), register file = largest SM dynamic-power block,
+ptxas `.reuse`-flag/bank-conflict scheduling differs across versions.
+(3) OUR SETUP IS UNIQUELY FAVORABLE: at a hard 600 W cap with a
+saturating kernel, sustained clock IS the joules-per-cycle sensor
+(~0.1% SNR over minutes), sidestepping the NVML ~25%-duty sampling
+problem that plagues the field (SC'24 GPU_Power_Benchmark).  (4) No
+per-instruction energy table exists for any Blackwell part — building
+one would be novel.  Expected magnitude: low-single-digit % power ->
+~1-3% perf via the P^0.31 exponent.
+
+Planned experiments (successor session): (E1) in-situ "clock-cost
+table" — NVRTC microkernels with controlled SASS mixes (IADD3 / LOP3 /
+SHF / IMAD / IMAD.MOV-as-copy; high- vs low-toggle operands), 60-120 s
+each at the cap, sustained MHz + nvmlDeviceGetTotalEnergyConsumption as
+observables, cuobjdump-verified SASS (~a day).  (E2) SASS-diff the
+NVRTC 13.0-vs-13.2 pair (already measured at -1.4 us) along the table's
+axes (opcode classes, .reuse density, unroll) to convert the anomaly
+into a causal, deliberately pullable lever.  Combined with the
+two-stage backend (5-12 us), a software-only path to 135 on THIS box is
+arithmetically plausible again: 142.8 - (5..12) - (1..3)% ~ 128-137.
