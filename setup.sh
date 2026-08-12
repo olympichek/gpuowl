@@ -112,6 +112,19 @@ else
   git clone --branch "$BRANCH" "$REPO_URL" "$TARGET"
 fi
 
+# --- 3b. Clock V-f offset probe (query-only; setting needs root) ------------
+# Server-edition vBIOSes report range [0,0] = fused off; an unlocked board is
+# worth ~-0.061 us/MHz on the production workload (the #1 reopen condition).
+if command -v gcc >/dev/null && [ -f "$TARGET/src/cuda/clkoff.c" ]; then
+  TMPC=$(mktemp -d)
+  if gcc -I/usr/local/cuda/include -o "$TMPC/clkoff" "$TARGET/src/cuda/clkoff.c" -lnvidia-ml 2>/dev/null; then
+    echo "clock V-f offset:           $("$TMPC/clkoff" 2>/dev/null | head -1 || echo "query failed")"
+  else
+    echo "clock V-f offset:           probe skipped (clkoff build failed)"
+  fi
+  rm -rf "$TMPC"
+fi
+
 # --- 4. Unpack previous-box artifacts (logs/configs), if provided ----------
 ZIPFILE="$(ls -1 "$SCRIPT_DIR"/prpll-campaign-artifacts-*.zip 2>/dev/null | head -1 || true)"
 if [ -n "$ZIPFILE" ]; then
@@ -160,9 +173,11 @@ if [ "${SKIP_VALIDATE:-0}" != "1" ]; then
     if (n) printf "samples=%d  mean power=%.0f W  SM clock mean=%d MHz (min %d, max %d)\n", n, pw/n, ck/n, mn, mx
     else print "no under-load samples captured (run too short for 1-s sampling)"
   }' "$RUNDIR/telemetry.csv"
-  echo "References: 300 W Max-Q 201.5 us @1552 MHz; 600 W WSE 137-138 us cool /"
-  echo "  148.9 us thermal-steady @2210 MHz.  Model: t(f) ~ 6.0 us + 315842/f_MHz."
-  echo "  (5M-iteration reference residue: 7eca65291732df02.)"
+  echo "References: 300 W Max-Q 201.5 us; 600 W WSE 148.9 us @2210 MHz;"
+  echo "  600 W Server GB202 (driver 595, NVRTC 13.2) 142-143 us @2313 MHz."
+  echo "  Model (Server box): t(f) ~ 5.16 us + 325116/f_MHz.  Best exact config:"
+  echo "  production -use line + LD_LIBRARY_PATH=<cuda-13.2>/lib64 (NVRTC 13.2)."
+  echo "  (5M-iteration reference residue: 7eca65291732df02; 1M: 52b03a7cc55e677d.)"
   [ "$FAIL" = 0 ] || exit 1
 fi
 
@@ -171,25 +186,27 @@ cat <<'EON'
 == Setup complete ==
 Read the campaign ledgers BEFORE any new experiment:
     sol-prpll-speedup-attempts.md    - registry of ~95 rejected designs
-    fable-prpll-speedup-attempts.md  - 600 W phase, scaling model, gate closures
+    fable-prpll-speedup-attempts.md  - 600 W phase + Server-box phase:
+      scaling model, ECC/driver findings, E1 clock-cost table, E2 compiler
+      closure, two-stage backend, terminal state 142-143 us
 
-The software/tune space is closed (see "Updated campaign boundary (600 W)").
-What THIS box can newly unlock depends on the hardware-control probe above:
+CAMPAIGN STATE (2026-08-12, Server GB202 terminal): every software channel
+is closed end-to-end; 142-143 us stands.  What a NEW box can reopen — check
+the hardware-control probe output above against these recorded conditions:
 
-  1. power-limit control (-pl): run the direct power sweep the 300/600 W boxes
-     could not: for PL in 150..max step 50, fresh-dir 200k+ production run to
-     thermal steady state with 1-s telemetry; record us/iter, sustained clock,
-     us*W (energy/iter).  Deliverables: perf(PL) curve vs the P^0.49 model and
-     the perf/W knee (fleet operating point).  Then map two-worker aggregate
-     (-prps 136279841,136279879 -workers 2) across the same PLs to find its
-     break-even (needs f_2w/f_1w >= 0.914; it was 0.840 at 600 W).
-  2. clock locking (-lgc): validate t(f) = 6.0 + 315842/f directly at fixed
-     clocks (decouples the V/f governor); measure iso-clock power of one vs
-     two workers to separate work-density from voltage effects.
-  3. NCU counters: profile the M61 tail/middle kernels for stall reasons
-     during production co-run — the last open software route (an invisible
-     intra-kernel stall).  Start: ncu --set full on tailSquareGF61 /
-     fftMiddleOutGF61 with production -use flags.
+  1. clock V-f offset UNLOCKED (range wider than [0,0]): the biggest lever.
+     Ladder +60/+120/+150/+180 via `sudo clkoff <MHz>` with a 100k residue
+     gate each (52775eea4730be87), 1M confirm at best stable
+     (52b03a7cc55e677d).  Worth ~-0.061 us/MHz (~-3.6 us at +60).
+  2. power cap above 600 W: production was cap-bound at 600 W / 2313 MHz;
+     1 W ~ +1.37 MHz ~ -0.083 us near that point.  Re-check the two-worker
+     break-even there (f_2w/f_1w >= 0.914 needed; 0.84-0.98 seen so far).
+  3. driver / ptxas major bump: re-run `e2ab.sh` + `e2stats.py` (~30 min)
+     — each new JIT re-rolls carryFused's schedule (13.0->13.2 was -1.4 us).
+     NVRTC newer than the driver JIT accepts: set PRPLL_PTX_VERSION=9.2.
+  4. new silicon: re-run the E1 power table (`src/cuda/clockcost.cu`,
+     `e1run.sh`) to re-price the power channel; >=2x register file per SM
+     or >=96-KiB static shared reopens the two-stage backend (TWO_STAGE=1).
 Record everything in fable-prpll-speedup-attempts.md (matched alternating
 runs, residues at every checkpoint; commit with "Record ..." messages).
 EON
