@@ -1227,3 +1227,23 @@ groups; Sol's transfer-function constancy shortcuts the CHAIN, but the
 VALUES still need one hop, which is exactly what the shuttle is).
 **Approach A closed by measurement; the upstream carry architecture is
 vindicated.**
+
+### Approach B: layout co-design for resident fusion — closed by physics gate
+
+[`src/cuda/pairtile_dsm_bench.cu`](src/cuda/pairtile_dsm_bench.cu) isolates
+the load/scatter physics on the production 16-width-interleaved layout:
+linear bound 4.5 us / direct pair-column gather 9.9 us / 8-block cluster
+with DSM scatter 166.3 us (17x WORSE than direct).  Conclusions: (1) the
+cluster-DSM route is dead — the scatter fabric costs far more than the
+coalescing it buys, consistent with every DSM result in Sol's record;
+(2) the 16x sector amplification that was blamed for FUSED31's loss is
+largely L2-absorbed under concurrent full-plane streaming (9.9 vs 4.5) —
+FUSED31's +25 us was dominated by its structural 1-block/SM residency and
+serialized pair rounds, which no layout change addresses; (3) the
+carryFused-side layout inversion is closed analytically: the h-major
+layout a fused reader wants makes carryFused's line-parallel writes fully
+scattered — the transpose must happen somewhere, and the existing 16-wide
+block-swizzle interleave IS the optimal compromise between the two access
+patterns.  **Approach B closed.  With approaches A and B both measured
+out, the architectural idea space of this codebase on this hardware is
+exhausted end to end.**
