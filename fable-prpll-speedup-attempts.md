@@ -662,12 +662,15 @@ shortlist:
    M31-side work reduction is paid back at the dilated co-run rate, not
    zero.  First gate: extend `q24_m61_overlap_bench.cu` with generic
    twiddle products + CF weights, matched alternation (hours-day).
-3. **M31 co-run price calibration probe (cheap enabler).**  The "hidden
-   M31" decision rule priced all M31-side savings at zero; Sol's own data
-   (M31 raises the M61 path 111.9 -> 129.6 us) contradicts it.  A
-   correctness-off thinned-M31-tail run calibrates us-of-iteration per
-   us-of-M31-kernel-removed (~1 h), re-pricing q24 and any future M31-side
-   idea.
+3. **M31 co-run price: derived, probe deprioritized.**  The "hidden M31"
+   decision rule priced all M31-side savings at zero; Sol's own data
+   contradicts it, and the payback coefficient can be DERIVED from the
+   registry without a new run: the detached-edge scaffold bought 18.8 us
+   end-to-end for ~22-26 us of isolated M31 width work deleted, and the
+   dilation data (65.6 us isolated -> ~108 us co-run) brackets the same
+   quantity.  **Price M31-side deletions at ~0.7-0.9x payback.**  The
+   correctness-off thinning probe adds little and is parked at lowest
+   priority (user call, 2026-08-12).
 4. **TAIL_TRIGS61 generate-vs-load (cheap, new).**  Cross-checking the
    audit's "twiddle generation no-go overgeneralization" flag against the
    code: the GF61/GF31 tails default to READING all trig values from
@@ -692,9 +695,13 @@ shortlist:
    Needs a memory-realistic tile gate (1-2 days).
 8. **Near-M61 radix-33 (LOW-MED)** — same invalid ALU-chain pricing, but
    corrected pricing must net under 4.6 us; likely still rejects (0.5-1 d).
-9. **Batch-native M61 AoSoA (conditional)** — robust for the 180-us gate,
-   but its aggregate-throughput question was never closed; reopen only if
-   the two-worker map shows aggregate gains at some power point.
+9. **Batch-native M61 AoSoA (condition now resolved: stays closed here).**
+   Robust for the 180-us gate, but its aggregate-throughput question was
+   never closed by Sol.  The two-worker map (below) answers the condition:
+   aggregate deltas are -11.3/-7.7/-5.3/-0.1% at 300/400/500/600 W —
+   parity at this board's ceiling, never a gain.  Reopen batch-native (and
+   two workers) only on a >600 W or multi-GPU host, where the monotonic
+   trend implies a positive sign.
 
 Flags that DISSOLVE on cross-check: the 9-vs-10-product pair-square
 closures (noise-level as recorded, but re-closed decisively by this
@@ -712,6 +719,30 @@ lean on one sub-noise number (the 1.28-us radix-9 core delta feeding the
 PFA33 bound) — their margins survive 3x error, so no action; (iii) the 3M
 hybrid scaffold (185.6 us "budget") is confirmed as the F5 exemplar: a
 false POSITIVE that consumed the campaign's largest wasted effort.
+
+### Two-worker break-even map across power points — MEASURED
+
+`-prps 136279841,136279879 -workers 2` (TAIL_KERNELS=2 default), 200k per
+exponent per power point, telemetry per run; residues exact and identical
+across all points (e1's 200k residue matches the 1-worker sweep run):
+
+| PL | 2w us/iter (e1/e2) | 2w SM MHz | 2w agg it/s | 1w it/s | delta |
+|---:|---|---:|---:|---:|---:|
+| 300 W | 486.2 / 485.2 | 1326 | 4,118 | 4,641 | -11.3% |
+| 400 W | 395.5 / 395.7 | 1636 | 5,056 | 5,476 | -7.7% |
+| 500 W | 345.1 / 344.7 | 1877 | 5,798 | 6,120 | -5.3% |
+| 600 W | 307.1 / 306.9 | 2133 | 6,515 | 6,522 | **-0.1%** |
+
+- **The break-even sits exactly at this board's 600 W ceiling**: the
+  two-worker clock ratio f_2w/f_1w = 2133/2338 = 0.912 lands at the 0.914
+  break-even threshold derived on the Workstation box.  The registry's
+  prediction ("on a still-higher-ceiling board the sign plausibly flips")
+  is confirmed and sharpened: parity at 600 W, monotonic improvement with
+  power (-11.3 -> -0.1%), so any >600 W or multi-GPU host tips positive.
+- At the per-watt optimum (300 W) two workers cost -11.3%: efficiency
+  fleets run one worker per capped card.  This box's map also beats the
+  Workstation's single 600 W point (-8.1% there vs -0.1% here at equal
+  power) — better cooling retains more clock under doubled residency.
 
 ## Experiment log
 
