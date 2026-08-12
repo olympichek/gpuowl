@@ -480,7 +480,9 @@ string clDefines(Args& args, cl_device_id id, FFTConfig fft, const vector<KeyVal
                               "MIDCARRY_FUSED",         // Two-phase middle/width/carry fusion for CUDA FFT3161
                               "GRAPHS",
                               "L1CUDA",
-                              "L2_PERSIST"              // CUDA persisting-L2 window for the largest trig table
+                              "L2_PERSIST",             // CUDA persisting-L2 window for the largest trig table
+                              "ASYNC_MID61",            // cp.async tile-looped fftMiddleOutGF61: 1=full staging, 2=half
+                              "ASYNC_TILES"             // Tiles per group for ASYNC_MID61 (default 4)
                             });
     if (!isValid) {
       log("Warning: unrecognized -use key '%s'\n", k.c_str());
@@ -1430,7 +1432,7 @@ Gpu::Gpu(GpuCommon s, FFTConfig fft, u64 E, const vector<KeyVal>& extraConf, boo
                                                hN / nH / 2, kernelDefines(K61) + numCudaRegisters(TAIL61)),  // Single-wide tailSquare with one kernel
   K(ktailMulGF61,          "tailmul.cl", "tailMulGF61", hN / nH / 2, kernelDefines(K61)),
   K(ktailMulLowGF61,       "tailmul.cl", "tailMulGF61", hN / nH / 2, kernelDefines(K61) + "-DMUL_LOW=1"),
-  K(kfftMidOutGF61,        "fftmiddleout.cl", "fftMiddleOutGF61", hN / (BIG_H / SMALL_H), kernelDefines(K61) + numCudaRegisters(MIDOUT61)),
+  K(kfftMidOutGF61,        "fftmiddleout.cl", "fftMiddleOutGF61", hN / (BIG_H / SMALL_H) / (args.value("ASYNC_MID61", 0) ? args.value("ASYNC_TILES", 4) : 1), kernelDefines(K61) + numCudaRegisters(MIDOUT61), 0, args.value("ASYNC_MID61", 0) ? 100 : 0),
   K(kfftWGF61,             "fftw.cl", "fftWGF61", hN / nW, kernelDefines(K61)),
 
   K(kfftP,                 "fftp.cl", "fftP", hN / nW, kernelDefines(KALL)),

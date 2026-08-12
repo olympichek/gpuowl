@@ -474,6 +474,83 @@ KERNEL(256) fftMiddleOutGF31(P(T2) out, P(T2) in, u32 base, Trig trig) {
 
 #if NTT_GF61
 
+#if ASYNC_MID61 && INPLACE == 1 && !L2_STRIPING
+
+// Tile-looped variant: the host launches 1/ASYNC_TILES of the usual groups;
+// each group walks ASYNC_TILES tiles with g strided by the grid size, and
+// prefetches the next tile's middle values [ASYNC_FIRST61..MIDDLE) into a
+// shared staging buffer with cp.async while the current tile computes.
+// ASYNC_MID61=1 stages all MIDDLE values; =2 stages the top half only
+// (smaller staging buffer preserves more blocks/SM).  The grid stride is a
+// multiple of N = SMALL_HEIGHT/16, so startx (hence x and the middleMul
+// trig row) is constant across a group's tiles.
+#if ASYNC_MID61 == 1
+#define ASYNC_FIRST61 0
+#else
+#define ASYNC_FIRST61 (MIDDLE / 2)
+#endif
+
+KERNEL(256) fftMiddleOutGF61(P(T2) out, P(T2) in, u32 base, Trig trig) {
+  assert(out == in);
+  GF61 u[MIDDLE];
+
+  P(GF61) in61 = (P(GF61)) (in + DISTGF61);
+  P(GF61) out61 = (P(GF61)) (out + DISTGF61);
+  TrigGF61 trig61 = (TrigGF61) (trig + DISTMTRIGGF61);
+
+  u32 me = get_local_id(0);
+  u32 N = SMALL_HEIGHT / 16;
+  u32 GRID = get_num_groups(0);
+  u32 tiles = (WIDTH / 16) * N / GRID;
+  u32 g0 = get_group_id(0);
+  assert(GRID % N == 0);
+
+  local GF61 stage[(MIDDLE - ASYNC_FIRST61) * 256];
+  local GF61 lds[256];
+
+  u32 x = g0 % N * 16 + me % 16;
+
+  asyncReadMiddleOutLine((local T2 *) stage, (CP(T2)) in61, g0 / N * 16 + me / 16, x, me, ASYNC_FIRST61);
+
+  dependentLaunchWait();   // Previous kernel was tailSquareGF61 that launched dependents before writing GF61 data
+
+  for (u32 t = 0; t < tiles; ++t) {
+    u32 g = g0 + t * GRID;
+    u32 y = g / N * 16 + me / 16;
+
+#if ASYNC_MID61 >= 2
+    readMiddleOutLinePrefix((T2 *) u, (CP(T2)) in61, y, x, ASYNC_FIRST61);
+#endif
+
+    CP_ASYNC_WAIT_ALL();
+    for (u32 i = ASYNC_FIRST61; i < MIDDLE; ++i) { u[i] = stage[(i - ASYNC_FIRST61) * 256 + me]; }
+
+    if (t + 1 < tiles) {
+      asyncReadMiddleOutLine((local T2 *) stage, (CP(T2)) in61, (g + GRID) / N * 16 + me / 16, x, me, ASYNC_FIRST61);
+    }
+
+    middleMul(u, x, trig61);
+
+    fft_MIDDLE_OUT(u);
+
+#if FULL_MIDDLE_ROOTS61
+    middleMul2FullOut(u, y, x, trig61);
+#else
+    middleMul2(u, y, x, trig61);
+#endif
+
+    middleShuffle(lds, u);
+
+    writeMiddleOutLine(out61, u, y, x);
+  }
+
+  dependentLaunch();       // Next kernel will be carryfused which must dependentLaunchWait before reading data
+}
+
+#undef ASYNC_FIRST61
+
+#else
+
 KERNEL(256) fftMiddleOutGF61(P(T2) out, P(T2) in, u32 base, Trig trig) {
   assert(out == in);
   GF61 u[MIDDLE];
@@ -522,6 +599,8 @@ KERNEL(256) fftMiddleOutGF61(P(T2) out, P(T2) in, u32 base, Trig trig) {
 
   writeMiddleOutLine(out61, u, y, x);
 }
+
+#endif
 
 #endif
 

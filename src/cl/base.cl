@@ -767,6 +767,23 @@ void PREFETCHL2(const __global void *addr) {
 #endif
 }
 
+// Asynchronous 16-byte global->shared copy (cp.async, sm_80+).  Used by the
+// ASYNC_MID61 tile-looped fftMiddleOutGF61 to prefetch the next tile's
+// middle values into shared memory while the current tile computes.  The
+// .cg flavor bypasses L1, matching the L2LOAD policy of FFT data loads.
+#if HAS_PTX >= 800
+void CP_ASYNC16(local void *dst, const __global void *src) {
+  __asm volatile("{\n\t"
+                 ".reg .u64 d64, s64;\n\t"
+                 "cvta.to.shared.u64 d64, %0;\n\t"
+                 "cvta.to.global.u64 s64, %1;\n\t"
+                 "cp.async.cg.shared.global [d64], [s64], 16;\n\t"
+                 "}" : : "l"(dst), "l"(src));
+}
+void CP_ASYNC_COMMIT() { __asm volatile("cp.async.commit_group;" : : : "memory"); }
+void CP_ASYNC_WAIT_ALL() { __asm volatile("cp.async.wait_group 0;" : : : "memory"); }
+#endif
+
 #if FFT_FP64
 void OVERLOAD read(u32 WG, u32 N, T2 *u, const global T2 *in, u32 base) {
   in += base + (u32) get_local_id(0);

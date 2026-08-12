@@ -1150,6 +1150,13 @@ void cudaSetKernelDynamicShared(cl_kernel kernel, unsigned bytes) {
   kernel->dynamicSharedBytes = bytes;
 }
 
+// Set the preferred shared-memory carveout (percent) for one kernel
+void cudaSetKernelSharedCarveout(cl_kernel kernel, int pct) {
+  ensureContextCurrent();
+  CU_CHECK(cuFuncSetAttribute(
+    kernel->func, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, pct));
+}
+
 void cudaSetL1Config(int x) {
   ensureContextCurrent();
   cuCtxSetCacheConfig (x == 0 ? CU_FUNC_CACHE_PREFER_NONE :            // no preference for shared memory or L1 (default)

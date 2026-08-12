@@ -843,6 +843,36 @@ tailSquareGF61 only cosmetic IADD3->IADD spellings; carryFused +16 of
   under 595.84 first — the firmware change shrank the very stalls it
   targets).
 
+### cp.async middle-prefetch MVP — IMPLEMENTED, exact, and CLOSED negative
+
+Implemented per the GO design (`-use ASYNC_MID61=1/2[,ASYNC_TILES=n]`,
+default off): tile-looped fftMiddleOutGF61 with cp.async staging
+(base.cl CP_ASYNC16/COMMIT/WAIT primitives; middle.cl
+asyncReadMiddleOutLine; per-kernel 100% shared carveout via new
+`cudaSetKernelSharedCarveout`).  Both arms residue-exact at every
+checkpoint on the first build (the same-thread staging needs no barriers).
+Alternating 3-round 100k A/B at 600 W on driver 595.84:
+
+| arm | design | d vs control (145.2 warm) |
+|---|---|---:|
+| ASYNC_MID61=1 | full 32-KiB stage, 2 blocks/SM | **+4.55 us** |
+| ASYNC_MID61=2 | half stage + direct prefix | +20.3 us |
+| =1, ASYNC_TILES=8 | 128-block grid | +27 us (SM starvation) |
+
+Mechanism: (i) per-tile direct loads serialize latency exposure (A2);
+(ii) the full pipeline works structurally but halves resident blocks, and
+in production the M31 co-run stream was ALREADY backfilling the middles'
+latency stalls — the isolated NCU profile's idle-issue slack is consumed
+by the other queue, so intra-kernel hiding buys nothing while the
+occupancy cost is real.  This is the saturation model's "no idle
+execution reservoir" expressed at warp granularity, now measured directly.
+The one untested permutation (6-of-8 staging at 3 blocks/SM) is bounded
+by the same trade and not worth its complexity.  **Code retained as
+opt-in evidence; default path untouched.  Lesson for the registry: NCU
+isolated-kernel latency slack is NOT exploitable for co-run kernels —
+only the serial carryFused's slack is real, and its occupancy is
+register-bound (closed).  The counters route is now fully walked.**
+
 ### Audit shortlist status update (post-inventory)
 
 The three flagged benches (q24 overlap, resident tile, radix-7) were

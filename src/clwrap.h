@@ -105,6 +105,10 @@ EventHolder run(cl_queue queue, cl_kernel kernel, size_t groupSizeX, size_t work
 
 #ifdef CUDA_BACKEND
 void cudaSetKernelDynamicShared(cl_kernel kernel, unsigned bytes);
+// Per-kernel preferred shared-memory carveout hint (percent of the unified
+// L1/shared budget).  Lets a shared-heavy kernel (e.g. ASYNC_MID61 staging)
+// get the maximum carveout without changing the context-wide L1CUDA policy.
+void cudaSetKernelSharedCarveout(cl_kernel kernel, int pct);
 // Recreate a newly constructed command queue at CUDA's highest (positive) or
 // lowest (negative) stream priority.  No work may have been submitted yet.
 void cudaSetQueuePriority(cl_queue queue, int priority);

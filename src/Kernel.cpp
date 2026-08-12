@@ -6,7 +6,7 @@
 
 Kernel::Kernel(string_view name, KernelCompiler* compiler, TimeInfo* timeInfo, Queue* queue,
        string_view fileName, string_view nameInFile,
-       size_t workSize, string_view defines, u32 dynamicSharedBytes):
+       size_t workSize, string_view defines, u32 dynamicSharedBytes, int sharedCarveoutPct):
   name{name},
   compiler{compiler},
   fileName{fileName},
@@ -16,7 +16,8 @@ Kernel::Kernel(string_view name, KernelCompiler* compiler, TimeInfo* timeInfo, Q
   queue{queue},
   workSizeX{workSize},
   workSizeY{1},
-  dynamicSharedBytes{dynamicSharedBytes}
+  dynamicSharedBytes{dynamicSharedBytes},
+  sharedCarveoutPct{sharedCarveoutPct}
 {}
 
 Kernel::~Kernel() = default;
@@ -35,6 +36,7 @@ void Kernel::finishLoad() {
   groupSize = getWorkGroupSize(kernel.get(), deviceId, name.c_str());
 #ifdef CUDA_BACKEND
   if (dynamicSharedBytes) cudaSetKernelDynamicShared(kernel.get(), dynamicSharedBytes);
+  if (sharedCarveoutPct) cudaSetKernelSharedCarveout(kernel.get(), sharedCarveoutPct);
 #endif
   assert(groupSize);
   assert(workSizeX % groupSize == 0);

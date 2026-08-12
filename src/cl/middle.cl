@@ -854,6 +854,25 @@ void OVERLOAD writeMiddleOutLine (P(T2) out, T2 *u, u32 y, u32 x)
   for (i32 i = 0; i < MIDDLE; ++i) { FFTSTORE(&out[i * SIZEM], u[i]); }
 }
 
+#if ASYNC_MID61
+// cp.async staging of middle values [first..MIDDLE) for the tile-looped
+// fftMiddleOutGF61.  Same addressing as readMiddleOutLine.  Stage slot
+// (i-first)*256+me is written and read only by thread me, so no barrier is
+// needed: cp.async.wait_group orders the data for the issuing thread, and
+// same-thread WAR across tiles is ordered by program order.
+void asyncReadMiddleOutLine(local T2 *stage, CP(T2) in, u32 y, u32 x, u32 me, u32 first) {
+  in += (y / 16 * SIZEW) + (y % 16 * SIZEBLK) + (SWIZ(y % 16, x / 16) * 16) + (x % 16);
+  for (u32 i = first; i < MIDDLE; ++i) { CP_ASYNC16(&stage[(i - first) * 256 + me], &in[i * SIZEM]); }
+  CP_ASYNC_COMMIT();
+}
+
+// Plain loads of the unstaged prefix [0..count) (half-staging mode)
+void readMiddleOutLinePrefix(T2 *u, CP(T2) in, u32 y, u32 x, u32 count) {
+  in += (y / 16 * SIZEW) + (y % 16 * SIZEBLK) + (SWIZ(y % 16, x / 16) * 16) + (x % 16);
+  for (u32 i = 0; i < count; ++i) { u[i] = FFTLOAD(&in[i * SIZEM]); }
+}
+#endif
+
 #endif
 
 

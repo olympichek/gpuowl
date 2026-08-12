@@ -28,6 +28,7 @@ class Kernel {
   size_t workSizeY;
   u32 groupSize = 0;
   u32 dynamicSharedBytes = 0;
+  int sharedCarveoutPct = 0;
   
   KernelHolder kernel;
   std::future<KernelHolder> pendingKernel;
@@ -39,7 +40,7 @@ public:
          TimeInfo* timeInfo, Queue* queue,
          string_view fileName, string_view nameInFile,
          size_t workSize, string_view defines = "",
-         u32 dynamicSharedBytes = 0);
+         u32 dynamicSharedBytes = 0, int sharedCarveoutPct = 0);
 
   ~Kernel();
 
