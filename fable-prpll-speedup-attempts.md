@@ -427,6 +427,95 @@ either a formal disproof of this search's negative (an exact 8-scheme it
 somehow missed) or a representation change that removes the canonical
 carry boundary (Sol's original alternative condition, unchanged).
 
+### Literature check on the pair-square gate (2026-08-12, web)
+
+The 8-vs-9 question was checked against published art after the search
+closure.  The operation is exactly **squaring in a quadratic extension**
+`F_q[j]/(j^2 - beta)` with `q = M61^2`, `beta = -T` (equivalently, doubling
+in the Pell-conic/Brahmagupta group with `D = -T`) — a shape pairing-based
+cryptography has optimized for two decades with beta-multiplications charged
+as a first-class cost, i.e. the same cost model as the gate.
+
+- [Devegili–O hEigeartaigh–Scott–Dahab, "Multiplication and Squaring on
+  Pairing-Friendly Fields" (eprint 2006/471)](https://eprint.iacr.org/2006/471)
+  catalogs the complete known inventory: schoolbook `M+2S+B` (= our
+  canonical 10 after expanding over the GF(M61^2) tower), Karatsuba-adapted
+  squaring `3S+B` (= our 9, literally the `(a+b)^2-a^2-b^2` spelling in
+  `tailsquare.cl`), and complex squaring `2S` **only when beta is cheap**
+  (beta = -1; unavailable for the dynamic tail trig).  Nothing below `3S+B`
+  for generic charged beta appears there or in the follow-on literature
+  (Chung–Hasan asymmetric squaring is cubic-extension material).
+- Classical complexity theory —
+  [Ja'Ja', "Optimal Evaluation of Pairs of Bilinear Forms"](https://epubs.siam.org/doi/10.1137/0208037),
+  Winograd, de Groote,
+  [Alder–Strassen algebra bounds](https://link.springer.com/chapter/10.1007/978-3-662-03338-8_17) —
+  works in the scalar-multiplications-free model: it confirms our measured
+  flat rank 4 (the split-algebra squares) but is structurally silent on the
+  charged-constants question that separates 8 from 9.
+  [Heideman–Burrus](https://link.springer.com/book/10.1007/978-1-4612-3912-3)
+  is the charged-constants framework, but its results cover DFTs and
+  convolutions, not this pointwise system.
+- Mersenne-community sources (mersenneforum PRPLL/M61 threads) contain no
+  deeper treatment of the pair-square multiplication count.
+
+Conclusion: **no published formula reaches 8, and no published theorem
+forbids it; the search's 9-optimality result is consistent with the state of
+the art and appears to be a small novel result.**  The gate closure stands
+unchanged; the community-standard best (`3S+B`) is what production already
+ties against.
+
+## Hardware-selection notes at the 600 W boundary (2026-08-12)
+
+Assessment of candidate hardware for the next throughput step.  All
+non-GB202 numbers are **estimates** from public specs scaled through the
+measured workload profile (integer-IMAD issue-bound, ~96% SM-clock-scaled,
+18% memory-controller activity, 48-MiB state); GB202 numbers are measured.
+
+| Device | Path | us/iter | Power | Note |
+|---|---|---:|---:|---|
+| RTX PRO 6000 (GB202, 188 SM) | M31+M61 integer | **148.9 measured** | 600 W | this box |
+| RTX 5090 (GB202, 170 SM, ~$2k) | M31+M61 integer | ~160-165 est. | 575 W | ~4x better it/s/$ than any alternative |
+| A100 SXM | M31+M61 integer | ~700-900 est. | 400 W | 6,912 INT lanes x 1.41 GHz = 5.4x lane-clock deficit |
+| A100 SXM | classic FP64 FFT | ~300-450 est. | 400 W | 9.7 TF FP64, 2 TB/s, 40 MiB L2 |
+| H100 SXM | best of either | ~150-250 est. | 700 W | parity at best, ~10x the price |
+| B200 | FP64/HBM path | ~60-100 est. | ~1 kW | only per-device candidate to beat GB202; hopeless per dollar/watt |
+| MI300X (wildcard) | OpenCL FP64 path | ~120-180 est. | 750 W | 81.7 TF FP64, 5.3 TB/s; untuned path, high uncertainty |
+
+- **A100 does not beat this box on either of its paths.**  Its strengths
+  (FP64 tensor, NVLink, HBM) are all things this workload measured out or
+  does not use.  M52's own discovery ran the FP64 backend on A100 — that
+  fleet's economics were donated compute, not efficiency.
+- **The per-dollar optimum for this codebase is a power-capped RTX 5090
+  fleet**: same silicon, and the measured perf ∝ P^0.49 makes several
+  capped cards strictly better than fewer full-power cards at equal wall
+  power (two 300 W GB202 ≈ +42% over one 600 W).
+- **The highest-value single box change is administrative, not silicon**: a
+  host with working `nvidia-smi -pl`/`-lgc` and NCU counters unlocks the
+  perf/W knee, the counters route, and the two-worker break-even map.
+- On any >600 W or multi-GPU machine, re-check two workers first.
+
+### FP64 tensor cores — rejected as an idea class for any current hardware
+
+Raised as a candidate optimization; rejected on analysis without
+implementation.  (1) sm_120 has **no FP64 MMA units at all** and 1/64-rate
+scalar FP64 — nothing to optimize here (registry already rejected the FP64
+backend and FP64-in-M61 offload at the rate gate).  (2) On A100/H100, which
+do have DMMA: casting radix stages as dense matmuls inflates real flops
+~10x for radix-8 (the DFT matrix is mostly +-1/+-i entries that butterflies
+turn into additions), while the FP64 tensor/vector throughput ratio is only
+**2x** (A100 19.5/9.7, H100 67/34 TF) — a ~5x net loss wherever
+compute-bound, and no gain where memory-bound.  This is the same failure
+mode the registry *measured* on dense INT8 tiles (42% slower despite a much
+larger nominal TOPS ratio); published tensor-FFT successes (tcFFT etc.)
+live in FP16/TF32 where the ratio is 8-16x.  (3) The exact-NTT variant
+(integer limbs in FP64 mantissas via DMMA) starts below the GB202 integer
+path's 5.3e13 IMAD/s before paying ~6x limb decomposition.  (4) Roadmap:
+B200 cuts FP64 tensor to ~vector rate (~40 TF) and consumer Blackwell has
+none — the unit is being removed, not grown.  FP64 MMA also fails the
+standing tensor reopen condition (multiple recoverable modular products per
+accumulator — it delivers one).  Do not revisit absent a part with a >=10x
+FP64 tensor/vector ratio.
+
 ## Experiment log
 
 ### 2026-08-12: baseline reverification

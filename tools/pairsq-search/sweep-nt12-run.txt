@@ -1,0 +1,38 @@
+[32mActivated conda/uv virtual environment at [36m/venv/main[0m
+== validate9: 4 shapes in parallel
+shape (0,6,3): residual 2.486e-30  max|coef| 1.9e+00  [ZERO] (41s)
+shape (3,6,0): residual 1.849e-17  max|coef| 3.4e+00  [NEAR] (49s)
+shape (3,5,1): residual 3.132e-05  max|coef| 2.5e+00  [no] (52s)
+shape (2,5,2): residual 3.468e-04  max|coef| 3.3e+00  [no] (54s)
+done
+=== EIGHT nT=12 ===
+== eight: 28 shapes in parallel
+shape (2,6,0): residual 1.493e-02  max|coef| 1.8e+00  [no] (137s)
+shape (1,7,0): residual 1.545e+01  max|coef| 2.1e+00  [no] (143s)
+shape (0,8,0): residual 5.316e+01  max|coef| 1.8e+00  [no] (144s)
+shape (1,4,3): residual 1.743e+01  max|coef| 5.1e+00  [no] (149s)
+shape (0,7,1): residual 2.520e+01  max|coef| 1.4e+00  [no] (150s)
+shape (2,5,1): residual 4.048e-04  max|coef| 5.5e+00  [no] (152s)
+shape (0,2,6): residual 1.714e+02  max|coef| 2.1e+00  [no] (153s)
+shape (3,5,0): residual 6.274e-04  max|coef| 4.3e+00  [no] (153s)
+shape (2,4,2): residual 2.885e+00  max|coef| 2.2e+00  [no] (153s)
+shape (0,6,2): residual 3.738e+00  max|coef| 3.2e+00  [no] (155s)
+shape (1,5,2): residual 1.306e-01  max|coef| 3.6e+00  [no] (156s)
+shape (0,4,4): residual 3.200e+01  max|coef| 2.5e+00  [no] (157s)
+shape (3,4,1): residual 7.841e+00  max|coef| 4.7e+00  [no] (157s)
+shape (1,6,1): residual 1.900e+00  max|coef| 2.3e+00  [no] (157s)
+shape (3,2,3): residual 1.533e+02  max|coef| 1.8e+00  [no] (158s)
+shape (2,2,4): residual 1.558e+02  max|coef| 2.3e+00  [no] (159s)
+shape (0,5,3): residual 1.240e+01  max|coef| 1.8e+00  [no] (160s)
+shape (2,3,3): residual 7.406e+01  max|coef| 2.4e+00  [no] (160s)
+shape (3,3,2): residual 7.390e+01  max|coef| 3.0e+00  [no] (160s)
+shape (1,3,4): residual 8.435e+01  max|coef| 6.4e+00  [no] (162s)
+shape (0,3,5): residual 9.469e+01  max|coef| 2.7e+00  [no] (162s)
+shape (1,2,5): residual 1.642e+02  max|coef| 1.6e+00  [no] (163s)
+shape (4,2,2): residual 1.533e+02  max|coef| 2.1e+00  [no] (55s)
+shape (4,4,0): residual 1.647e+01  max|coef| 5.3e+00  [no] (55s)
+shape (4,3,1): residual 7.775e+01  max|coef| 3.6e+00  [no] (58s)
+shape (5,2,1): residual 1.580e+02  max|coef| 1.8e+00  [no] (55s)
+shape (5,3,0): residual 8.741e+01  max|coef| 5.1e+00  [no] (55s)
+shape (6,2,0): residual 1.674e+02  max|coef| 1.9e+00  [no] (57s)
+done
